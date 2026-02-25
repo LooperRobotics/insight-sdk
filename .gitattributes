@@ -1,0 +1,2 @@
+Windows-SDK/third_party/opencv/build/**/*.dll filter=lfs diff=lfs merge=lfs -text
+Windows-SDK/third_party/opencv/build/**/*.pdb filter=lfs diff=lfs merge=lfs -text

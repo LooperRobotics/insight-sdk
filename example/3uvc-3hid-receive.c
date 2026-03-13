@@ -301,8 +301,8 @@ int scan_uvc_devices(uvc_device_info_t *devices, int max_devices) {
         return -1;
     }
 
-    printf("Scanning UVC devices...\n");
-    printf("========================================\n\n");
+    // printf("Scanning UVC devices...\n");
+    // printf("========================================\n\n");
 
     while ((entry = readdir(dir)) != NULL && count < max_devices) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
@@ -333,32 +333,32 @@ int scan_uvc_devices(uvc_device_info_t *devices, int max_devices) {
             // 解析USB设备信息
             parse_usb_device_info(usb_path, &devices[count]);
 
-            printf("UVC Device %d:\n", count + 1);
-            printf("  Video Device: %s\n", devices[count].video_dev);
-            printf("  USB Path: %s\n", devices[count].usb_path);
-            printf("  Driver: %s\n", driver);
+            // printf("UVC Device %d:\n", count + 1);
+            // printf("  Video Device: %s\n", devices[count].video_dev);
+            // printf("  USB Path: %s\n", devices[count].usb_path);
+            // printf("  Driver: %s\n", driver);
 
             if (devices[count].manufacturer[0]) {
-                printf("  Manufacturer: %s\n", devices[count].manufacturer);
+                // printf("  Manufacturer: %s\n", devices[count].manufacturer);
             }
             if (devices[count].product[0]) {
-                printf("  Product: %s\n", devices[count].product);
+                // printf("  Product: %s\n", devices[count].product);
             }
-            printf("  VID: 0x%04x\n", devices[count].vid);
-            printf("  PID: 0x%04x\n", devices[count].pid);
+            // printf("  VID: 0x%04x\n", devices[count].vid);
+            // printf("  PID: 0x%04x\n", devices[count].pid);
 
             if (devices[count].serial[0]) {
-                printf("  Serial Number: %s\n", devices[count].serial);
+                // printf("  Serial Number: %s\n", devices[count].serial);
             } else {
-                printf("  Serial Number: Not available\n");
+                // printf("  Serial Number: Not available\n");
             }
-            printf("\n");
+            // printf("\n");
 
             // 检查是否为目标设备
             if (devices[count].vid == VENDOR_ID && devices[count].pid == PRODUCT_ID) {
                 found_target = 1;
-                printf("*** Found target device! ***\n");
-                printf("  Serial Number: %s\n\n", devices[count].serial);
+                // printf("*** Found target device! ***\n");
+                // printf("  Serial Number: %s\n\n", devices[count].serial);
             }
 
             count++;
@@ -368,10 +368,10 @@ int scan_uvc_devices(uvc_device_info_t *devices, int max_devices) {
     closedir(dir);
 
     if (!found_target && count > 0) {
-        printf("Target device (VID=0x%04x, PID=0x%04x) not found in UVC devices.\n", 
-               VENDOR_ID, PRODUCT_ID);
+        // printf("Target device (VID=0x%04x, PID=0x%04x) not found in UVC devices.\n", 
+        //        VENDOR_ID, PRODUCT_ID);
     } else if (count == 0) {
-        printf("No UVC devices found.\n");
+        // printf("No UVC devices found.\n");
     }
 
     return count;
@@ -421,40 +421,28 @@ int find_target_uvc_device(uvc_device_info_t *device) {
 
 void show_dev_info() {
     uvc_device_info_t devices[MAX_DEVICES];
-    uvc_device_info_t target_device;
-    int count;
-    int opt = 0;
+    int count = scan_uvc_devices(devices, MAX_DEVICES);
+    int found = 0;
 
-    printf("UVC Device Serial Number Extractor\n");
-    printf("Target: VID=0x%04x, PID=0x%04x\n", VENDOR_ID, PRODUCT_ID);
     printf("========================================\n\n");
-
-    if (opt == 1) {
-        // 显示所有UVC设备
-        count = scan_uvc_devices(devices, MAX_DEVICES);
-        printf("Total UVC devices found: %d\n", count);
-
-    } else {
-        // 只查找目标设备
-        if (find_target_uvc_device(&target_device) == 0) {
-            printf("Target UVC Device Found:\n");
-            printf("========================================\n");
-            printf("Video Device: %s\n", target_device.video_dev);
-            printf("USB Path: %s\n", target_device.usb_path);
-            printf("Manufacturer: %s\n", target_device.manufacturer);
-            printf("Product: %s\n", target_device.product);
-            printf("VID: 0x%04x\n", target_device.vid);
-            printf("PID: 0x%04x\n", target_device.pid);
-            printf("Serial Number: %s\n", 
-                   target_device.serial[0] ? target_device.serial : "Not available");
-        } else {
-            printf("Target UVC device (VID=0x%04x, PID=0x%04x) not found.\n", 
-                   VENDOR_ID, PRODUCT_ID);
-
-            // 可选：显示所有找到的UVC设备
-            printf("\nAvailable UVC devices:\n");
-            count = scan_uvc_devices(devices, MAX_DEVICES);
+    printf("Target: VID=0x%04x, PID=0x%04x\n\n", VENDOR_ID, PRODUCT_ID);
+    printf("========================================\n\n");
+    for (int i = 0; i < count; i++) {
+        if (devices[i].vid == VENDOR_ID && devices[i].pid == PRODUCT_ID) {
+            if (!found) {
+                printf("\nTarget devices found:\n");
+                printf("========================================\n\n");
+                found = 1;
+            }
+            printf("  Video Device: %s\n", devices[i].video_dev);
+            printf("  Serial: %s\n", devices[i].serial[0] ? devices[i].serial : "N/A");
+            printf("  Product: %s\n", devices[i].product);
+            printf("  Serial Number: %s\n\n", devices[i].serial[0] ? devices[i].serial : "Not available");
         }
+    }
+    printf("========================================\n\n");
+    if (!found) {
+        printf("No target device found.\n");
     }
 }
 
@@ -655,6 +643,7 @@ void save_mono8_frame(struct cam_ctx *ctx, void *data, size_t size, int seq) {
 void *capture_thread(void *arg) {
     struct cam_ctx *ctx = (struct cam_ctx *)arg;
     unsigned long frame_count = 0;
+    uint64_t RGB_timestamps = 0, BW_L_timestamps = 0, BW_R_timestamps = 0;
     int ret;
 
     printf("[CAM%d] 采集线程启动，持续接收...\n", ctx->cam_id);
@@ -740,9 +729,31 @@ void *capture_thread(void *arg) {
 
         //根据格式保存帧
         if (ctx->format == V4L2_PIX_FMT_MJPEG) {
+            uint8_t *p = ctx->buffers[buf.index].start;
+            // if (p[0] != 0xFF || p[1] != 0xD8) {
+            //     goto error;
+            // }
+            p += 2;
+            if (p[0] != 0xFF) break;  // 非标记，应是图像数据开始
+            uint8_t marker = p[1];
+            if (marker == 0xE1) {     // APP1
+                uint16_t len = (p[2] << 8) | p[3];
+                // if (p + len + 2 > ctx->buffers[buf.index].start + buf.bytesused) break;
+                if (len >= 4+8 && memcmp(p+4, "TS__", 4) == 0) {
+                    memcpy(&RGB_timestamps, p+8, sizeof(RGB_timestamps));
+                }
+                printf("MJPEG time-stamp: %ld\n", RGB_timestamps);
+            }
             save_mjpeg_frame(ctx, ctx->buffers[buf.index].start, 
                             buf.bytesused, ctx->frame_count);
         } else if (ctx->format == V4L2_PIX_FMT_GREY) {
+            if(ctx->cam_id == 1) {
+                memcpy(&BW_L_timestamps, ctx->buffers[buf.index].start + ctx->width * ctx->height, sizeof(BW_L_timestamps));
+                printf("BW L time-stamp: %ld\n", BW_L_timestamps);
+            } else if (ctx->cam_id == 2) {
+                memcpy(&BW_R_timestamps, ctx->buffers[buf.index].start + ctx->width * ctx->height, sizeof(BW_R_timestamps));
+                printf("BW R time-stamp: %ld\n", BW_R_timestamps);
+            }
             save_mono8_frame(ctx, ctx->buffers[buf.index].start,
                             ctx->width * ctx->height, ctx->frame_count);
         }

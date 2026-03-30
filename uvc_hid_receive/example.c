@@ -7,10 +7,10 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
     printf("Image[%d]: %zub, %dx%d, ts=%lu\n", cam_id, size, w, h, ts);
 }
 
-void my_imu_cb(int16_t ax, int16_t ay, int16_t az,
-               int16_t gx, int16_t gy, int16_t gz,
+void my_imu_cb(float ax, float ay, float az,
+               float gx, float gy, float gz,
                uint32_t ts, void *user) {
-    printf("IMU: ax=%d ay=%d az=%d gx=%d gy=%d gz=%d ts=%u\n",
+    printf("IMU: ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%u\n",
            ax, ay, az, gx, gy, gz, ts);
 }
 

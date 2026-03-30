@@ -11,7 +11,6 @@
 #include <sys/time.h>
 #include <linux/videodev2.h>
 #include <unistd.h>
-#include <stdint.h>
 #include <pthread.h>
 #include <signal.h>
 #include <dirent.h>
@@ -47,7 +46,7 @@ struct cam_ctx {
     struct buffer *buffers;         // mmap缓冲区数组
     int buffer_count;               // 缓冲区数量
     pthread_t tid;                  // 采集线程ID
-    int cam_id;                      // 0,1,2
+    int cam_id;
     int width;
     int height;
     unsigned int format;
@@ -217,19 +216,13 @@ static int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
 
         // 找到 hidraw 设备对应的 USB 路径
         char device_path[MAX_PATH];
-        if (snprintf(device_path, sizeof(device_path), "%s/device", hidraw_sysfs) >= sizeof(device_path)) {
-            fprintf(stderr, "path truncated\n");
-            continue;
-        }
+        snprintf(device_path, sizeof(device_path), "%s/device", hidraw_sysfs);
         if (realpath(device_path, usb_path) == NULL) continue;
 
         // 向上查找 USB 根目录（包含 idVendor）
         char *p;
         while (1) {
-            if (snprintf(device_path, sizeof(device_path), "%s/idVendor", usb_path) >= sizeof(device_path)) {
-                fprintf(stderr, "path truncated\n");
-                continue;
-            }
+            snprintf(device_path, sizeof(device_path), "%s/idVendor", usb_path);
             if (access(device_path, F_OK) == 0) break;
             p = strrchr(usb_path, '/');
             if (!p) break;
@@ -256,7 +249,7 @@ static int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
     return count;
 }
 
-// ==================== 原有 V4L2 工具函数 ====================
+// ==================== V4L2 操作函数 ====================
 static void print_camera_info(int fd) {
     struct v4l2_capability cap;
     if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
@@ -277,7 +270,7 @@ static int set_framerate(int fd, int framerate) {
         return -1;
     }
     if (!(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
-        printf("  设备不支持设置帧率\n");
+        // 设备不支持设置帧率
         return 0;
     }
     parm.parm.capture.timeperframe.numerator = 1;
@@ -324,13 +317,13 @@ static int init_capture(struct cam_ctx *ctx) {
     }
 
     if (req.count < 2) {
-        printf("[CAM%d] 缓冲区不足: %d\n", ctx->cam_id, req.count);
+        fprintf(stderr, "Insufficient buffers\n");
         return -1;
     }
 
     ctx->buffers = calloc(req.count, sizeof(struct buffer));
     if (!ctx->buffers) {
-        perror("calloc failed");
+        perror("calloc");
         return -1;
     }
     ctx->buffer_count = req.count;
@@ -343,7 +336,7 @@ static int init_capture(struct cam_ctx *ctx) {
         buf.index = i;
 
         if (ioctl(ctx->fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            perror("VIDIOC_QUERYBUF failed");
+            perror("VIDIOC_QUERYBUF");
             return -1;
         }
 
@@ -353,12 +346,12 @@ static int init_capture(struct cam_ctx *ctx) {
                                      MAP_SHARED, ctx->fd, buf.m.offset);
 
         if (ctx->buffers[i].start == MAP_FAILED) {
-            perror("mmap failed");
+            perror("mmap");
             return -1;
         }
 
         if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF failed");
+            perror("VIDIOC_QBUF");
             return -1;
         }
     }
@@ -369,7 +362,7 @@ static int init_capture(struct cam_ctx *ctx) {
 static int start_capture(int fd) {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-        perror("VIDIOC_STREAMON failed");
+        perror("VIDIOC_STREAMON");
         return -1;
     }
     return 0;
@@ -378,7 +371,7 @@ static int start_capture(int fd) {
 static int stop_capture(int fd) {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
-        perror("VIDIOC_STREAMOFF failed");
+        perror("VIDIOC_STREAMOFF");
         return -1;
     }
     return 0;
@@ -398,21 +391,20 @@ static void *capture_thread(void *arg) {
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
                 printf("[CAM%d] 打开失败: %s，等待重试...\n", ctx->cam_id, strerror(errno));
-                sleep(1);
+                usleep(1000000);
                 continue;
             }
             if (init_capture(ctx) < 0) {
-                printf("[CAM%d] 初始化失败，关闭设备\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
-                sleep(1);
+                usleep(1000000);
                 continue;
             }
             if (start_capture(ctx->fd) < 0) {
                 printf("[CAM%d] 启动流失败\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
-                sleep(1);
+                usleep(1000000);
                 continue;
             }
             printf("[CAM%d] 设备重新初始化成功\n", ctx->cam_id);
@@ -429,7 +421,7 @@ static void *capture_thread(void *arg) {
         int ret = select(ctx->fd + 1, &fds, NULL, NULL, &tv);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            perror("select failed");
+            perror("select");
             close(ctx->fd);
             ctx->fd = -1;
             continue;
@@ -447,20 +439,18 @@ static void *capture_thread(void *arg) {
                 close(ctx->fd);
                 ctx->fd = -1;
                 if (ctx->buffers) {
-                    for (int j = 0; j < ctx->buffer_count; j++) {
-                        if (ctx->buffers[j].start) {
-                            munmap(ctx->buffers[j].start, ctx->buffers[j].length);
-                        }
+                    for (int i = 0; i < ctx->buffer_count; i++) {
+                        if (ctx->buffers[i].start)
+                            munmap(ctx->buffers[i].start, ctx->buffers[i].length);
                     }
                     free(ctx->buffers);
                     ctx->buffers = NULL;
                 }
                 ctx->buffer_count = 0;
                 continue;
-            } else {
-                perror("VIDIOC_DQBUF failed");
-                continue;
             }
+            perror("VIDIOC_DQBUF");
+            continue;
         }
 
         uint64_t timestamp = 0;
@@ -468,20 +458,17 @@ static void *capture_thread(void *arg) {
             uint8_t *p = ctx->buffers[buf.index].start;
             if (p[0] == 0xFF && p[1] == 0xD8) {
                 p += 2;
-                if (p[0] == 0xFF) {
-                    uint8_t marker = p[1];
-                    if (marker == 0xE1) {
-                        uint16_t len = (p[2] << 8) | p[3];
-                        if (len >= 4+8 && memcmp(p+4, "TS__", 4) == 0) {
-                            memcpy(&timestamp, p+8, sizeof(timestamp));
-                        }
+                if (p[0] == 0xFF && p[1] == 0xE1) {
+                    uint16_t len = (p[2] << 8) | p[3];
+                    if (len >= 4+8 && memcmp(p+4, "TS__", 4) == 0) {
+                        memcpy(&timestamp, p+8, sizeof(timestamp));
                     }
                 }
             }
         } else if (ctx->format == V4L2_PIX_FMT_GREY) {
             if (buf.bytesused >= (ctx->width * ctx->height + 8)) {
                 memcpy(&timestamp,
-                       ctx->buffers[buf.index].start + ctx->width * ctx->height,
+                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * ctx->height,
                        sizeof(timestamp));
             }
         }
@@ -499,21 +486,19 @@ static void *capture_thread(void *arg) {
         frame_count++;
 
         if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF failed");
+            perror("VIDIOC_QBUF");
             close(ctx->fd);
             ctx->fd = -1;
-            continue;
         }
     }
 
-    printf("[CAM%d] 采集线程退出，共接收 %lu 帧\n", ctx->cam_id, frame_count);
     return NULL;
 }
 
-// ==================== HID 线程（通用，根据索引区分 IMU/VIO）====================
+// ==================== HID 设备读取 ====================
 struct imu_hid_report {
-    int16_t ax, ay, az;
-    int16_t gx, gy, gz;
+    float ax, ay, az;
+    float gx, gy, gz;
     uint32_t timestamp;
 };
 
@@ -525,7 +510,7 @@ struct vio_hid_payload {
 };
 
 static void *hid_thread(void *arg) {
-    int idx = (int)(intptr_t)arg;  // 0:IMU, 1:VIO
+    int idx = (int)(intptr_t)arg;
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
 
@@ -535,12 +520,8 @@ static void *hid_thread(void *arg) {
         if (fd < 0) {
             fd = open(device, O_RDONLY | O_NONBLOCK);
             if (fd < 0) {
-                if (errno == ENOENT) {
-                    sleep(1);
-                    continue;
-                }
-                perror("open HID device");
-                sleep(1);
+                if (errno != ENOENT) perror("open HID");
+                usleep(1000000);
                 continue;
             }
             printf("成功打开 HID 设备 %s\n", device);
@@ -557,33 +538,29 @@ static void *hid_thread(void *arg) {
         }
         if (ret == 0) continue;
 
-        if (idx == 0) { // IMU
+        if (idx == 0) {
             struct imu_hid_report rpt;
             int n = read(fd, &rpt, sizeof(rpt));
-            if (n == sizeof(rpt)) {
-                if (g_ctx.imu_cb) {
-                    g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
-                                 rpt.gx, rpt.gy, rpt.gz,
-                                 rpt.timestamp,
-                                 g_ctx.imu_userdata);
-                }
+            if (n == sizeof(rpt) && g_ctx.imu_cb) {
+                g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
+                             rpt.gx, rpt.gy, rpt.gz,
+                             rpt.timestamp,
+                             g_ctx.imu_userdata);
             } else if (n < 0) {
-                perror("read IMU error");
+                perror("read IMU");
                 close(fd);
                 fd = -1;
             }
-        } else { // VIO
+        } else {
             struct vio_hid_payload payload;
             int n = read(fd, &payload, sizeof(payload));
-            if (n == sizeof(payload)) {
-                if (g_ctx.vio_cb) {
-                    g_ctx.vio_cb(payload.px, payload.py, payload.pz,
-                                 payload.qx, payload.qy, payload.qz, payload.qw,
-                                 payload.seq,
-                                 g_ctx.vio_userdata);
-                }
+            if (n == sizeof(payload) && g_ctx.vio_cb) {
+                g_ctx.vio_cb(payload.px, payload.py, payload.pz,
+                             payload.qx, payload.qy, payload.qz, payload.qw,
+                             payload.seq,
+                             g_ctx.vio_userdata);
             } else if (n < 0) {
-                perror("read VIO error");
+                perror("read VIO");
                 close(fd);
                 fd = -1;
             }
@@ -596,15 +573,15 @@ static void *hid_thread(void *arg) {
 }
 
 // ==================== SDK API 实现 ====================
-int sdk_init(void) {
+int insight9_receive_init(void) {
     if (g_ctx.initialized) {
-        fprintf(stderr, "SDK already initialized\n");
+        fprintf(stderr, "Insight_9_receive already initialized\n");
         return -1;
     }
 
     memset(&g_ctx, 0, sizeof(g_ctx));
 
-    // 1. 查找 UVC 设备
+    // 查找 UVC 设备
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < 3) {
@@ -612,7 +589,7 @@ int sdk_init(void) {
                 VENDOR_ID, PRODUCT_ID, uvc_count);
         return -1;
     }
-    // 按隔一个的方式选取三个设备：索引 0,2,4
+    // 隔一个选取：索引 0,2,4
     int selected_idx[] = {0, 2, 4};
     for (int i = 0; i < CAM_NUM; i++) {
         if (selected_idx[i] >= uvc_count) {
@@ -623,7 +600,7 @@ int sdk_init(void) {
         printf("Selected UVC device %d: %s\n", i, g_ctx.video_devs[i]);
     }
 
-    // 2. 查找 HID 设备
+    // 查找 HID 设备
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
     if (hid_count < 2) {
@@ -631,9 +608,9 @@ int sdk_init(void) {
                 VENDOR_ID, PRODUCT_ID, hid_count);
         return -1;
     }
-    // 取前两个，小的为 IMU，大的为 VIO
-    strcpy(g_ctx.hid_devs[0], hid_list[0]); // IMU
-    strcpy(g_ctx.hid_devs[1], hid_list[1]); // VIO
+    // 取前两个，小的为 IMU，大的为 VIO（已排序）
+    strcpy(g_ctx.hid_devs[0], hid_list[0]);
+    strcpy(g_ctx.hid_devs[1], hid_list[1]);
     printf("Selected HID devices: IMU=%s, VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
 
     // 初始化摄像头上下文
@@ -652,50 +629,35 @@ int sdk_init(void) {
     }
 
     g_ctx.initialized = 1;
-    printf("SDK initialized.\n");
+    printf("Insight_9_receive initialized.\n");
     return 0;
 }
 
-int sdk_start(void) {
+int insight9_receive_start(void) {
     if (!g_ctx.initialized) {
-        fprintf(stderr, "SDK not initialized\n");
+        fprintf(stderr, "Insight_9_receive not initialized\n");
         return -1;
     }
     if (g_ctx.running) {
-        fprintf(stderr, "SDK already running\n");
+        fprintf(stderr, "Insight_9_receive already running\n");
         return -1;
     }
 
     g_ctx.running = 1;
 
-    // 启动摄像头线程
     for (int i = 0; i < CAM_NUM; i++) {
-        // 初始打开设备（线程内会重试）
-        g_ctx.cams[i].fd = open(g_ctx.video_devs[i], O_RDWR);
-        if (g_ctx.cams[i].fd < 0) {
-            printf("[CAM%d] 初始打开失败，将在线程中重试\n", i);
-        } else {
-            if (init_capture(&g_ctx.cams[i]) < 0) {
-                close(g_ctx.cams[i].fd);
-                g_ctx.cams[i].fd = -1;
-            } else {
-                start_capture(g_ctx.cams[i].fd);
-            }
-        }
         pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
     }
+    for (int i = 0; i < 2; i++) {
+        pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
+    }
 
-    // 启动 HID 线程
-    pthread_create(&g_ctx.hid_tids[0], NULL, hid_thread, (void*)0); // IMU
-    pthread_create(&g_ctx.hid_tids[1], NULL, hid_thread, (void*)1); // VIO
-
-    printf("SDK started.\n");
+    printf("Insight_9_receive started.\n");
     return 0;
 }
 
-void sdk_stop(void) {
+void insight9_receive_stop(void) {
     if (!g_ctx.running) return;
-
     g_ctx.running = 0;
 
     for (int i = 0; i < CAM_NUM; i++) {
@@ -704,15 +666,14 @@ void sdk_stop(void) {
     for (int i = 0; i < 2; i++) {
         pthread_join(g_ctx.hid_tids[i], NULL);
     }
-
-    printf("SDK stopped.\n");
+    printf("Insight_9_receive stopped.\n");
 }
 
-void sdk_cleanup(void) {
+void insight9_receive_cleanup(void) {
     if (!g_ctx.initialized) return;
 
     if (g_ctx.running) {
-        sdk_stop();
+        insight9_receive_stop();
     }
 
     for (int i = 0; i < CAM_NUM; i++) {
@@ -721,9 +682,8 @@ void sdk_cleanup(void) {
             stop_capture(ctx->fd);
             if (ctx->buffers) {
                 for (int j = 0; j < ctx->buffer_count; j++) {
-                    if (ctx->buffers[j].start) {
+                    if (ctx->buffers[j].start)
                         munmap(ctx->buffers[j].start, ctx->buffers[j].length);
-                    }
                 }
                 free(ctx->buffers);
                 ctx->buffers = NULL;
@@ -734,20 +694,20 @@ void sdk_cleanup(void) {
     }
 
     g_ctx.initialized = 0;
-    printf("SDK cleaned up.\n");
+    printf("Insight_9_receive cleaned up.\n");
 }
 
-void sdk_register_image_callback(image_callback cb, void *userdata) {
+void insight9_receive_register_image_callback(image_callback cb, void *userdata) {
     g_ctx.img_cb = cb;
     g_ctx.img_userdata = userdata;
 }
 
-void sdk_register_imu_callback(imu_callback cb, void *userdata) {
+void insight9_receive_register_imu_callback(imu_callback cb, void *userdata) {
     g_ctx.imu_cb = cb;
     g_ctx.imu_userdata = userdata;
 }
 
-void sdk_register_vio_callback(vio_callback cb, void *userdata) {
+void insight9_receive_register_vio_callback(vio_callback cb, void *userdata) {
     g_ctx.vio_cb = cb;
     g_ctx.vio_userdata = userdata;
 }

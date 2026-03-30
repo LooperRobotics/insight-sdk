@@ -1,123 +1,120 @@
-# Insight 9 SDK 使用说明
+# Insight 9 SDK User Guide
 
-## 1. 概述
-Insight 9 SDK 是一个用于采集三路 UVC 摄像头（主路 MJPEG，左右副路 Mono8）和两路 HID 设备（IMU、VIO）数据的动态库。SDK 自动识别指定 VID/PID 的设备节点，按设备号排序后选取合适的设备，并通过回调函数将图像和传感器数据传递给上层应用。
+## 1. Overview
+The Insight 9 SDK is a dynamic library for capturing data from three UVC cameras (main MJPEG, left/right mono8) and two HID devices (IMU, VIO). The SDK automatically discovers devices with the specified VID/PID, selects appropriate devices after sorting by device number, and passes the captured image and sensor data to the application via callbacks.
 
-## 2. 功能特性
-自动设备发现：根据 VID=0x1d6b、PID=0x0104 自动查找 UVC 和 HID 设备。
+## 2. Features
+- **Automatic device discovery**: Finds UVC and HID devices based on VID=0x1d6b, PID=0x0104.
 
-智能选择：
+- **Intelligent selection**:  
+  - UVC: Sorts all matching video nodes numerically and selects indices 0, 2, 4 as the three cameras (initialization fails if less than 6 devices exist).  
+  - HID: Sorts matching hidraw nodes numerically, takes the first two; the smaller number is used for IMU, the larger for VIO.
 
-UVC：将所有匹配的 video 节点按数字排序，选择索引 0、2、4 作为三个摄像头（若不足 6 个则初始化失败）。
+- **Multi‑threaded capture**: Each device runs in its own thread without interference.
 
-HID：将匹配的 hidraw 节点按数字排序，取前两个，数字小的作为 IMU，大的作为 VIO。
+- **Hot‑plug support**: Automatically reconnects after device disconnection and resumes data streaming.
 
-多线程采集：为每个设备创建独立线程，互不干扰。
+- **Callback mechanism**: Image, IMU, and VIO data are delivered to the application in real time.
 
-热插拔支持：设备断开后自动重连，恢复数据流。
+- **Simple API**: Only a few calls are needed to start/stop data acquisition.
 
-回调机制：图像、IMU、VIO 数据通过回调函数实时通知应用层。
+## 3. Dependencies
+- **OS**: Linux (requires sysfs, V4L2, HIDRAW support)
 
-简单易用：仅需少量 API 调用即可启动/停止采集。
+- **Build**: gcc, make, pthread library
 
-## 3. 依赖
-操作系统：Linux（支持 sysfs、V4L2、HIDRAW）
+- **Runtime**: Access to `/sys/class/video4linux` and `/sys/class/hidraw`; read/write permissions for `/dev/video*` and `/dev/hidraw*`
 
-编译环境：gcc、make、pthread 库
-
-运行时：/sys/class/video4linux 和 /sys/class/hidraw 可访问，设备节点 /dev/video*、/dev/hidraw* 有读写权限。
-
-## 4. 编译与安装
-### 4.1 编译动态库
-将 Insight_9_receive.c 和 Insight_9_receive.h 放在同一目录，执行：
+## 4. Building and Installation
+### 4.1 Build the shared library
+Place `Insight_9_receive.c` and `Insight_9_receive.h` in the same directory and execute:
 
 bash
 gcc -c -fPIC Insight_9_receive.c -o Insight_9_receive.o
 gcc -shared -o libinsight9.so Insight_9_receive.o -lpthread
-生成 libinsight9.so。
+This generates libinsight9.so.
 
-### 4.2 安装
-将 libinsight9.so 和 Insight_9_receive.h 复制到系统目录或项目目录，例如：
+### 4.2 Install
+Copy libinsight9.so and Insight_9_receive.h to system or project directories, e.g.:
 
 bash
 sudo cp libinsight9.so /usr/local/lib/
 sudo cp Insight_9_receive.h /usr/local/include/
 sudo ldconfig
 
-## 5. API 参考
-### 5.1 头文件
+### 5. API Reference
+### 5.1 Header
 c
 #include "Insight_9_receive.h"
-### 5.2 回调函数类型定义
-图像回调
+
+### 5.2 Callback Types
+Image callback
 c
 typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
                                int width, int height, unsigned int format,
                                uint64_t timestamp, void *userdata);
-cam_id: 0=主路RGB，1=左路灰度，2=右路灰度
+cam_id: 0 = main RGB, 1 = left mono, 2 = right mono
 
-data: 图像数据（MJPEG 或原始灰度）
+data: Image data (MJPEG or raw mono)
 
-size: 数据大小（字节）
+size: Data size in bytes
 
-width, height: 图像尺寸
+width, height: Image dimensions
 
-format: V4L2 像素格式（V4L2_PIX_FMT_MJPEG 或 V4L2_PIX_FMT_GREY）
+format: V4L2 pixel format (V4L2_PIX_FMT_MJPEG or V4L2_PIX_FMT_GREY)
 
-timestamp: 从设备提取的时间戳（微秒级）
+timestamp: Device‑extracted timestamp (microseconds)
 
-userdata: 注册时传入的用户指针
+userdata: User pointer passed during registration
 
-IMU 回调
+IMU callback
 c
-typedef void (*imu_callback)(int16_t ax, int16_t ay, int16_t az,
-                             int16_t gx, int16_t gy, int16_t gz,
+typedef void (*imu_callback)(float ax, float ay, float az,
+                             float gx, float gy, float gz,
                              uint32_t timestamp, void *userdata);
-ax,ay,az: 加速度计原始值
+ax, ay, az: Accelerometer values (physical units)
 
-gx,gy,gz: 陀螺仪原始值
+gx, gy, gz: Gyroscope values (physical units)
 
-timestamp: 设备时间戳
+timestamp: Device timestamp
 
-VIO 回调
+VIO callback
 c
 typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint32_t seq, void *userdata);
-px,py,pz: 位置坐标
+px, py, pz: Position coordinates
 
-qx,qy,qz,qw: 四元数姿态
+qx, qy, qz, qw: Quaternion orientation
 
-seq: 序列号
+seq: Sequence number
 
-### 5.3 SDK 控制 API
-int sdk_init(void);
-初始化 SDK，扫描并选择设备，分配资源。
+### 5.3 SDK Control Functions
+int insight9_receive_init(void)
+Initializes the SDK, scans for devices, and allocates resources.
+Returns: 0 on success, -1 on failure (insufficient devices or permission issues).
 
-返回值：0 成功，-1 失败（设备不足或权限问题）。
+int insight9_receive_start(void)
+Starts all acquisition threads.
+Returns: 0 on success, -1 if not initialized or already running.
 
-int sdk_start(void);
-启动所有采集线程。
+void insight9_receive_stop(void)
+Stops all acquisition threads (blocks until threads exit).
 
-返回值：0 成功，-1 失败（未初始化或已在运行）。
+void insight9_receive_cleanup(void)
+Releases all resources (must be called after stop).
 
-void sdk_stop(void);
-停止所有采集线程（阻塞等待线程退出）。
+### 5.4 Callback Registration
+void insight9_receive_register_image_callback(image_callback cb, void *userdata)
+Registers the image callback. Must be called before insight9_receive_start().
 
-void sdk_cleanup(void);
-释放所有资源（必须在停止后调用）。
+void insight9_receive_register_imu_callback(imu_callback cb, void *userdata)
+Registers the IMU callback.
 
-### 5.4 回调注册 API
-void sdk_register_image_callback(image_callback cb, void *userdata);
-注册图像回调。必须在 sdk_start() 之前调用。
+void insight9_receive_register_vio_callback(vio_callback cb, void *userdata)
+Registers the VIO callback.
 
-void sdk_register_imu_callback(imu_callback cb, void *userdata);
-注册 IMU 回调。
-
-void sdk_register_vio_callback(vio_callback cb, void *userdata);
-注册 VIO 回调。
-
-## 6. 使用示例
+## 6. Usage Example
 c
 #include "Insight_9_receive.h"
 #include <stdio.h>
@@ -134,13 +131,13 @@ void image_callback(int cam_id, uint8_t *data, size_t size,
                     int width, int height, unsigned int format,
                     uint64_t timestamp, void *userdata) {
     printf("CAM%d: %zub, %dx%d, ts=%lu\n", cam_id, size, width, height, timestamp);
-    // 如需保存数据，请在此处拷贝 data 内容
+    // Copy data if needed for later use
 }
 
-void imu_callback(int16_t ax, int16_t ay, int16_t az,
-                  int16_t gx, int16_t gy, int16_t gz,
+void imu_callback(float ax, float ay, float az,
+                  float gx, float gy, float gz,
                   uint32_t timestamp, void *userdata) {
-    printf("IMU: acc=(%d,%d,%d) gyro=(%d,%d,%d) ts=%u\n",
+    printf("IMU: acc=(%.2f,%.2f,%.2f) gyro=(%.2f,%.2f,%.2f) ts=%u\n",
            ax, ay, az, gx, gy, gz, timestamp);
 }
 
@@ -154,18 +151,18 @@ void vio_callback(float px, float py, float pz,
 int main() {
     signal(SIGINT, sigint_handler);
 
-    if (sdk_init() != 0) {
+    if (insight9_receive_init() != 0) {
         fprintf(stderr, "SDK init failed\n");
         return -1;
     }
 
-    sdk_register_image_callback(image_callback, NULL);
-    sdk_register_imu_callback(imu_callback, NULL);
-    sdk_register_vio_callback(vio_callback, NULL);
+    insight9_receive_register_image_callback(image_callback, NULL);
+    insight9_receive_register_imu_callback(imu_callback, NULL);
+    insight9_receive_register_vio_callback(vio_callback, NULL);
 
-    if (sdk_start() != 0) {
+    if (insight9_receive_start() != 0) {
         fprintf(stderr, "SDK start failed\n");
-        sdk_cleanup();
+        insight9_receive_cleanup();
         return -1;
     }
 
@@ -174,43 +171,47 @@ int main() {
         sleep(1);
     }
 
-    sdk_stop();
-    sdk_cleanup();
+    insight9_receive_stop();
+    insight9_receive_cleanup();
     return 0;
 }
-编译示例
+Compile the example:
+
 bash
-gcc -o example example.c -L. -luvchid -lpthread
+gcc -o example example.c -L. -linsight9 -lpthread
 export LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH
 ./example
 
-## 7. 注意事项
-数据生命周期：图像数据指针 data 指向 SDK 内部缓冲区，回调返回后该缓冲区会被复用。如需长期保存，必须在回调中拷贝数据。
+## 7. Important Notes
+Data lifecycle: The image data pointer points to an internal SDK buffer that will be reused after the callback returns. If you need to keep the data, copy it inside the callback.
 
-线程安全：回调函数在采集线程中被调用，不应执行阻塞操作（如文件 I/O、长时间计算），否则可能丢帧。
+Thread safety: Callbacks are invoked from acquisition threads; avoid blocking operations (e.g., file I/O, long computations) to prevent frame drops.
 
-设备权限：运行程序需具备访问 /dev/video* 和 /dev/hidraw* 的权限（通常需要 root 或加入 video、plugdev 组）。
+Device permissions: The program must have read/write access to /dev/video* and /dev/hidraw*. This often requires root privileges or membership in the video and plugdev groups.
 
-设备数量要求：SDK 需要至少 5 个 UVC 设备（取 0、2、4 三个）和 2 个 HID 设备，否则 sdk_init 将返回 -1。
+Device count requirement: The SDK expects at least 5 UVC devices (to select indices 0, 2, 4) and 2 HID devices; otherwise insight9_receive_init() will return -1.
 
-热插拔：设备断开后，采集线程会自动尝试重连，回调数据会暂时中断，待设备恢复后自动恢复。
+Hot‑plug: After device disconnection, the acquisition threads will automatically attempt to reconnect. Data flow will pause and resume when the device becomes available again.
 
-错误处理：若 sdk_init 失败，应调用 sdk_cleanup 释放已分配的资源（即使初始化失败，内部也会清理，但外部调用可确保安全）。
+Error handling: If insight9_receive_init() fails, it is safe to call insight9_receive_cleanup() (though the SDK already cleans up internally, calling it ensures proper resource release).
 
-## 8. 常见问题
-Q: 如何查看设备是否被正确识别？
-A: 运行程序时会打印选中的设备节点，如 Selected UVC device 0: /dev/video4。也可在 sdk_init 后查看 g_ctx.video_devs 等内部变量（仅调试用）。
+## 8. Frequently Asked Questions
+Q: How can I verify that devices are correctly detected?
+A: When the program runs, it prints the selected device nodes, e.g., Selected UVC device 0: /dev/video4. For debugging, you can inspect internal variables like g_ctx.video_devs after insight9_receive_init() (not recommended for production).
 
-Q: 回调中收到的图像数据是 MJPEG，如何解码？
-A: 可使用 libjpeg 或硬件解码器将 MJPEG 转换为 RGB/YUV。灰度图（Mono8）是原始 8 位像素数据，可直接保存为 PGM 或使用 OpenCV 处理。
+Q: The image data is MJPEG. How do I decode it?
+A: You can use libjpeg or a hardware decoder to convert MJPEG to RGB/YUV. The mono (GREY) data is raw 8‑bit pixel data and can be saved as PGM or processed with OpenCV.
 
-Q: 如何调整摄像头参数（如曝光、增益）？
-A: 当前 SDK 未开放参数设置接口，如有需要可扩展 init_capture 函数，通过 VIDIOC_S_CTRL 设置 V4L2 控制项。
+Q: How can I adjust camera parameters (exposure, gain)?
+A: The current SDK does not expose parameter tuning. If needed, you can extend the init_capture() function with VIDIOC_S_CTRL calls to set V4L2 controls.
 
-Q: 编译时提示找不到 libinsight9.so？
-A: 确保库文件路径在 LD_LIBRARY_PATH 中，或使用 -Wl,-rpath 指定运行时路径，例如 gcc -o example example.c -L. -luvchid -Wl,-rpath=.。
+Q: I get “cannot find libinsight9.so” when running the example.
+A: Ensure the library path is in LD_LIBRARY_PATH or use -Wl,-rpath during compilation, e.g.:
 
-## 9. 更新日志
-v1.0 (2025-03): 初始版本，支持三路 UVC + 两路 HID 自动识别与采集。
+bash
+gcc -o example example.c -L. -linsight9 -Wl,-rpath=.
 
-如需更多帮助或定制功能，请联系开发者。
+## 9. Changelog
+v1.0 (2025‑03): Initial release – supports automatic device discovery and acquisition for three UVC cameras and two HID devices.
+
+For further assistance or customisations, please contact the developer.

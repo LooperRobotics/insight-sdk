@@ -1,5 +1,5 @@
-#ifndef UVC_HID_SDK_H
-#define UVC_HID_SDK_H
+#ifndef INSIGHT_SDK_H
+#define INSIGHT_SDK_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -30,8 +30,8 @@ typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
  * @param timestamp 时间戳（由设备提供）
  * @param userdata  用户指针
  */
-typedef void (*imu_callback)(int16_t ax, int16_t ay, int16_t az,
-                             int16_t gx, int16_t gy, int16_t gz,
+typedef void (*imu_callback)(float ax, float ay, float az,
+                             float gx, float gy, float gz,
                              uint32_t timestamp, void *userdata);
 
 /**
@@ -49,43 +49,43 @@ typedef void (*vio_callback)(float px, float py, float pz,
  * @brief 初始化SDK（打开所有设备，但不启动采集）
  * @return 0成功，-1失败
  */
-int sdk_init(void);
+int insight9_receive_init(void);
 
 /**
  * @brief 启动所有采集线程
  * @return 0成功，-1失败
  */
-int sdk_start(void);
+int insight9_receive_start(void);
 
 /**
  * @brief 停止所有采集线程
  */
-void sdk_stop(void);
+void insight9_receive_stop(void);
 
 /**
  * @brief 清理所有资源（必须在停止后调用）
  */
-void sdk_cleanup(void);
+void insight9_receive_cleanup(void);
 
 /**
  * @brief 注册图像回调
  * @param cb       回调函数
  * @param userdata 用户自定义指针（将透传给回调）
  */
-void sdk_register_image_callback(image_callback cb, void *userdata);
+void insight9_receive_register_image_callback(image_callback cb, void *userdata);
 
 /**
  * @brief 注册IMU回调
  */
-void sdk_register_imu_callback(imu_callback cb, void *userdata);
+void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
 
 /**
  * @brief 注册VIO回调
  */
-void sdk_register_vio_callback(vio_callback cb, void *userdata);
+void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // UVC_HID_SDK_H
+#endif // INSIGHT_SDK_H

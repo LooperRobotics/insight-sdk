@@ -24,12 +24,15 @@
 
 // ==================== 摄像头配置 ====================
 #define CAM_NUM 3
-#define MAIN_WIDTH  1920
-#define MAIN_HEIGHT 1080
-#define MAIN_FORMAT V4L2_PIX_FMT_MJPEG
-#define SUB_WIDTH   544
-#define SUB_HEIGHT  640
-#define SUB_FORMAT  V4L2_PIX_FMT_GREY
+#define MAIN_WIDTH   1088
+#define MAIN_HEIGHT  1920
+#define MAIN_FORMAT  V4L2_PIX_FMT_MJPEG
+#define SUB_WIDTH    544
+#define SUB_HEIGHT   1281
+#define SUB_FORMAT   V4L2_PIX_FMT_GREY
+#define DEPTH_WIDTH  544
+#define DEPTH_HEIGHT 641
+#define DEPTH_FORMAT V4L2_PIX_FMT_Z16
 #define FRAME_RATE 30
 #define BUFFER_COUNT 8
 
@@ -466,9 +469,15 @@ static void *capture_thread(void *arg) {
                 }
             }
         } else if (ctx->format == V4L2_PIX_FMT_GREY) {
-            if (buf.bytesused >= (ctx->width * ctx->height + 8)) {
+            if (buf.bytesused >= (ctx->width * ctx->height)) {
                 memcpy(&timestamp,
-                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * ctx->height,
+                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 1),
+                       sizeof(timestamp));
+            }
+        } else if (ctx->format == V4L2_PIX_FMT_Z16) {
+            if (buf.bytesused >= (ctx->width * ctx->height)) {
+                memcpy(&timestamp,
+                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 2),
                        sizeof(timestamp));
             }
         }
@@ -621,10 +630,14 @@ int insight9_receive_init(void) {
             g_ctx.cams[i].width = MAIN_WIDTH;
             g_ctx.cams[i].height = MAIN_HEIGHT;
             g_ctx.cams[i].format = MAIN_FORMAT;
-        } else {
+        } else if (i == 1) {
             g_ctx.cams[i].width = SUB_WIDTH;
             g_ctx.cams[i].height = SUB_HEIGHT;
             g_ctx.cams[i].format = SUB_FORMAT;
+        } else if (i == 2) {
+            g_ctx.cams[i].width = DEPTH_WIDTH;
+            g_ctx.cams[i].height = DEPTH_HEIGHT;
+            g_ctx.cams[i].format = DEPTH_FORMAT;
         }
     }
 

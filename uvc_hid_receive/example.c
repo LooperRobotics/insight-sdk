@@ -17,16 +17,16 @@ void my_imu_cb(float ax, float ay, float az,
 void my_vio_cb(float px, float py, float pz,
                float qx, float qy, float qz, float qw,
                uint32_t seq, void *user) {
-    // printf("VIO: pos=(%.2f %.2f %.2f) seq=%u\n", px, py, pz, seq);
+    printf("VIO: pos=(%.2f %.2f %.2f) seq=%u\n", px, py, pz, seq);
 }
 
 int main() {
-    sdk_init();
-    sdk_register_image_callback(my_image_cb, NULL);
-    sdk_register_imu_callback(my_imu_cb, NULL);
-    sdk_register_vio_callback(my_vio_cb, NULL);
+    insight9_receive_init();
+    insight9_receive_register_image_callback(my_image_cb, NULL);
+    insight9_receive_register_imu_callback(my_imu_cb, NULL);
+    insight9_receive_register_vio_callback(my_vio_cb, NULL);
 
-    if (sdk_start() != 0) {
+    if (insight9_receive_start() != 0) {
         fprintf(stderr, "start failed\n");
         return -1;
     }
@@ -34,7 +34,7 @@ int main() {
     printf("Press Enter to stop...\n");
     getchar();
 
-    sdk_stop();
-    sdk_cleanup();
+    insight9_receive_stop();
+    insight9_receive_cleanup();
     return 0;
 }

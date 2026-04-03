@@ -17,11 +17,13 @@ extern "C" {
  * @param height    图像高度
  * @param format    V4L2像素格式（如 V4L2_PIX_FMT_MJPEG 或 V4L2_PIX_FMT_GREY）
  * @param timestamp 图像时间戳（微秒，由设备提供或系统时间）
+ * @param right_timestamp 右图像时间戳（微秒，由设备提供或系统时间）
  * @param userdata  用户注册时传入的指针
  */
 typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
                                int width, int height, unsigned int format,
-                               uint64_t timestamp, void *userdata);
+                               uint64_t timestamp, uint64_t right_timestamp,
+                               void *userdata);
 
 /**
  * @brief IMU数据回调函数

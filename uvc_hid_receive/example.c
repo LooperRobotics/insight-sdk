@@ -3,8 +3,12 @@
 #include <unistd.h>
 
 void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
-                 unsigned int fmt, uint64_t ts, void *user) {
-    printf("Image[%d]: %zub, %dx%d, ts=%lu\n", cam_id, size, w, h, ts);
+                 unsigned int fmt, uint64_t ts, uint64_t ts_right, void *user) {
+    // if (cam_id == 1) {
+        printf("Left ts=%llu, Right ts=%llu\n", ts, ts_right);
+    // } else {
+        printf("Image[%d]: %zub, %dx%d, ts=%lu\n", cam_id, size, w, h, ts);
+    // }
 }
 
 void my_imu_cb(float ax, float ay, float az,
@@ -17,7 +21,7 @@ void my_imu_cb(float ax, float ay, float az,
 void my_vio_cb(float px, float py, float pz,
                float qx, float qy, float qz, float qw,
                uint32_t seq, void *user) {
-    printf("VIO: pos=(%.2f %.2f %.2f) seq=%u\n", px, py, pz, seq);
+    printf("VIO: pos=(%f %f %f) ori=(%f %f %f %f) seq=%u\n", px, py, pz, qx, qy, qz, qw, seq);
 }
 
 int main() {

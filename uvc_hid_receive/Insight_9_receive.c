@@ -31,7 +31,7 @@
 #define SUB_HEIGHT   1281
 #define SUB_FORMAT   V4L2_PIX_FMT_GREY
 #define DEPTH_WIDTH  544
-#define DEPTH_HEIGHT 641
+#define DEPTH_HEIGHT 642
 #define DEPTH_FORMAT V4L2_PIX_FMT_Z16
 #define FRAME_RATE 30
 #define BUFFER_COUNT 8
@@ -303,9 +303,11 @@ static int init_capture(struct cam_ctx *ctx) {
         return -1;
     }
 
-    printf("[CAM%d] 设置后: %dx%d\n", ctx->cam_id,
-           fmt.fmt.pix.width, fmt.fmt.pix.height);
-
+    ctx->width = fmt.fmt.pix.width;
+    ctx->height = fmt.fmt.pix.height;
+    ctx->format = fmt.fmt.pix.pixelformat;
+    printf("[CAM%d] 设置后: %dx%d, format=0x%x\n", ctx->cam_id,
+           ctx->width, ctx->height, ctx->format);
     set_framerate(ctx->fd, FRAME_RATE);
 
     struct v4l2_requestbuffers req;
@@ -457,6 +459,7 @@ static void *capture_thread(void *arg) {
         }
 
         uint64_t timestamp = 0;
+        uint64_t right_timestamp = 0;
         if (ctx->format == V4L2_PIX_FMT_MJPEG) {
             uint8_t *p = ctx->buffers[buf.index].start;
             if (p[0] == 0xFF && p[1] == 0xD8) {
@@ -473,6 +476,9 @@ static void *capture_thread(void *arg) {
                 memcpy(&timestamp,
                        (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 1),
                        sizeof(timestamp));
+                memcpy(&right_timestamp,
+                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 1) + sizeof(timestamp),
+                       sizeof(right_timestamp));
             }
         } else if (ctx->format == V4L2_PIX_FMT_Z16) {
             if (buf.bytesused >= (ctx->width * ctx->height)) {
@@ -489,6 +495,7 @@ static void *capture_thread(void *arg) {
                          ctx->width, ctx->height,
                          ctx->format,
                          timestamp,
+                         right_timestamp,
                          g_ctx.img_userdata);
         }
 
@@ -523,6 +530,10 @@ static void *hid_thread(void *arg) {
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
 
+    const long desired_interval_us = (idx == 0 ? 2500L : 33333L); // IMU 400Hz, VIO 30Hz
+    struct timespec last_cb_ts;
+    clock_gettime(CLOCK_MONOTONIC, &last_cb_ts);
+
     printf("HID 线程 %d 启动，设备 %s\n", idx, device);
 
     while (g_ctx.running) {
@@ -537,7 +548,7 @@ static void *hid_thread(void *arg) {
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, 500);
+        int ret = poll(&pfd, 1, 10); // 快速响应，频率控制在逻辑中实现
         if (ret < 0) {
             if (errno == EINTR) continue;
             perror("poll HID");
@@ -547,14 +558,24 @@ static void *hid_thread(void *arg) {
         }
         if (ret == 0) continue;
 
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_us = (now.tv_sec - last_cb_ts.tv_sec) * 1000000L +
+                          (now.tv_nsec - last_cb_ts.tv_nsec) / 1000L;
+
         if (idx == 0) {
             struct imu_hid_report rpt;
             int n = read(fd, &rpt, sizeof(rpt));
-            if (n == sizeof(rpt) && g_ctx.imu_cb) {
-                g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
-                             rpt.gx, rpt.gy, rpt.gz,
-                             rpt.timestamp,
-                             g_ctx.imu_userdata);
+            if (n == sizeof(rpt)) {
+                if (elapsed_us >= desired_interval_us) {
+                    last_cb_ts = now;
+                    if (g_ctx.imu_cb) {
+                        g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
+                                     rpt.gx, rpt.gy, rpt.gz,
+                                     rpt.timestamp,
+                                     g_ctx.imu_userdata);
+                    }
+                }
             } else if (n < 0) {
                 perror("read IMU");
                 close(fd);
@@ -563,11 +584,16 @@ static void *hid_thread(void *arg) {
         } else {
             struct vio_hid_payload payload;
             int n = read(fd, &payload, sizeof(payload));
-            if (n == sizeof(payload) && g_ctx.vio_cb) {
-                g_ctx.vio_cb(payload.px, payload.py, payload.pz,
-                             payload.qx, payload.qy, payload.qz, payload.qw,
-                             payload.seq,
-                             g_ctx.vio_userdata);
+            if (n == sizeof(payload)) {
+                if (elapsed_us >= desired_interval_us) {
+                    last_cb_ts = now;
+                    if (g_ctx.vio_cb) {
+                        g_ctx.vio_cb(payload.px, payload.py, payload.pz,
+                                     payload.qx, payload.qy, payload.qz, payload.qw,
+                                     payload.seq,
+                                     g_ctx.vio_userdata);
+                    }
+                }
             } else if (n < 0) {
                 perror("read VIO");
                 close(fd);

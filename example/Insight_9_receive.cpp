@@ -17,6 +17,8 @@
 #include <poll.h>
 #include <assert.h>
 #include <ctype.h>
+#include "UvcExtensionUnit.hpp"
+#include <atomic>
 
 // ==================== 目标设备 VID/PID ====================
 #define VENDOR_ID  0x1d6b
@@ -24,6 +26,7 @@
 
 // ==================== 摄像头配置 ====================
 #define CAM_NUM 3
+#define HID_NUM 2
 #define MAIN_WIDTH   1088
 #define MAIN_HEIGHT  1920
 #define MAIN_FORMAT  V4L2_PIX_FMT_MJPEG
@@ -60,9 +63,11 @@ typedef struct {
     // 摄像头
     struct cam_ctx cams[CAM_NUM];
     char video_devs[CAM_NUM][MAX_PATH];   // 动态确定的 video 设备路径
+    char video_usb_paths[CAM_NUM][MAX_PATH]; // 设备对应的 USB 根路径，用于重连时重新查找
     // HID设备（只使用两个：0=IMU, 1=VIO）
-    char hid_devs[2][MAX_PATH];           // 动态确定的 hidraw 设备路径
-    pthread_t hid_tids[2];
+    char hid_devs[HID_NUM][MAX_PATH];           // 动态确定的 hidraw 设备路径
+    char hid_usb_paths[HID_NUM][MAX_PATH];   // HID 设备对应的 USB 根路径，用于重连时重新查找
+    pthread_t hid_tids[HID_NUM];
     // 回调
     image_callback img_cb;
     void *img_userdata;
@@ -74,6 +79,8 @@ typedef struct {
     volatile int running;
     // 初始化标志
     int initialized;
+    viewer::UvcExtensionUnit *xu_control;
+    std::atomic<bool> xu_ready;
 } sdk_ctx_t;
 
 static sdk_ctx_t g_ctx = {0};
@@ -125,6 +132,99 @@ static int parse_usb_vid_pid(const char *usb_path, unsigned int *vid, unsigned i
     if (read_sysfs_file(path, buffer, sizeof(buffer)) == 0)
         sscanf(buffer, "%x", pid);
     return (*vid != 0 && *pid != 0) ? 0 : -1;
+}
+
+static int get_video_usb_device_path(const char *video_dev, char *usb_path, size_t usb_path_size) {
+    const char *base = strrchr(video_dev, '/');
+    if (base) base++;
+    else base = video_dev;
+    char video_sysfs[MAX_PATH];
+    snprintf(video_sysfs, sizeof(video_sysfs), "/sys/class/video4linux/%s", base);
+    return find_usb_path_from_video(video_sysfs, usb_path, usb_path_size);
+}
+
+static int get_hid_usb_device_path(const char *hid_dev, char *usb_path, size_t usb_path_size) {
+    const char *base = strrchr(hid_dev, '/');
+    if (base) base++;
+    else base = hid_dev;
+    char hid_sysfs[MAX_PATH];
+    snprintf(hid_sysfs, sizeof(hid_sysfs), "/sys/class/hidraw/%s/device", base);
+
+    char resolved[MAX_PATH];
+    if (realpath(hid_sysfs, resolved) == NULL) {
+        return -1;
+    }
+
+    char *p;
+    while (strlen(resolved) > 1) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s/idVendor", resolved);
+        if (access(path, F_OK) == 0) {
+            strncpy(usb_path, resolved, usb_path_size - 1);
+            usb_path[usb_path_size - 1] = '\0';
+            return 0;
+        }
+        p = strrchr(resolved, '/');
+        if (!p) break;
+        *p = '\0';
+    }
+    return -1;
+}
+
+static int find_video_device_by_usb_path(const char *usb_path, char dev_path[MAX_PATH]) {
+    DIR *dir = opendir("/sys/class/video4linux");
+    if (!dir) return -1;
+    struct dirent *entry;
+    char path[MAX_PATH];
+    char candidate_usb[MAX_PATH];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
+        if (get_video_usb_device_path(path, candidate_usb, sizeof(candidate_usb)) != 0) continue;
+        if (strcmp(candidate_usb, usb_path) == 0) {
+            snprintf(dev_path, MAX_PATH, "/dev/%s", entry->d_name);
+            closedir(dir);
+            return 0;
+        }
+    }
+    closedir(dir);
+    return -1;
+}
+
+static int video_device_supports_format(const char *dev, int width, int height, unsigned int format) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) return 0;
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width;
+    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.pixelformat = format;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    int ret = ioctl(fd, VIDIOC_TRY_FMT, &fmt);
+    close(fd);
+    if (ret < 0) return 0;
+    return fmt.fmt.pix.width == width && fmt.fmt.pix.height == height && fmt.fmt.pix.pixelformat == format;
+}
+
+static int find_hid_device_by_usb_path(const char *usb_path, char dev_path[MAX_PATH]) {
+    DIR *dir = opendir("/sys/class/hidraw");
+    if (!dir) return -1;
+    struct dirent *entry;
+    char path[MAX_PATH];
+    char candidate_usb[MAX_PATH];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
+        if (get_hid_usb_device_path(path, candidate_usb, sizeof(candidate_usb)) != 0) continue;
+        if (strcmp(candidate_usb, usb_path) == 0) {
+            snprintf(dev_path, MAX_PATH, "/dev/%s", entry->d_name);
+            closedir(dir);
+            return 0;
+        }
+    }
+    closedir(dir);
+    return -1;
 }
 
 static int is_uvc_device(const char *video_dev) {
@@ -199,6 +299,59 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
     return count;
 }
 
+static void refresh_video_device_path(int cam_id) {
+    printf("[CAM%d] 刷新设备路径...\n", cam_id);
+    if (cam_id < 0 || cam_id >= CAM_NUM) return;
+    printf("[CAM%d] 当前设备路径: %s\n", cam_id, g_ctx.video_devs[cam_id]);
+
+    char uvc_list[10][MAX_PATH] = {{0}};
+    int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
+    if (uvc_count < CAM_NUM) {
+        printf("[CAM%d] 找到 %d 个 UVC 设备，不足 %d 个，放弃重连\n", cam_id, uvc_count, CAM_NUM);
+        return;
+    } else {
+        printf("[CAM%d] 找到 %d 个 UVC 设备，尝试匹配...\n", cam_id, uvc_count);
+        for (int i = 0; i < uvc_count; ++i) {
+            printf("  [%d] %s\n", i, uvc_list[i]);
+        }
+    }
+
+    // 优先按格式支持匹配，找到第一个支持当前相机格式的设备
+    for (int i = 0; i < uvc_count; ++i) {
+        if (video_device_supports_format(uvc_list[i], g_ctx.cams[cam_id].width,
+                                         g_ctx.cams[cam_id].height,
+                                         g_ctx.cams[cam_id].format)) {
+            if (strcmp(uvc_list[i], g_ctx.video_devs[cam_id]) != 0) {
+                printf("[CAM%d] 重新匹配设备路径: %s -> %s (格式匹配)\n", cam_id,
+                       g_ctx.video_devs[cam_id], uvc_list[i]);
+                strcpy(g_ctx.video_devs[cam_id], uvc_list[i]);
+                if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
+                    g_ctx.video_usb_paths[cam_id][0] = '\0';
+                }
+            }
+            return;
+        }
+    }
+
+    // 后备方案：按照预定的设备索引选择
+    int selected_idx[CAM_NUM] = {0, 2, 4};
+    int index = (uvc_count >= 6 ? selected_idx[cam_id] : cam_id);
+    if (index >= uvc_count) index = cam_id;
+    if (index >= uvc_count) {
+        printf("[CAM%d] 设备索引超出范围，无法重连\n", cam_id);
+        return;
+    }
+
+    if (strcmp(uvc_list[index], g_ctx.video_devs[cam_id]) != 0) {
+        printf("[CAM%d] 重新匹配设备路径: %s -> %s (索引备选)\n", cam_id, 
+               g_ctx.video_devs[cam_id], uvc_list[index]);
+        strcpy(g_ctx.video_devs[cam_id], uvc_list[index]);
+    }
+    if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
+        g_ctx.video_usb_paths[cam_id][0] = '\0';
+    }
+}
+
 // 查找所有匹配 VID/PID 的 HID 设备，返回找到的设备路径（/dev/hidrawX），按数字升序排列
 static int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int target_pid,
                                        char dev_paths[][MAX_PATH], int max_devs) {
@@ -250,6 +403,27 @@ static int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
         for (int i = 0; i < count; i++) strcpy(dev_paths[i], tmp[i]);
     }
     return count;
+}
+
+static void refresh_hid_device_path(int idx) {
+    if (idx < 0 || idx >= HID_NUM) return;
+
+    char hid_list[10][MAX_PATH] = {{0}};
+    int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
+    if (hid_count < HID_NUM) {
+        printf("[HID%d] 找到 %d 个 HID 设备，不足 %d 个，放弃重连\n", idx, hid_count, HID_NUM);
+        return;
+    }
+
+    // 尝试用缓存的 USB 路径查找，但如果失效则直接选择缓存列表中的设备
+    if (strcmp(hid_list[idx], g_ctx.hid_devs[idx]) != 0) {
+        printf("[HID%d] 重新匹配设备路径: %s -> %s\n", idx, 
+               g_ctx.hid_devs[idx], hid_list[idx]);
+        strcpy(g_ctx.hid_devs[idx], hid_list[idx]);
+    }
+    if (get_hid_usb_device_path(g_ctx.hid_devs[idx], g_ctx.hid_usb_paths[idx], MAX_PATH) < 0) {
+        g_ctx.hid_usb_paths[idx][0] = '\0';
+    }
 }
 
 // ==================== V4L2 操作函数 ====================
@@ -326,7 +500,7 @@ static int init_capture(struct cam_ctx *ctx) {
         return -1;
     }
 
-    ctx->buffers = calloc(req.count, sizeof(struct buffer));
+    ctx->buffers = (buffer*)calloc(req.count, sizeof(struct buffer));
     if (!ctx->buffers) {
         perror("calloc");
         return -1;
@@ -382,16 +556,126 @@ static int stop_capture(int fd) {
     return 0;
 }
 
+// ==================== 拓展单元辅助函数 ====================
+static int ensure_xu_available() {
+    if (!g_ctx.xu_control) {
+        // 尝试重新创建
+        if (g_ctx.video_devs[0][0] == '\0') return -1;
+        g_ctx.xu_control = new viewer::UvcExtensionUnit();
+        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+            delete g_ctx.xu_control;
+            g_ctx.xu_control = nullptr;
+            g_ctx.xu_ready = false;
+            return -1;
+        }
+        g_ctx.xu_ready = true;
+    } else if (!g_ctx.xu_control->isOpen()) {
+        // 已经存在但关闭了，尝试重新打开（路径可能改变）
+        g_ctx.xu_control->close();
+        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+            g_ctx.xu_ready = false;
+            return -1;
+        }
+        g_ctx.xu_ready = true;
+    }
+    return 0;
+}
+
+static int is_camera_params_valid(const camera_params *params) {
+    // 校验分辨率索引（RGB:0-3, 灰度:0-1，但SDK不知道具体类型，限定0-3较为宽松）
+    if (params->resolution > 3) {
+        fprintf(stderr, "Invalid resolution index, expected 0-3, got %d\n", params->resolution);
+        return 0;
+    }
+    // 校验帧率索引
+    if (params->frame_rate > 5) {
+        fprintf(stderr, "Invalid frame rate index, expected 0-5, got %d\n", params->frame_rate);
+        return 0;
+    }
+
+    // exposure_time: 0.0 ~ 0.03
+    if (params->exposure_time < 0.0f || params->exposure_time > 0.03f) {
+        fprintf(stderr, "Invalid exposure time, expected 0.0-0.03, got %f\n", params->exposure_time);
+        return 0;
+    }
+    // exposure_gain: 1.0 ~ 16.0
+    if (params->exposure_gain < 1.0f || params->exposure_gain > 16.0f) {
+        fprintf(stderr, "Invalid exposure gain, expected 1.0-16.0, got %f\n", params->exposure_gain);
+        return 0;
+    }
+    // backlight_comp: 0 或 1
+    if (params->backlight_comp > 1) {
+        fprintf(stderr, "Invalid backlight compensation, expected 0 or 1, got %d\n", params->backlight_comp);
+        return 0;
+    }
+    // brightness: 0.0 ~ 127.0
+    if (params->brightness < 0.0f || params->brightness > 127.0f) {
+        fprintf(stderr, "Invalid brightness, expected 0.0-127.0, got %f\n", params->brightness);
+        return 0;
+    }
+    // contrast: 0.0 ~ 1.9
+    if (params->contrast < 0.0f || params->contrast > 1.9f) {
+        fprintf(stderr, "Invalid contrast, expected 0.0-1.9, got %f\n", params->contrast);
+        return 0;
+    }
+    // gamma_dark: 1.0 ~ 4.0
+    if (params->gamma_dark < 1.0f || params->gamma_dark > 4.0f) {
+        fprintf(stderr, "Invalid gamma dark, expected 1.0-4.0, got %f\n", params->gamma_dark);
+        return 0;
+    }
+    // hue: 0.0 ~ 87.0
+    if (params->hue < 0.0f || params->hue > 87.0f) {
+        fprintf(stderr, "Invalid hue, expected 0.0-87.0, got %f\n", params->hue);
+        return 0;
+    }
+    // saturation: 0.0 ~ 1.999
+    if (params->saturation < 0.0f || params->saturation > 1.999f) {
+        fprintf(stderr, "Invalid saturation, expected 0.0-1.999, got %f\n", params->saturation);
+        return 0;
+    }
+    // sharpness: 1 ~ 255
+    if (params->sharpness < 1 || params->sharpness > 255) {
+        fprintf(stderr, "Invalid sharpness, expected 1-255, got %d\n", params->sharpness);
+        return 0;
+    }
+    // auto_white_balance: 0 或 1
+    if (params->auto_white_balance > 1) {
+        fprintf(stderr, "Invalid auto white balance, expected 0 or 1, got %d\n", params->auto_white_balance);
+        return 0;
+    }
+    // white_balance: 1.0 ~ 3.0
+    if (params->white_balance < 1.0f || params->white_balance > 3.0f) {
+        fprintf(stderr, "Invalid white balance, expected 1.0-3.0, got %f\n", params->white_balance);
+        return 0;
+    }
+    // decimation: 1 ~ 255
+    if (params->decimation < 1 || params->decimation > 255) {
+        fprintf(stderr, "Invalid decimation, expected 1-255, got %d\n", params->decimation);
+        return 0;
+    }
+    // rotation: 1 ~ 255
+    if (params->rotation < 1 || params->rotation > 255) {
+        fprintf(stderr, "Invalid rotation, expected 1-255, got %d\n", params->rotation);
+        return 0;
+    }
+
+    return 1;
+}
+
 // ==================== 摄像头采集线程 ====================
 static void *capture_thread(void *arg) {
     struct cam_ctx *ctx = (struct cam_ctx *)arg;
     unsigned long frame_count = 0;
     const char *dev_path = g_ctx.video_devs[ctx->cam_id];
 
-    printf("[CAM%d] 采集线程启动，设备 %s\n", ctx->cam_id, dev_path);
+    printf("[CAM%d] 采集线程启动，设备 %s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
 
     while (g_ctx.running) {
+        const char *dev_path = g_ctx.video_devs[ctx->cam_id];
         if (ctx->fd < 0) {
+            printf("[CAM%d] 设备未打开，尝试打开 %s\n", ctx->cam_id, dev_path);
+            refresh_video_device_path(ctx->cam_id);
+            dev_path = g_ctx.video_devs[ctx->cam_id];
             printf("[CAM%d] 尝试重新打开设备 %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
@@ -461,7 +745,7 @@ static void *capture_thread(void *arg) {
         uint64_t timestamp = 0;
         uint64_t right_timestamp = 0;
         if (ctx->format == V4L2_PIX_FMT_MJPEG) {
-            uint8_t *p = ctx->buffers[buf.index].start;
+            uint8_t *p = (uint8_t*)ctx->buffers[buf.index].start;
             if (p[0] == 0xFF && p[1] == 0xD8) {
                 p += 2;
                 if (p[0] == 0xFF && p[1] == 0xE1) {
@@ -490,7 +774,7 @@ static void *capture_thread(void *arg) {
 
         if (g_ctx.img_cb) {
             g_ctx.img_cb(ctx->cam_id,
-                         ctx->buffers[buf.index].start,
+                         (uint8_t*)ctx->buffers[buf.index].start,
                          buf.bytesused,
                          ctx->width, ctx->height,
                          ctx->format,
@@ -512,17 +796,18 @@ static void *capture_thread(void *arg) {
 }
 
 // ==================== HID 设备读取 ====================
-struct imu_hid_report {
+struct __attribute__((packed)) imu_hid_report {
     float ax, ay, az;
     float gx, gy, gz;
-    uint32_t timestamp;
+    uint64_t timestamp;
 };
 
-struct vio_hid_payload {
-    uint32_t sec, nsec;
+struct __attribute__((packed)) vio_hid_payload {
+    uint64_t timestamp;
     float px, py, pz;
     float qx, qy, qz, qw;
-    uint32_t seq;
+    uint8_t seq;
+    uint8_t reserved[3];
 };
 
 static void *hid_thread(void *arg) {
@@ -534,10 +819,13 @@ static void *hid_thread(void *arg) {
     struct timespec last_cb_ts;
     clock_gettime(CLOCK_MONOTONIC, &last_cb_ts);
 
-    printf("HID 线程 %d 启动，设备 %s\n", idx, device);
+    printf("HID 线程 %d 启动，设备 %s\n", idx, g_ctx.hid_devs[idx]);
 
     while (g_ctx.running) {
+        const char *device = g_ctx.hid_devs[idx];
         if (fd < 0) {
+            refresh_hid_device_path(idx);
+            device = g_ctx.hid_devs[idx];
             fd = open(device, O_RDONLY | O_NONBLOCK);
             if (fd < 0) {
                 if (errno != ENOENT) perror("open HID");
@@ -590,7 +878,7 @@ static void *hid_thread(void *arg) {
                     if (g_ctx.vio_cb) {
                         g_ctx.vio_cb(payload.px, payload.py, payload.pz,
                                      payload.qx, payload.qy, payload.qz, payload.qw,
-                                     payload.seq,
+                                     payload.timestamp,
                                      g_ctx.vio_userdata);
                     }
                 }
@@ -632,6 +920,10 @@ int insight9_receive_init(void) {
             return -1;
         }
         strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
+        g_ctx.video_usb_paths[i][0] = '\0';
+        if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
+            g_ctx.video_usb_paths[i][0] = '\0';
+        }
         printf("Selected UVC device %d: %s\n", i, g_ctx.video_devs[i]);
     }
 
@@ -646,6 +938,14 @@ int insight9_receive_init(void) {
     // 取前两个，小的为 IMU，大的为 VIO（已排序）
     strcpy(g_ctx.hid_devs[0], hid_list[0]);
     strcpy(g_ctx.hid_devs[1], hid_list[1]);
+    g_ctx.hid_usb_paths[0][0] = '\0';
+    g_ctx.hid_usb_paths[1][0] = '\0';
+    if (get_hid_usb_device_path(g_ctx.hid_devs[0], g_ctx.hid_usb_paths[0], MAX_PATH) < 0) {
+        g_ctx.hid_usb_paths[0][0] = '\0';
+    }
+    if (get_hid_usb_device_path(g_ctx.hid_devs[1], g_ctx.hid_usb_paths[1], MAX_PATH) < 0) {
+        g_ctx.hid_usb_paths[1][0] = '\0';
+    }
     printf("Selected HID devices: IMU=%s, VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
 
     // 初始化摄像头上下文
@@ -665,6 +965,22 @@ int insight9_receive_init(void) {
             g_ctx.cams[i].height = DEPTH_HEIGHT;
             g_ctx.cams[i].format = DEPTH_FORMAT;
         }
+    }
+
+    if (g_ctx.video_devs[0][0] != '\0') {
+        g_ctx.xu_control = new viewer::UvcExtensionUnit();
+        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+            printf("Warning: The expansion unit cannot be opened. The adjustment of camera parameters will be unavailable\n");
+            delete g_ctx.xu_control;
+            g_ctx.xu_control = nullptr;
+            g_ctx.xu_ready = false;
+        } else {
+            g_ctx.xu_ready = true;
+            printf("Extension unit initialized successfully, device: %s\n", g_ctx.video_devs[0]);
+        }
+    } else {
+        g_ctx.xu_control = nullptr;
+        g_ctx.xu_ready = false;
     }
 
     g_ctx.initialized = 1;
@@ -695,6 +1011,16 @@ int insight9_receive_start(void) {
     return 0;
 }
 
+const char *insight9_receive_get_video_dev(int cam_id) {
+    if (!g_ctx.initialized) {
+        return NULL;
+    }
+    if (cam_id < 0 || cam_id >= CAM_NUM) {
+        return NULL;
+    }
+    return g_ctx.video_devs[cam_id][0] ? g_ctx.video_devs[cam_id] : NULL;
+}
+
 void insight9_receive_stop(void) {
     if (!g_ctx.running) return;
     g_ctx.running = 0;
@@ -710,6 +1036,12 @@ void insight9_receive_stop(void) {
 
 void insight9_receive_cleanup(void) {
     if (!g_ctx.initialized) return;
+
+    if (g_ctx.xu_control) {
+        g_ctx.xu_control->close();
+        delete g_ctx.xu_control;
+        g_ctx.xu_control = nullptr;
+    }
 
     if (g_ctx.running) {
         insight9_receive_stop();
@@ -750,3 +1082,68 @@ void insight9_receive_register_vio_callback(vio_callback cb, void *userdata) {
     g_ctx.vio_cb = cb;
     g_ctx.vio_userdata = userdata;
 }
+
+extern "C" {
+
+int insight9_receive_set_active_camera(int cam_id) {
+    if (ensure_xu_available() != 0) return -1;
+    return g_ctx.xu_control->setActiveCamera(static_cast<uint8_t>(cam_id)) ? 0 : -1;
+}
+
+int insight9_receive_get_active_camera(int *cam_id) {
+    if (!cam_id) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    uint8_t val;
+    if (!g_ctx.xu_control->getActiveCamera(val)) return -1;
+    *cam_id = val;
+    return 0;
+}
+
+int insight9_receive_set_camera_params(const camera_params *params) {
+    if (!params || !is_camera_params_valid(params)) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    viewer::camera_params xu_params;
+    memcpy(&xu_params, params, sizeof(viewer::camera_params));
+    return g_ctx.xu_control->writeCurrentCameraParams(xu_params) ? 0 : -1;
+}
+
+int insight9_receive_get_camera_params(camera_params *params) {
+    if (!params) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    viewer::camera_params xu_params;
+    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) return -1;
+    memcpy(params, &xu_params, sizeof(camera_params));
+    return 0;
+}
+
+int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
+    if (!params || !is_camera_params_valid(params)) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    viewer::camera_params xu_params;
+    memcpy(&xu_params, params, sizeof(viewer::camera_params));
+    return g_ctx.xu_control->writeCameraParams(static_cast<uint8_t>(cam_id), xu_params) ? 0 : -1;
+}
+
+int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
+    if (!params) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    viewer::camera_params xu_params;
+    if (!g_ctx.xu_control->readCameraParams(static_cast<uint8_t>(cam_id), xu_params)) return -1;
+    memcpy(params, &xu_params, sizeof(camera_params));
+    return 0;
+}
+
+int insight9_receive_reset_camera_params(int cam_id) {
+    // 读取设备的出厂默认值需额外实现，这里提供一个简便方法：初始化时先读取当前值并保存为初始值，需要恢复时直接写回去。
+    fprintf(stderr, "reset_camera_params not implemented, use set_camera_params with saved defaults\n");
+    return -1;
+}
+
+void insight9_receive_print_camera_params(const camera_params *params) {
+    if (!params) return;
+    viewer::camera_params xu_params;
+    memcpy(&xu_params, params, sizeof(xu_params));
+    viewer::printParams(xu_params);
+}
+
+} // extern "C"

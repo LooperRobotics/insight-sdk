@@ -71,7 +71,7 @@ typedef struct {
     uint8_t frame_rate;         // Frame rate index (0-5: 90,60,30,20,15,10 fps) Not enabled!!!
     float exposure_time;        // Exposure time (0.0 ~ 0.03 seconds)
     float exposure_gain;        // Exposure gain (1.0 ~ 16.0)
-    uint8_t backlight_comp;     // Backlight compensation (0 or 1) Not enabled!!!
+    uint8_t auto_exposure;      // Auto Exposure (0 ~ 1)
     float brightness;           // Brightness (0.0 ~ 127.0)
     float contrast;             // Contrast (0.0 ~ 1.9)
     float gamma_dark;           // Gamma dark (1.0 ~ 4.0)
@@ -283,7 +283,7 @@ int main() {
     params.auto_white_balance = 1;
     params.resolution = 0;
     params.frame_rate = 2;
-    params.backlight_comp = 0;
+    params.auto_exposure = 0;
     params.gamma_dark = 2.0f;
     params.hue = 40.0f;
     params.saturation = 1.0f;
@@ -345,7 +345,7 @@ Error handling: If insight9_receive_init() fails, it is safe to call insight9_re
 Parameter	        Min	    Max	    Notes
 exposure_time (s)	0.0	    0.03	Linear mapping from UI value
 exposure_gain	    1.0	    16.0	Linear mapping
-backlight_comp	    0	    1	    Boolean
+auto_exposure	    0	    1	    Boolean
 brightness	        0.0	    127.0	Linear mapping from -64..64
 contrast	        0.0	    1.9	    Linear mapping from 0..100
 gamma_dark	        1.0	    4.0	    Linear mapping from 100..500

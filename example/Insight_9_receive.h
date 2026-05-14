@@ -11,13 +11,13 @@ typedef struct {
     uint8_t frame_rate;         // 帧率索引，0-5分别对应 10/15/20/30/60/90fps
     float exposure_time;        // 曝光时间，单位秒，范围0.0~0.03
     float exposure_gain;        // 曝光增益，范围1.0~16.0
-    uint8_t backlight_comp;     // 背光补偿，暂未使用
+    uint8_t auto_exposure;      // 自动曝光，0或1
     float brightness;           // 亮度，范围0.0~127.0
     float contrast;             // 对比度，范围0.0~1.9
     float gamma_dark;           // Gamma暗部，范围1.0~4.0
     float hue;                  // 色调，范围0.0~87.0
     float saturation;           // 饱和度，范围0.0~1.999
-    uint8_t sharpness;          // 锐度，范围1~255
+    uint8_t sharpness;          // 锐度，暂未使用
     uint8_t auto_white_balance; // 自动白平衡，0或1
     float white_balance;        // 白平衡，范围1.0~3.0
     uint8_t decimation;         // 采样率, 暂未使用

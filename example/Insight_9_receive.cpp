@@ -610,9 +610,9 @@ static int is_camera_params_valid(const camera_params *params) {
         fprintf(stderr, "Invalid exposure gain, expected 1.0-16.0, got %f\n", params->exposure_gain);
         return 0;
     }
-    // backlight_comp: 0 或 1
-    if (params->backlight_comp > 1) {
-        fprintf(stderr, "Invalid backlight compensation, expected 0 or 1, got %d\n", params->backlight_comp);
+    // auto_exposure: 0 或 1
+    if (params->auto_exposure > 1) {
+        fprintf(stderr, "Invalid auto exposure, expected 0 or 1, got %d\n", params->auto_exposure);
         return 0;
     }
     // brightness: 0.0 ~ 127.0

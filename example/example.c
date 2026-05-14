@@ -87,7 +87,7 @@ int main() {
     params.auto_white_balance = 1;
     params.resolution = 0;
     params.frame_rate = 2;
-    params.backlight_comp = 0;
+    params.auto_exposure = 0;
     params.gamma_dark = 2.0f;
     params.hue = 40.0f;
     params.saturation = 1.0f;

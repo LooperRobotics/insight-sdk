@@ -482,7 +482,14 @@ static int init_capture(struct cam_ctx *ctx) {
     ctx->format = fmt.fmt.pix.pixelformat;
     printf("[CAM%d] 设置后: %dx%d, format=0x%x\n", ctx->cam_id,
            ctx->width, ctx->height, ctx->format);
-    set_framerate(ctx->fd, FRAME_RATE);
+    
+    int target_framerate = 30;
+    if (ctx->format == V4L2_PIX_FMT_GREY) {
+        target_framerate = 20;
+    } else if (ctx->format == V4L2_PIX_FMT_Z16) {
+        target_framerate = 15;
+    }
+    set_framerate(ctx->fd, target_framerate);
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
@@ -671,6 +678,9 @@ static void *capture_thread(void *arg) {
     printf("[CAM%d] 采集线程启动，设备 %s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
 
     while (g_ctx.running) {
+        struct pollfd fds;
+        fds.fd = ctx->fd;
+        fds.events = POLLIN;
         const char *dev_path = g_ctx.video_devs[ctx->cam_id];
         if (ctx->fd < 0) {
             printf("[CAM%d] 设备未打开，尝试打开 %s\n", ctx->cam_id, dev_path);
@@ -700,22 +710,34 @@ static void *capture_thread(void *arg) {
             frame_count = 0;
         }
 
-        fd_set fds;
-        struct timeval tv;
-        FD_ZERO(&fds);
-        FD_SET(ctx->fd, &fds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+        // fd_set fds;
+        // struct timeval tv;
+        // FD_ZERO(&fds);
+        // FD_SET(ctx->fd, &fds);
+        // tv.tv_sec = 1;
+        // tv.tv_usec = 0;
 
-        int ret = select(ctx->fd + 1, &fds, NULL, NULL, &tv);
+        // int ret = select(ctx->fd + 1, &fds, NULL, NULL, &tv);
+        // if (ret < 0) {
+        //     if (errno == EINTR) continue;
+        //     perror("select");
+        //     close(ctx->fd);
+        //     ctx->fd = -1;
+        //     continue;
+        // }
+        // if (ret == 0) continue;
+        int ret = poll(&fds, 1, 200);
         if (ret < 0) {
-            if (errno == EINTR) continue;
-            perror("select");
+            if (errno == EINTR)
+                continue;
+            perror("poll");
             close(ctx->fd);
             ctx->fd = -1;
             continue;
+        } else if (ret == 0) {
+            // 超时，循环继续
+            continue;
         }
-        if (ret == 0) continue;
 
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
@@ -723,6 +745,10 @@ static void *capture_thread(void *arg) {
         buf.memory = V4L2_MEMORY_MMAP;
 
         if (ioctl(ctx->fd, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN) {
+                // poll 说有数据但 DQBUF 却返回 EAGAIN，极少数情况，直接重试
+                continue;
+            }
             if (errno == ENODEV) {
                 printf("[CAM%d] 设备已移除，关闭并等待重新连接\n", ctx->cam_id);
                 close(ctx->fd);
@@ -767,7 +793,7 @@ static void *capture_thread(void *arg) {
         } else if (ctx->format == V4L2_PIX_FMT_Z16) {
             if (buf.bytesused >= (ctx->width * ctx->height)) {
                 memcpy(&timestamp,
-                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 2),
+                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 2) * 2,
                        sizeof(timestamp));
             }
         }
@@ -836,7 +862,7 @@ static void *hid_thread(void *arg) {
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, 10); // 快速响应，频率控制在逻辑中实现
+        int ret = poll(&pfd, 1, -1); // 快速响应，频率控制在逻辑中实现
         if (ret < 0) {
             if (errno == EINTR) continue;
             perror("poll HID");

@@ -20,11 +20,11 @@
 #include "UvcExtensionUnit.hpp"
 #include <atomic>
 
-// ==================== 目标设备 VID/PID ====================
+// ==================== Target Device VID/PID ====================
 #define VENDOR_ID  0x1d6b
 #define PRODUCT_ID 0x0104
 
-// ==================== 摄像头配置 ====================
+// ==================== Camera Configuration ====================
 #define CAM_NUM 3
 #define HID_NUM 2
 #define MAIN_WIDTH   1088
@@ -39,7 +39,7 @@
 #define FRAME_RATE 30
 #define BUFFER_COUNT 8
 
-// ==================== 数据结构 ====================
+// ==================== Data Structures ====================
 #define MAX_PATH 1024
 
 struct buffer {
@@ -48,36 +48,36 @@ struct buffer {
 };
 
 struct cam_ctx {
-    int fd;                         // 设备文件描述符
-    struct buffer *buffers;         // mmap缓冲区数组
-    int buffer_count;               // 缓冲区数量
-    pthread_t tid;                  // 采集线程ID
+    int fd;                         // Device file descriptor
+    struct buffer *buffers;         // mmap buffer array
+    int buffer_count;               // Buffer count
+    pthread_t tid;                  // Capture thread ID
     int cam_id;
     int width;
     int height;
     unsigned int format;
 };
 
-// SDK全局上下文
+// SDK global context
 typedef struct {
-    // 摄像头
+    // Cameras
     struct cam_ctx cams[CAM_NUM];
-    char video_devs[CAM_NUM][MAX_PATH];   // 动态确定的 video 设备路径
-    char video_usb_paths[CAM_NUM][MAX_PATH]; // 设备对应的 USB 根路径，用于重连时重新查找
-    // HID设备（只使用两个：0=IMU, 1=VIO）
-    char hid_devs[HID_NUM][MAX_PATH];           // 动态确定的 hidraw 设备路径
-    char hid_usb_paths[HID_NUM][MAX_PATH];   // HID 设备对应的 USB 根路径，用于重连时重新查找
+    char video_devs[CAM_NUM][MAX_PATH];   // Dynamically resolved video device paths
+    char video_usb_paths[CAM_NUM][MAX_PATH]; // Matching USB root paths, used for rediscovery after reconnect
+    // HID devices (only two are used: 0=IMU, 1=VIO)
+    char hid_devs[HID_NUM][MAX_PATH];           // Dynamically resolved hidraw device paths
+    char hid_usb_paths[HID_NUM][MAX_PATH];   // Matching HID USB root paths, used for rediscovery after reconnect
     pthread_t hid_tids[HID_NUM];
-    // 回调
+    // Callbacks
     image_callback img_cb;
     void *img_userdata;
     imu_callback imu_cb;
     void *imu_userdata;
     vio_callback vio_cb;
     void *vio_userdata;
-    // 运行标志
+    // Running flag
     volatile int running;
-    // 初始化标志
+    // Initialization flag
     int initialized;
     viewer::UvcExtensionUnit *xu_control;
     std::atomic<bool> xu_ready;
@@ -85,7 +85,7 @@ typedef struct {
 
 static sdk_ctx_t g_ctx = {0};
 
-// ==================== 工具函数：sysfs 读取、VID/PID 解析等 ====================
+// ==================== Utilities: sysfs Reads, VID/PID Parsing, etc. ====================
 static void trim_newline(char *str) {
     size_t len = strlen(str);
     if (len > 0 && str[len-1] == '\n') str[len-1] = '\0';
@@ -253,7 +253,7 @@ static int compare_device_numbers(const void *a, const void *b) {
     return na - nb;
 }
 
-// 查找所有匹配 VID/PID 的 UVC 设备，返回找到的设备路径（/dev/videoX），按数字升序排列
+// Find all UVC devices matching the VID/PID, return device paths (/dev/videoX) sorted by numeric suffix.
 static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int target_pid,
                                        char dev_paths[][MAX_PATH], int max_devs) {
     DIR *dir = opendir("/sys/class/video4linux");
@@ -271,7 +271,7 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
         snprintf(video_sysfs, sizeof(video_sysfs), "/sys/class/video4linux/%s", entry->d_name);
         snprintf(dev_paths[count], MAX_PATH, "/dev/%s", entry->d_name);
 
-        // 检查是否为 UVC 捕获设备
+        // Check whether this is a UVC capture device.
         if (!is_uvc_device(dev_paths[count]))
             continue;
 
@@ -285,13 +285,13 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
     }
     closedir(dir);
 
-    // 按设备号排序
+    // Sort by device number.
     if (count > 1) {
-        // 临时指针数组用于排序
+        // Temporary pointer array for sorting.
         const char *ptrs[count];
         for (int i = 0; i < count; i++) ptrs[i] = dev_paths[i];
         qsort(ptrs, count, sizeof(char *), compare_device_numbers);
-        // 重新排列
+        // Reorder the device paths.
         char tmp[count][MAX_PATH];
         for (int i = 0; i < count; i++) strcpy(tmp[i], ptrs[i]);
         for (int i = 0; i < count; i++) strcpy(dev_paths[i], tmp[i]);
@@ -300,29 +300,29 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
 }
 
 static void refresh_video_device_path(int cam_id) {
-    printf("[CAM%d] 刷新设备路径...\n", cam_id);
+    printf("[CAM%d] Refreshing device path...\n", cam_id);
     if (cam_id < 0 || cam_id >= CAM_NUM) return;
-    printf("[CAM%d] 当前设备路径: %s\n", cam_id, g_ctx.video_devs[cam_id]);
+    printf("[CAM%d] Current device path: %s\n", cam_id, g_ctx.video_devs[cam_id]);
 
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < CAM_NUM) {
-        printf("[CAM%d] 找到 %d 个 UVC 设备，不足 %d 个，放弃重连\n", cam_id, uvc_count, CAM_NUM);
+        printf("[CAM%d] Found %d UVC devices, fewer than %d; skipping reconnect\n", cam_id, uvc_count, CAM_NUM);
         return;
     } else {
-        printf("[CAM%d] 找到 %d 个 UVC 设备，尝试匹配...\n", cam_id, uvc_count);
+        printf("[CAM%d] Found %d UVC devices, trying to match...\n", cam_id, uvc_count);
         for (int i = 0; i < uvc_count; ++i) {
             printf("  [%d] %s\n", i, uvc_list[i]);
         }
     }
 
-    // 优先按格式支持匹配，找到第一个支持当前相机格式的设备
+    // Prefer format-based matching and choose the first device that supports the current camera format.
     for (int i = 0; i < uvc_count; ++i) {
         if (video_device_supports_format(uvc_list[i], g_ctx.cams[cam_id].width,
                                          g_ctx.cams[cam_id].height,
                                          g_ctx.cams[cam_id].format)) {
             if (strcmp(uvc_list[i], g_ctx.video_devs[cam_id]) != 0) {
-                printf("[CAM%d] 重新匹配设备路径: %s -> %s (格式匹配)\n", cam_id,
+                printf("[CAM%d] Rematched device path: %s -> %s (format match)\n", cam_id,
                        g_ctx.video_devs[cam_id], uvc_list[i]);
                 strcpy(g_ctx.video_devs[cam_id], uvc_list[i]);
                 if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
@@ -333,17 +333,17 @@ static void refresh_video_device_path(int cam_id) {
         }
     }
 
-    // 后备方案：按照预定的设备索引选择
+    // Fallback: select by the predefined device index.
     int selected_idx[CAM_NUM] = {0, 2, 4};
     int index = (uvc_count >= 6 ? selected_idx[cam_id] : cam_id);
     if (index >= uvc_count) index = cam_id;
     if (index >= uvc_count) {
-        printf("[CAM%d] 设备索引超出范围，无法重连\n", cam_id);
+        printf("[CAM%d] Device index is out of range; cannot reconnect\n", cam_id);
         return;
     }
 
     if (strcmp(uvc_list[index], g_ctx.video_devs[cam_id]) != 0) {
-        printf("[CAM%d] 重新匹配设备路径: %s -> %s (索引备选)\n", cam_id, 
+        printf("[CAM%d] Rematched device path: %s -> %s (index fallback)\n", cam_id, 
                g_ctx.video_devs[cam_id], uvc_list[index]);
         strcpy(g_ctx.video_devs[cam_id], uvc_list[index]);
     }
@@ -352,7 +352,7 @@ static void refresh_video_device_path(int cam_id) {
     }
 }
 
-// 查找所有匹配 VID/PID 的 HID 设备，返回找到的设备路径（/dev/hidrawX），按数字升序排列
+// Find all HID devices matching the VID/PID, return device paths (/dev/hidrawX) sorted by numeric suffix.
 static int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int target_pid,
                                        char dev_paths[][MAX_PATH], int max_devs) {
     DIR *dir = opendir("/sys/class/hidraw");
@@ -370,12 +370,12 @@ static int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
         snprintf(hidraw_sysfs, sizeof(hidraw_sysfs), "/sys/class/hidraw/%s", entry->d_name);
         snprintf(dev_paths[count], MAX_PATH, "/dev/%s", entry->d_name);
 
-        // 找到 hidraw 设备对应的 USB 路径
+        // Find the USB path corresponding to the hidraw device.
         char device_path[MAX_PATH];
         snprintf(device_path, sizeof(device_path), "%s/device", hidraw_sysfs);
         if (realpath(device_path, usb_path) == NULL) continue;
 
-        // 向上查找 USB 根目录（包含 idVendor）
+        // Walk upward to find the USB root directory that contains idVendor.
         char *p;
         while (1) {
             snprintf(device_path, sizeof(device_path), "%s/idVendor", usb_path);
@@ -411,13 +411,13 @@ static void refresh_hid_device_path(int idx) {
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
     if (hid_count < HID_NUM) {
-        printf("[HID%d] 找到 %d 个 HID 设备，不足 %d 个，放弃重连\n", idx, hid_count, HID_NUM);
+        printf("[HID%d] Found %d HID devices, fewer than %d; skipping reconnect\n", idx, hid_count, HID_NUM);
         return;
     }
 
-    // 尝试用缓存的 USB 路径查找，但如果失效则直接选择缓存列表中的设备
+    // Try matching with the cached USB path; if it is stale, choose the device from the current list.
     if (strcmp(hid_list[idx], g_ctx.hid_devs[idx]) != 0) {
-        printf("[HID%d] 重新匹配设备路径: %s -> %s\n", idx, 
+        printf("[HID%d] Rematched device path: %s -> %s\n", idx, 
                g_ctx.hid_devs[idx], hid_list[idx]);
         strcpy(g_ctx.hid_devs[idx], hid_list[idx]);
     }
@@ -426,16 +426,16 @@ static void refresh_hid_device_path(int idx) {
     }
 }
 
-// ==================== V4L2 操作函数 ====================
+// ==================== V4L2 Operations ====================
 static void print_camera_info(int fd) {
     struct v4l2_capability cap;
     if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
         perror("VIDIOC_QUERYCAP failed");
         return;
     }
-    printf("  驱动: %s\n", cap.driver);
-    printf("  卡: %s\n", cap.card);
-    printf("  总线: %s\n", cap.bus_info);
+    printf("  Driver: %s\n", cap.driver);
+    printf("  Card: %s\n", cap.card);
+    printf("  Bus: %s\n", cap.bus_info);
 }
 
 static int set_framerate(int fd, int framerate) {
@@ -447,7 +447,7 @@ static int set_framerate(int fd, int framerate) {
         return -1;
     }
     if (!(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
-        // 设备不支持设置帧率
+        // The device does not support setting the frame rate.
         return 0;
     }
     parm.parm.capture.timeperframe.numerator = 1;
@@ -456,7 +456,7 @@ static int set_framerate(int fd, int framerate) {
         perror("VIDIOC_S_PARM failed");
         return -1;
     }
-    printf("  设置帧率: %d fps\n", framerate);
+    printf("  Set frame rate: %d fps\n", framerate);
     return 0;
 }
 
@@ -469,7 +469,7 @@ static int init_capture(struct cam_ctx *ctx) {
     fmt.fmt.pix.pixelformat = ctx->format;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
-    printf("[CAM%d] 设置格式: %dx%d, format=0x%x\n",
+    printf("[CAM%d] Setting format: %dx%d, format=0x%x\n",
            ctx->cam_id, ctx->width, ctx->height, ctx->format);
 
     if (ioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
@@ -480,7 +480,7 @@ static int init_capture(struct cam_ctx *ctx) {
     ctx->width = fmt.fmt.pix.width;
     ctx->height = fmt.fmt.pix.height;
     ctx->format = fmt.fmt.pix.pixelformat;
-    printf("[CAM%d] 设置后: %dx%d, format=0x%x\n", ctx->cam_id,
+    printf("[CAM%d] After setting: %dx%d, format=0x%x\n", ctx->cam_id,
            ctx->width, ctx->height, ctx->format);
     
     int target_framerate = 30;
@@ -563,10 +563,10 @@ static int stop_capture(int fd) {
     return 0;
 }
 
-// ==================== 拓展单元辅助函数 ====================
+// ==================== Extension Unit Helpers ====================
 static int ensure_xu_available() {
     if (!g_ctx.xu_control) {
-        // 尝试重新创建
+        // Try to recreate the extension unit.
         if (g_ctx.video_devs[0][0] == '\0') return -1;
         g_ctx.xu_control = new viewer::UvcExtensionUnit();
         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
@@ -577,7 +577,7 @@ static int ensure_xu_available() {
         }
         g_ctx.xu_ready = true;
     } else if (!g_ctx.xu_control->isOpen()) {
-        // 已经存在但关闭了，尝试重新打开（路径可能改变）
+        // The extension unit exists but is closed; try to reopen it because the path may have changed.
         g_ctx.xu_control->close();
         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
             g_ctx.xu_ready = false;
@@ -589,12 +589,12 @@ static int ensure_xu_available() {
 }
 
 static int is_camera_params_valid(const camera_params *params) {
-    // 校验分辨率索引（RGB:0-3, 灰度:0-1，但SDK不知道具体类型，限定0-3较为宽松）
+    // Validate resolution index. RGB uses 0-3 and grayscale uses 0-1; the SDK uses the more permissive 0-3 range.
     if (params->resolution > 3) {
         fprintf(stderr, "Invalid resolution index, expected 0-3, got %d\n", params->resolution);
         return 0;
     }
-    // 校验帧率索引
+    // Validate frame-rate index.
     if (params->frame_rate > 5) {
         fprintf(stderr, "Invalid frame rate index, expected 0-5, got %d\n", params->frame_rate);
         return 0;
@@ -610,7 +610,7 @@ static int is_camera_params_valid(const camera_params *params) {
         fprintf(stderr, "Invalid exposure gain, expected 1.0-16.0, got %f\n", params->exposure_gain);
         return 0;
     }
-    // auto_exposure: 0 或 1
+    // auto_exposure: 0 or 1
     if (params->auto_exposure > 1) {
         fprintf(stderr, "Invalid auto exposure, expected 0 or 1, got %d\n", params->auto_exposure);
         return 0;
@@ -645,7 +645,7 @@ static int is_camera_params_valid(const camera_params *params) {
         fprintf(stderr, "Invalid sharpness, expected 1-255, got %d\n", params->sharpness);
         return 0;
     }
-    // auto_white_balance: 0 或 1
+    // auto_white_balance: 0 or 1
     if (params->auto_white_balance > 1) {
         fprintf(stderr, "Invalid auto white balance, expected 0 or 1, got %d\n", params->auto_white_balance);
         return 0;
@@ -669,13 +669,13 @@ static int is_camera_params_valid(const camera_params *params) {
     return 1;
 }
 
-// ==================== 摄像头采集线程 ====================
+// ==================== Camera Capture Thread ====================
 static void *capture_thread(void *arg) {
     struct cam_ctx *ctx = (struct cam_ctx *)arg;
     unsigned long frame_count = 0;
     const char *dev_path = g_ctx.video_devs[ctx->cam_id];
 
-    printf("[CAM%d] 采集线程启动，设备 %s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
+    printf("[CAM%d] Capture thread started, device %s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
 
     while (g_ctx.running) {
         struct pollfd fds;
@@ -683,13 +683,13 @@ static void *capture_thread(void *arg) {
         fds.events = POLLIN;
         const char *dev_path = g_ctx.video_devs[ctx->cam_id];
         if (ctx->fd < 0) {
-            printf("[CAM%d] 设备未打开，尝试打开 %s\n", ctx->cam_id, dev_path);
+            printf("[CAM%d] Device is not open; trying to open %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
-            printf("[CAM%d] 尝试重新打开设备 %s\n", ctx->cam_id, dev_path);
+            printf("[CAM%d] Trying to reopen device %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
-                printf("[CAM%d] 打开失败: %s，等待重试...\n", ctx->cam_id, strerror(errno));
+                printf("[CAM%d] Open failed: %s; waiting before retry...\n", ctx->cam_id, strerror(errno));
                 usleep(1000000);
                 continue;
             }
@@ -700,13 +700,13 @@ static void *capture_thread(void *arg) {
                 continue;
             }
             if (start_capture(ctx->fd) < 0) {
-                printf("[CAM%d] 启动流失败\n", ctx->cam_id);
+                printf("[CAM%d] Failed to start stream\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
                 usleep(1000000);
                 continue;
             }
-            printf("[CAM%d] 设备重新初始化成功\n", ctx->cam_id);
+            printf("[CAM%d] Device reinitialized successfully\n", ctx->cam_id);
             frame_count = 0;
         }
 
@@ -735,7 +735,7 @@ static void *capture_thread(void *arg) {
             ctx->fd = -1;
             continue;
         } else if (ret == 0) {
-            // 超时，循环继续
+            // Timed out; continue the loop.
             continue;
         }
 
@@ -746,11 +746,11 @@ static void *capture_thread(void *arg) {
 
         if (ioctl(ctx->fd, VIDIOC_DQBUF, &buf) < 0) {
             if (errno == EAGAIN) {
-                // poll 说有数据但 DQBUF 却返回 EAGAIN，极少数情况，直接重试
+                // poll reported data but DQBUF returned EAGAIN; this is rare, so retry directly.
                 continue;
             }
             if (errno == ENODEV) {
-                printf("[CAM%d] 设备已移除，关闭并等待重新连接\n", ctx->cam_id);
+                printf("[CAM%d] Device removed; closing and waiting for reconnect\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
                 if (ctx->buffers) {
@@ -821,7 +821,7 @@ static void *capture_thread(void *arg) {
     return NULL;
 }
 
-// ==================== HID 设备读取 ====================
+// ==================== HID Device Reading ====================
 struct __attribute__((packed)) imu_hid_report {
     float ax, ay, az;
     float gx, gy, gz;
@@ -845,7 +845,7 @@ static void *hid_thread(void *arg) {
     struct timespec last_cb_ts;
     clock_gettime(CLOCK_MONOTONIC, &last_cb_ts);
 
-    printf("HID 线程 %d 启动，设备 %s\n", idx, g_ctx.hid_devs[idx]);
+    printf("HID thread %d started, device %s\n", idx, g_ctx.hid_devs[idx]);
 
     while (g_ctx.running) {
         const char *device = g_ctx.hid_devs[idx];
@@ -858,11 +858,11 @@ static void *hid_thread(void *arg) {
                 usleep(1000000);
                 continue;
             }
-            printf("成功打开 HID 设备 %s\n", device);
+            printf("Opened HID device %s successfully\n", device);
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, -1); // 快速响应，频率控制在逻辑中实现
+        int ret = poll(&pfd, 1, -1); // Fast response; rate limiting is handled in the loop.
         if (ret < 0) {
             if (errno == EINTR) continue;
             perror("poll HID");
@@ -917,11 +917,11 @@ static void *hid_thread(void *arg) {
     }
 
     if (fd >= 0) close(fd);
-    printf("HID 线程 %d 退出\n", idx);
+    printf("HID thread %d exited\n", idx);
     return NULL;
 }
 
-// ==================== SDK API 实现 ====================
+// ==================== SDK API Implementation ====================
 int insight9_receive_init(void) {
     if (g_ctx.initialized) {
         fprintf(stderr, "Insight_9_receive already initialized\n");
@@ -930,7 +930,7 @@ int insight9_receive_init(void) {
 
     memset(&g_ctx, 0, sizeof(g_ctx));
 
-    // 查找 UVC 设备
+    // Find UVC devices.
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < 3) {
@@ -938,7 +938,7 @@ int insight9_receive_init(void) {
                 VENDOR_ID, PRODUCT_ID, uvc_count);
         return -1;
     }
-    // 隔一个选取：索引 0,2,4
+    // Select every other device: indexes 0, 2, and 4.
     int selected_idx[] = {0, 2, 4};
     for (int i = 0; i < CAM_NUM; i++) {
         if (selected_idx[i] >= uvc_count) {
@@ -953,7 +953,7 @@ int insight9_receive_init(void) {
         printf("Selected UVC device %d: %s\n", i, g_ctx.video_devs[i]);
     }
 
-    // 查找 HID 设备
+    // Find HID devices.
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
     if (hid_count < 2) {
@@ -961,7 +961,7 @@ int insight9_receive_init(void) {
                 VENDOR_ID, PRODUCT_ID, hid_count);
         return -1;
     }
-    // 取前两个，小的为 IMU，大的为 VIO（已排序）
+    // Take the first two devices after sorting: the lower number is IMU and the higher number is VIO.
     strcpy(g_ctx.hid_devs[0], hid_list[0]);
     strcpy(g_ctx.hid_devs[1], hid_list[1]);
     g_ctx.hid_usb_paths[0][0] = '\0';
@@ -974,7 +974,7 @@ int insight9_receive_init(void) {
     }
     printf("Selected HID devices: IMU=%s, VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
 
-    // 初始化摄像头上下文
+    // Initialize camera contexts.
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cams[i].cam_id = i;
         g_ctx.cams[i].fd = -1;
@@ -1160,7 +1160,8 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
 }
 
 int insight9_receive_reset_camera_params(int cam_id) {
-    // 读取设备的出厂默认值需额外实现，这里提供一个简便方法：初始化时先读取当前值并保存为初始值，需要恢复时直接写回去。
+    // Reading factory defaults from the device requires additional implementation. A simple approach is to read
+    // and save the current values during initialization, then write them back when a reset is needed.
     fprintf(stderr, "reset_camera_params not implemented, use set_camera_params with saved defaults\n");
     return -1;
 }

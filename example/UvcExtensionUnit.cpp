@@ -10,7 +10,7 @@
 
 namespace viewer {
 
-// 包装 uvc_control_query（需要从内核头文件或自己实现）
+// Wrap uvc_control_query, which must come from kernel headers or a local implementation.
 static int uvc_control_query(int fd, __u8 unit, __u8 selector,
                              __u8 query, void *data, __u16 size)
 {
@@ -59,7 +59,7 @@ bool UvcExtensionUnit::open(const std::string& devicePath) {
         return false;
     }
 
-    // 检查必需的选择器是否存在
+    // Check whether the required selectors exist.
     if (!selector_exists(fd_, unitId_, 4) || !selector_exists(fd_, unitId_, 7)) {
         fprintf(stderr, "UVC extension unit %d missing selector 4 or 7\n", unitId_);
         close();
@@ -113,7 +113,7 @@ bool UvcExtensionUnit::writeCurrentCameraParams(const camera_params& params) con
 bool UvcExtensionUnit::readCameraParams(uint8_t camId, camera_params& params) const {
     if (!isOpen()) return false;
     if (!setActiveCamera(camId)) return false;
-    usleep(50000); // 等待切换稳定
+    usleep(50000); // Wait for the switch to stabilize.
     return readCurrentCameraParams(params);
 }
 

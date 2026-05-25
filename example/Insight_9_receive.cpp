@@ -861,10 +861,7 @@ static void *hid_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
-
-    const long desired_interval_us = (idx == 0 ? 2500L : 33333L); // IMU 400Hz, VIO 30Hz
-    struct timespec last_cb_ts;
-    clock_gettime(CLOCK_MONOTONIC, &last_cb_ts);
+    uint64_t last_ts = 0;
 
     printf("[HID%d] thread started, dev=%s\n", idx, g_ctx.hid_devs[idx]);
 
@@ -881,10 +878,11 @@ static void *hid_thread(void *arg) {
                 continue;
             }
             printf("[HID%d] opened %s\n", idx, device);
+            last_ts = 0;
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, -1); // Fast response; rate limiting is handled in the loop.
+        int ret = poll(&pfd, 1, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "[HID%d][ERR] poll: %s\n", idx, strerror(errno));
@@ -894,23 +892,18 @@ static void *hid_thread(void *arg) {
         }
         if (ret == 0) continue;
 
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_us = (now.tv_sec - last_cb_ts.tv_sec) * 1000000L +
-                          (now.tv_nsec - last_cb_ts.tv_nsec) / 1000L;
-
         if (idx == 0) {
             struct imu_hid_report rpt;
             int n = read(fd, &rpt, sizeof(rpt));
             if (n == sizeof(rpt)) {
-                if (elapsed_us >= desired_interval_us) {
-                    last_cb_ts = now;
-                    if (g_ctx.imu_cb) {
-                        g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
-                                     rpt.gx, rpt.gy, rpt.gz,
-                                     rpt.timestamp,
-                                     g_ctx.imu_userdata);
-                    }
+                // Drop duplicates if the device redelivers the same sample.
+                if (rpt.timestamp != 0 && rpt.timestamp == last_ts) continue;
+                last_ts = rpt.timestamp;
+                if (g_ctx.imu_cb) {
+                    g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
+                                 rpt.gx, rpt.gy, rpt.gz,
+                                 rpt.timestamp,
+                                 g_ctx.imu_userdata);
                 }
             } else if (n < 0) {
                 fprintf(stderr, "[HID%d][ERR] read IMU: %s\n", idx, strerror(errno));
@@ -921,14 +914,13 @@ static void *hid_thread(void *arg) {
             struct vio_hid_payload payload;
             int n = read(fd, &payload, sizeof(payload));
             if (n == sizeof(payload)) {
-                if (elapsed_us >= desired_interval_us) {
-                    last_cb_ts = now;
-                    if (g_ctx.vio_cb) {
-                        g_ctx.vio_cb(payload.px, payload.py, payload.pz,
-                                     payload.qx, payload.qy, payload.qz, payload.qw,
-                                     payload.timestamp,
-                                     g_ctx.vio_userdata);
-                    }
+                if (payload.timestamp != 0 && payload.timestamp == last_ts) continue;
+                last_ts = payload.timestamp;
+                if (g_ctx.vio_cb) {
+                    g_ctx.vio_cb(payload.px, payload.py, payload.pz,
+                                 payload.qx, payload.qy, payload.qz, payload.qw,
+                                 payload.timestamp,
+                                 g_ctx.vio_userdata);
                 }
             } else if (n < 0) {
                 fprintf(stderr, "[HID%d][ERR] read VIO: %s\n", idx, strerror(errno));

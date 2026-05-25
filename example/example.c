@@ -24,7 +24,16 @@ struct cam_stats {
     int      zero_size_count;
 };
 
+struct hid_stats {
+    uint64_t cb_count;
+    uint64_t unique_ts_count;
+    uint64_t last_ts;
+    uint64_t ts_delta_sum_us;
+};
+
 static struct cam_stats g_stats[3];
+static struct hid_stats g_imu_stats;
+static struct hid_stats g_vio_stats;
 static struct timespec g_last_print;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_stats_inited = 0;
@@ -37,6 +46,23 @@ static void reset_stats(void) {
         g_stats[i].min_size = (size_t)-1;
         g_stats[i].max_size = 0;
         g_stats[i].zero_size_count = 0;
+    }
+    g_imu_stats.cb_count = 0;
+    g_imu_stats.unique_ts_count = 0;
+    g_imu_stats.ts_delta_sum_us = 0;
+    g_vio_stats.cb_count = 0;
+    g_vio_stats.unique_ts_count = 0;
+    g_vio_stats.ts_delta_sum_us = 0;
+}
+
+static void update_hid_stats(struct hid_stats *s, uint64_t ts) {
+    s->cb_count++;
+    if (ts != s->last_ts) {
+        if (s->last_ts != 0 && ts > s->last_ts) {
+            s->ts_delta_sum_us += (ts - s->last_ts);
+        }
+        s->unique_ts_count++;
+        s->last_ts = ts;
     }
 }
 
@@ -69,7 +95,7 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
     double elapsed = (now.tv_sec - g_last_print.tv_sec) +
                      (now.tv_nsec - g_last_print.tv_nsec) / 1e9;
     if (elapsed >= 1.0) {
-        printf("---- FPS stats (window=%.2fs) ----\n", elapsed);
+        printf("---- stats (window=%.2fs) ----\n", elapsed);
         const char *names[3] = {"RGB ", "GREY", "Z16 "};
         for (int i = 0; i < 3; i++) {
             struct cam_stats *cs = &g_stats[i];
@@ -83,6 +109,17 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
                    i, names[i], cb_fps, uts_fps, avg_ts_dt_ms,
                    min_sz, cs->max_size, cs->zero_size_count);
         }
+        struct hid_stats *hs[2] = {&g_imu_stats, &g_vio_stats};
+        const char *hnames[2] = {"IMU ", "VIO "};
+        for (int i = 0; i < 2; i++) {
+            double cb_fps  = hs[i]->cb_count / elapsed;
+            double uts_fps = hs[i]->unique_ts_count / elapsed;
+            double avg_ts_dt_ms = (hs[i]->unique_ts_count > 1)
+                ? (hs[i]->ts_delta_sum_us / (double)(hs[i]->unique_ts_count - 1)) / 1000.0
+                : 0.0;
+            printf("  %s     : cb=%6.1ffps  uniqueTS=%5.1ffps  avgTSdt=%6.2fms\n",
+                   hnames[i], cb_fps, uts_fps, avg_ts_dt_ms);
+        }
         fflush(stdout);
         reset_stats();
         g_last_print = now;
@@ -93,14 +130,17 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
 void my_imu_cb(float ax, float ay, float az,
                float gx, float gy, float gz,
                uint64_t ts, void *user) {
-    //printf("IMU: ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
-           //ax, ay, az, gx, gy, gz, ts);
+    pthread_mutex_lock(&g_stats_lock);
+    update_hid_stats(&g_imu_stats, ts);
+    pthread_mutex_unlock(&g_stats_lock);
 }
 
 void my_vio_cb(float px, float py, float pz,
                float qx, float qy, float qz, float qw,
                uint64_t ts, void *user) {
-    //printf("VIO: pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n", px, py, pz, qx, qy, qz, qw, ts);
+    pthread_mutex_lock(&g_stats_lock);
+    update_hid_stats(&g_vio_stats, ts);
+    pthread_mutex_unlock(&g_stats_lock);
 }
 
 int main() {

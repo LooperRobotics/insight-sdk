@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string>
 
 #pragma pack(push, 1)
 typedef struct {
@@ -21,7 +22,7 @@ typedef struct {
     uint8_t auto_white_balance; // Auto white balance, 0 or 1
     float white_balance;        // White balance, range 1.0~3.0
     uint8_t decimation;         // Decimation, currently unused
-    uint8_t rotation;           // Rotation, currently unused
+    uint8_t hardware_model;     // Hardware model, currently unused
 } camera_params;
 #pragma pack(pop)
 
@@ -171,6 +172,12 @@ int insight9_receive_reset_camera_params(int cam_id);
  * @param params Pointer to camera_params
  */
 void insight9_receive_print_camera_params(const camera_params *params);
+
+/**
+ * @brief Get the hardware type/model as a string. This requires reading the current camera parameters to determine the hardware_model field, which is then mapped to a string.
+ * @return Hardware type/model string, or "unknown" on failure.
+ */
+std::string insight9_receive_get_hardware_type();
 
 #ifdef __cplusplus
 }

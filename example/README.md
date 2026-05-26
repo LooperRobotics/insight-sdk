@@ -418,6 +418,8 @@ int main() {
     } else {
         printf("Failed to set camera parameters (invalid range or XU not available)\n");
     }
+    
+    printf("Hardware type: %s\n", insight9_receive_get_hardware_type().c_str());
 
     printf("SDK running, press Ctrl+C to stop...\n");
     while (keep_running) {

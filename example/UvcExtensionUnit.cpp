@@ -127,7 +127,7 @@ bool UvcExtensionUnit::writeCameraParams(uint8_t camId, const camera_params& par
 void printParams(const camera_params& params) {
     std::printf(
         "[XU] cam=%u res=%u fps=%u exp_t=%.4f exp_g=%.4f bl=%u bright=%.4f contrast=%.4f "
-        "gamma=%.4f hue=%.4f sat=%.4f sharp=%u awb=%u wb=%.4f dec=%u rot=%u\n",
+        "gamma=%.4f hue=%.4f sat=%.4f sharp=%u awb=%u wb=%.4f dec=%u\n",
         static_cast<unsigned>(params.cam_id),
         static_cast<unsigned>(params.resolution),
         static_cast<unsigned>(params.frame_rate),
@@ -142,8 +142,8 @@ void printParams(const camera_params& params) {
         static_cast<unsigned>(params.sharpness),
         static_cast<unsigned>(params.auto_white_balance),
         params.white_balance,
-        static_cast<unsigned>(params.decimation),
-        static_cast<unsigned>(params.rotation));
+        static_cast<unsigned>(params.decimation)
+    );
 }
 
 } // namespace viewer

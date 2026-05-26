@@ -42,6 +42,8 @@
 // ==================== Data Structures ====================
 #define MAX_PATH 1024
 
+std::string hardware_model[50] = { "Insight 9", "Insight 7", "Insight 7p", "Insight 3u" };
+
 struct buffer {
     void *start;
     size_t length;
@@ -662,11 +664,6 @@ static int is_camera_params_valid(const camera_params *params) {
         fprintf(stderr, "[XU][ERR] invalid decimation, expected 1-255, got %d\n", params->decimation);
         return 0;
     }
-    // rotation: 1 ~ 255
-    if (params->rotation < 1 || params->rotation > 255) {
-        fprintf(stderr, "[XU][ERR] invalid rotation, expected 1-255, got %d\n", params->rotation);
-        return 0;
-    }
 
     return 1;
 }
@@ -1185,6 +1182,12 @@ void insight9_receive_print_camera_params(const camera_params *params) {
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(xu_params));
     viewer::printParams(xu_params);
+}
+
+std::string insight9_receive_get_hardware_type() {
+    viewer::camera_params xu_params;
+    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) return "unknown";
+    return hardware_model[xu_params.hardware_model];
 }
 
 } // extern "C"

@@ -206,7 +206,6 @@ int main() {
     params.sharpness = 128;
     params.white_balance = 2.0f;
     params.decimation = 1;
-    params.rotation = 1;
 
     if (insight9_receive_set_camera_params_for(0, &params) == 0) {
         printf("Camera parameters set successfully\n");
@@ -219,6 +218,8 @@ int main() {
     } else {
         printf("Failed to set camera parameters (invalid range or XU not available)\n");
     }
+
+    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type().c_str());
 
     printf("SDK running, press Ctrl+C to stop...\n");
     while (keep_running) {

@@ -89,6 +89,23 @@ int insight9_receive_start(void);
 const char *insight9_receive_get_video_dev(int cam_id);
 
 /**
+ * @brief Get the metadata device path for the specified camera.
+ * @param cam_id Camera index (0..2).
+ * @return Metadata device path string, or NULL on failure.
+ */
+const char *insight9_receive_get_metadata_dev(int cam_id);
+
+/**
+ * @brief Read one timestamp sample from the camera metadata node.
+ * @param cam_id Camera index (0..2).
+ * @param timestamp Output timestamp parsed from metadata PTS/SCR low 32 bits.
+ * @return 0 on success, -1 on failure.
+ * @note This opens and streams the metadata node briefly. Avoid calling it while
+ *       insight9_receive_start() is already streaming the same metadata node.
+ */
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
+
+/**
  * @brief Stop all capture threads.
  */
 void insight9_receive_stop(void);

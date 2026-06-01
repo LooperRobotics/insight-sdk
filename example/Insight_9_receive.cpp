@@ -42,6 +42,8 @@
 // ==================== Data Structures ====================
 #define MAX_PATH 1024
 
+std::string hardware_model[50] = { "Insight 9", "Insight 7", "Insight 7p", "Insight 3u" };
+
 struct buffer {
     void *start;
     size_t length;
@@ -56,6 +58,7 @@ struct cam_ctx {
     int width;
     int height;
     unsigned int format;
+    uint64_t last_timestamp;        // Last embedded timestamp delivered, used to drop duplicates
 };
 
 // SDK global context
@@ -300,20 +303,20 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
 }
 
 static void refresh_video_device_path(int cam_id) {
-    printf("[CAM%d] Refreshing device path...\n", cam_id);
     if (cam_id < 0 || cam_id >= CAM_NUM) return;
-    printf("[CAM%d] Current device path: %s\n", cam_id, g_ctx.video_devs[cam_id]);
+    printf("[CAM%d] refreshing device path (current=%s)\n",
+           cam_id, g_ctx.video_devs[cam_id]);
 
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < CAM_NUM) {
-        printf("[CAM%d] Found %d UVC devices, fewer than %d; skipping reconnect\n", cam_id, uvc_count, CAM_NUM);
+        fprintf(stderr, "[CAM%d][WARN] found %d UVC devices (< %d), skip reconnect\n",
+                cam_id, uvc_count, CAM_NUM);
         return;
-    } else {
-        printf("[CAM%d] Found %d UVC devices, trying to match...\n", cam_id, uvc_count);
-        for (int i = 0; i < uvc_count; ++i) {
-            printf("  [%d] %s\n", i, uvc_list[i]);
-        }
+    }
+    printf("[CAM%d] found %d UVC devices, matching:\n", cam_id, uvc_count);
+    for (int i = 0; i < uvc_count; ++i) {
+        printf("[CAM%d]   [%d] %s\n", cam_id, i, uvc_list[i]);
     }
 
     // Prefer format-based matching and choose the first device that supports the current camera format.
@@ -322,8 +325,8 @@ static void refresh_video_device_path(int cam_id) {
                                          g_ctx.cams[cam_id].height,
                                          g_ctx.cams[cam_id].format)) {
             if (strcmp(uvc_list[i], g_ctx.video_devs[cam_id]) != 0) {
-                printf("[CAM%d] Rematched device path: %s -> %s (format match)\n", cam_id,
-                       g_ctx.video_devs[cam_id], uvc_list[i]);
+                printf("[CAM%d] rematched %s -> %s (format match)\n",
+                       cam_id, g_ctx.video_devs[cam_id], uvc_list[i]);
                 strcpy(g_ctx.video_devs[cam_id], uvc_list[i]);
                 if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
                     g_ctx.video_usb_paths[cam_id][0] = '\0';
@@ -338,13 +341,13 @@ static void refresh_video_device_path(int cam_id) {
     int index = (uvc_count >= 6 ? selected_idx[cam_id] : cam_id);
     if (index >= uvc_count) index = cam_id;
     if (index >= uvc_count) {
-        printf("[CAM%d] Device index is out of range; cannot reconnect\n", cam_id);
+        fprintf(stderr, "[CAM%d][ERR] device index out of range, cannot reconnect\n", cam_id);
         return;
     }
 
     if (strcmp(uvc_list[index], g_ctx.video_devs[cam_id]) != 0) {
-        printf("[CAM%d] Rematched device path: %s -> %s (index fallback)\n", cam_id, 
-               g_ctx.video_devs[cam_id], uvc_list[index]);
+        printf("[CAM%d] rematched %s -> %s (index fallback)\n",
+               cam_id, g_ctx.video_devs[cam_id], uvc_list[index]);
         strcpy(g_ctx.video_devs[cam_id], uvc_list[index]);
     }
     if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
@@ -411,14 +414,15 @@ static void refresh_hid_device_path(int idx) {
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
     if (hid_count < HID_NUM) {
-        printf("[HID%d] Found %d HID devices, fewer than %d; skipping reconnect\n", idx, hid_count, HID_NUM);
+        fprintf(stderr, "[HID%d][WARN] found %d HID devices (< %d), skip reconnect\n",
+                idx, hid_count, HID_NUM);
         return;
     }
 
     // Try matching with the cached USB path; if it is stale, choose the device from the current list.
     if (strcmp(hid_list[idx], g_ctx.hid_devs[idx]) != 0) {
-        printf("[HID%d] Rematched device path: %s -> %s\n", idx, 
-               g_ctx.hid_devs[idx], hid_list[idx]);
+        printf("[HID%d] rematched %s -> %s\n",
+               idx, g_ctx.hid_devs[idx], hid_list[idx]);
         strcpy(g_ctx.hid_devs[idx], hid_list[idx]);
     }
     if (get_hid_usb_device_path(g_ctx.hid_devs[idx], g_ctx.hid_usb_paths[idx], MAX_PATH) < 0) {
@@ -443,7 +447,7 @@ static int set_framerate(int fd, int framerate) {
     memset(&parm, 0, sizeof(parm));
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_G_PARM, &parm) < 0) {
-        perror("VIDIOC_G_PARM failed");
+        fprintf(stderr, "[CAM][ERR] VIDIOC_G_PARM: %s\n", strerror(errno));
         return -1;
     }
     if (!(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
@@ -453,10 +457,10 @@ static int set_framerate(int fd, int framerate) {
     parm.parm.capture.timeperframe.numerator = 1;
     parm.parm.capture.timeperframe.denominator = framerate;
     if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
-        perror("VIDIOC_S_PARM failed");
+        fprintf(stderr, "[CAM][ERR] VIDIOC_S_PARM: %s\n", strerror(errno));
         return -1;
     }
-    printf("  Set frame rate: %d fps\n", framerate);
+    printf("[CAM] set framerate=%d fps\n", framerate);
     return 0;
 }
 
@@ -469,19 +473,19 @@ static int init_capture(struct cam_ctx *ctx) {
     fmt.fmt.pix.pixelformat = ctx->format;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
-    printf("[CAM%d] Setting format: %dx%d, format=0x%x\n",
+    printf("[CAM%d] setting format %dx%d fmt=0x%x\n",
            ctx->cam_id, ctx->width, ctx->height, ctx->format);
 
     if (ioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
-        perror("VIDIOC_S_FMT failed");
+        fprintf(stderr, "[CAM%d][ERR] VIDIOC_S_FMT: %s\n", ctx->cam_id, strerror(errno));
         return -1;
     }
 
     ctx->width = fmt.fmt.pix.width;
     ctx->height = fmt.fmt.pix.height;
     ctx->format = fmt.fmt.pix.pixelformat;
-    printf("[CAM%d] After setting: %dx%d, format=0x%x\n", ctx->cam_id,
-           ctx->width, ctx->height, ctx->format);
+    printf("[CAM%d] negotiated %dx%d fmt=0x%x\n",
+           ctx->cam_id, ctx->width, ctx->height, ctx->format);
     
     int target_framerate = 30;
     if (ctx->format == V4L2_PIX_FMT_GREY) {
@@ -498,18 +502,18 @@ static int init_capture(struct cam_ctx *ctx) {
     req.memory = V4L2_MEMORY_MMAP;
 
     if (ioctl(ctx->fd, VIDIOC_REQBUFS, &req) < 0) {
-        perror("VIDIOC_REQBUFS failed");
+        fprintf(stderr, "[CAM%d][ERR] VIDIOC_REQBUFS: %s\n", ctx->cam_id, strerror(errno));
         return -1;
     }
 
     if (req.count < 2) {
-        fprintf(stderr, "Insufficient buffers\n");
+        fprintf(stderr, "[CAM%d][ERR] insufficient buffers (%u)\n", ctx->cam_id, req.count);
         return -1;
     }
 
     ctx->buffers = (buffer*)calloc(req.count, sizeof(struct buffer));
     if (!ctx->buffers) {
-        perror("calloc");
+        fprintf(stderr, "[CAM%d][ERR] calloc: %s\n", ctx->cam_id, strerror(errno));
         return -1;
     }
     ctx->buffer_count = req.count;
@@ -522,7 +526,7 @@ static int init_capture(struct cam_ctx *ctx) {
         buf.index = i;
 
         if (ioctl(ctx->fd, VIDIOC_QUERYBUF, &buf) < 0) {
-            perror("VIDIOC_QUERYBUF");
+            fprintf(stderr, "[CAM%d][ERR] VIDIOC_QUERYBUF: %s\n", ctx->cam_id, strerror(errno));
             return -1;
         }
 
@@ -532,12 +536,12 @@ static int init_capture(struct cam_ctx *ctx) {
                                      MAP_SHARED, ctx->fd, buf.m.offset);
 
         if (ctx->buffers[i].start == MAP_FAILED) {
-            perror("mmap");
+            fprintf(stderr, "[CAM%d][ERR] mmap: %s\n", ctx->cam_id, strerror(errno));
             return -1;
         }
 
         if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF");
+            fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
             return -1;
         }
     }
@@ -548,7 +552,7 @@ static int init_capture(struct cam_ctx *ctx) {
 static int start_capture(int fd) {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-        perror("VIDIOC_STREAMON");
+        fprintf(stderr, "[CAM][ERR] VIDIOC_STREAMON: %s\n", strerror(errno));
         return -1;
     }
     return 0;
@@ -557,7 +561,7 @@ static int start_capture(int fd) {
 static int stop_capture(int fd) {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
-        perror("VIDIOC_STREAMOFF");
+        fprintf(stderr, "[CAM][ERR] VIDIOC_STREAMOFF: %s\n", strerror(errno));
         return -1;
     }
     return 0;
@@ -591,78 +595,73 @@ static int ensure_xu_available() {
 static int is_camera_params_valid(const camera_params *params) {
     // Validate resolution index. RGB uses 0-3 and grayscale uses 0-1; the SDK uses the more permissive 0-3 range.
     if (params->resolution > 3) {
-        fprintf(stderr, "Invalid resolution index, expected 0-3, got %d\n", params->resolution);
+        fprintf(stderr, "[XU][ERR] invalid resolution index, expected 0-3, got %d\n", params->resolution);
         return 0;
     }
     // Validate frame-rate index.
     if (params->frame_rate > 5) {
-        fprintf(stderr, "Invalid frame rate index, expected 0-5, got %d\n", params->frame_rate);
+        fprintf(stderr, "[XU][ERR] invalid frame rate index, expected 0-5, got %d\n", params->frame_rate);
         return 0;
     }
 
     // exposure_time: 0.0 ~ 0.03
     if (params->exposure_time < 0.0f || params->exposure_time > 0.03f) {
-        fprintf(stderr, "Invalid exposure time, expected 0.0-0.03, got %f\n", params->exposure_time);
+        fprintf(stderr, "[XU][ERR] invalid exposure time, expected 0.0-0.03, got %f\n", params->exposure_time);
         return 0;
     }
     // exposure_gain: 1.0 ~ 16.0
     if (params->exposure_gain < 1.0f || params->exposure_gain > 16.0f) {
-        fprintf(stderr, "Invalid exposure gain, expected 1.0-16.0, got %f\n", params->exposure_gain);
+        fprintf(stderr, "[XU][ERR] invalid exposure gain, expected 1.0-16.0, got %f\n", params->exposure_gain);
         return 0;
     }
     // auto_exposure: 0 or 1
     if (params->auto_exposure > 1) {
-        fprintf(stderr, "Invalid auto exposure, expected 0 or 1, got %d\n", params->auto_exposure);
+        fprintf(stderr, "[XU][ERR] invalid auto exposure, expected 0 or 1, got %d\n", params->auto_exposure);
         return 0;
     }
     // brightness: 0.0 ~ 127.0
     if (params->brightness < 0.0f || params->brightness > 127.0f) {
-        fprintf(stderr, "Invalid brightness, expected 0.0-127.0, got %f\n", params->brightness);
+        fprintf(stderr, "[XU][ERR] invalid brightness, expected 0.0-127.0, got %f\n", params->brightness);
         return 0;
     }
     // contrast: 0.0 ~ 1.9
     if (params->contrast < 0.0f || params->contrast > 1.9f) {
-        fprintf(stderr, "Invalid contrast, expected 0.0-1.9, got %f\n", params->contrast);
+        fprintf(stderr, "[XU][ERR] invalid contrast, expected 0.0-1.9, got %f\n", params->contrast);
         return 0;
     }
     // gamma_dark: 1.0 ~ 4.0
     if (params->gamma_dark < 1.0f || params->gamma_dark > 4.0f) {
-        fprintf(stderr, "Invalid gamma dark, expected 1.0-4.0, got %f\n", params->gamma_dark);
+        fprintf(stderr, "[XU][ERR] invalid gamma dark, expected 1.0-4.0, got %f\n", params->gamma_dark);
         return 0;
     }
     // hue: 0.0 ~ 87.0
     if (params->hue < 0.0f || params->hue > 87.0f) {
-        fprintf(stderr, "Invalid hue, expected 0.0-87.0, got %f\n", params->hue);
+        fprintf(stderr, "[XU][ERR] invalid hue, expected 0.0-87.0, got %f\n", params->hue);
         return 0;
     }
     // saturation: 0.0 ~ 1.999
     if (params->saturation < 0.0f || params->saturation > 1.999f) {
-        fprintf(stderr, "Invalid saturation, expected 0.0-1.999, got %f\n", params->saturation);
+        fprintf(stderr, "[XU][ERR] invalid saturation, expected 0.0-1.999, got %f\n", params->saturation);
         return 0;
     }
     // sharpness: 1 ~ 255
     if (params->sharpness < 1 || params->sharpness > 255) {
-        fprintf(stderr, "Invalid sharpness, expected 1-255, got %d\n", params->sharpness);
+        fprintf(stderr, "[XU][ERR] invalid sharpness, expected 1-255, got %d\n", params->sharpness);
         return 0;
     }
     // auto_white_balance: 0 or 1
     if (params->auto_white_balance > 1) {
-        fprintf(stderr, "Invalid auto white balance, expected 0 or 1, got %d\n", params->auto_white_balance);
+        fprintf(stderr, "[XU][ERR] invalid auto white balance, expected 0 or 1, got %d\n", params->auto_white_balance);
         return 0;
     }
     // white_balance: 1.0 ~ 3.0
     if (params->white_balance < 1.0f || params->white_balance > 3.0f) {
-        fprintf(stderr, "Invalid white balance, expected 1.0-3.0, got %f\n", params->white_balance);
+        fprintf(stderr, "[XU][ERR] invalid white balance, expected 1.0-3.0, got %f\n", params->white_balance);
         return 0;
     }
     // decimation: 1 ~ 255
     if (params->decimation < 1 || params->decimation > 255) {
-        fprintf(stderr, "Invalid decimation, expected 1-255, got %d\n", params->decimation);
-        return 0;
-    }
-    // rotation: 1 ~ 255
-    if (params->rotation < 1 || params->rotation > 255) {
-        fprintf(stderr, "Invalid rotation, expected 1-255, got %d\n", params->rotation);
+        fprintf(stderr, "[XU][ERR] invalid decimation, expected 1-255, got %d\n", params->decimation);
         return 0;
     }
 
@@ -673,9 +672,9 @@ static int is_camera_params_valid(const camera_params *params) {
 static void *capture_thread(void *arg) {
     struct cam_ctx *ctx = (struct cam_ctx *)arg;
     unsigned long frame_count = 0;
-    const char *dev_path = g_ctx.video_devs[ctx->cam_id];
 
-    printf("[CAM%d] Capture thread started, device %s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
+    printf("[CAM%d] capture thread started, dev=%s\n",
+           ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
 
     while (g_ctx.running) {
         struct pollfd fds;
@@ -683,13 +682,14 @@ static void *capture_thread(void *arg) {
         fds.events = POLLIN;
         const char *dev_path = g_ctx.video_devs[ctx->cam_id];
         if (ctx->fd < 0) {
-            printf("[CAM%d] Device is not open; trying to open %s\n", ctx->cam_id, dev_path);
+            printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
-            printf("[CAM%d] Trying to reopen device %s\n", ctx->cam_id, dev_path);
+            printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
-                printf("[CAM%d] Open failed: %s; waiting before retry...\n", ctx->cam_id, strerror(errno));
+                fprintf(stderr, "[CAM%d][ERR] open failed: %s, retry in 1s\n",
+                        ctx->cam_id, strerror(errno));
                 usleep(1000000);
                 continue;
             }
@@ -700,37 +700,22 @@ static void *capture_thread(void *arg) {
                 continue;
             }
             if (start_capture(ctx->fd) < 0) {
-                printf("[CAM%d] Failed to start stream\n", ctx->cam_id);
+                fprintf(stderr, "[CAM%d][ERR] failed to start stream\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
                 usleep(1000000);
                 continue;
             }
-            printf("[CAM%d] Device reinitialized successfully\n", ctx->cam_id);
+            ctx->last_timestamp = 0;
+            printf("[CAM%d] device reinitialized\n", ctx->cam_id);
             frame_count = 0;
         }
 
-        // fd_set fds;
-        // struct timeval tv;
-        // FD_ZERO(&fds);
-        // FD_SET(ctx->fd, &fds);
-        // tv.tv_sec = 1;
-        // tv.tv_usec = 0;
-
-        // int ret = select(ctx->fd + 1, &fds, NULL, NULL, &tv);
-        // if (ret < 0) {
-        //     if (errno == EINTR) continue;
-        //     perror("select");
-        //     close(ctx->fd);
-        //     ctx->fd = -1;
-        //     continue;
-        // }
-        // if (ret == 0) continue;
         int ret = poll(&fds, 1, 200);
         if (ret < 0) {
             if (errno == EINTR)
                 continue;
-            perror("poll");
+            fprintf(stderr, "[CAM%d][ERR] poll: %s\n", ctx->cam_id, strerror(errno));
             close(ctx->fd);
             ctx->fd = -1;
             continue;
@@ -750,7 +735,7 @@ static void *capture_thread(void *arg) {
                 continue;
             }
             if (errno == ENODEV) {
-                printf("[CAM%d] Device removed; closing and waiting for reconnect\n", ctx->cam_id);
+                fprintf(stderr, "[CAM%d][WARN] device removed, waiting for reconnect\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
                 if (ctx->buffers) {
@@ -764,7 +749,17 @@ static void *capture_thread(void *arg) {
                 ctx->buffer_count = 0;
                 continue;
             }
-            perror("VIDIOC_DQBUF");
+            fprintf(stderr, "[CAM%d][ERR] VIDIOC_DQBUF: %s\n", ctx->cam_id, strerror(errno));
+            continue;
+        }
+
+        // Filter 1: skip buffers the driver flagged as errored (incomplete USB transfer).
+        if (buf.flags & V4L2_BUF_FLAG_ERROR) {
+            if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+                fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+                close(ctx->fd);
+                ctx->fd = -1;
+            }
             continue;
         }
 
@@ -772,7 +767,7 @@ static void *capture_thread(void *arg) {
         uint64_t right_timestamp = 0;
         if (ctx->format == V4L2_PIX_FMT_MJPEG) {
             uint8_t *p = (uint8_t*)ctx->buffers[buf.index].start;
-            if (p[0] == 0xFF && p[1] == 0xD8) {
+            if (buf.bytesused >= 12 && p[0] == 0xFF && p[1] == 0xD8) {
                 p += 2;
                 if (p[0] == 0xFF && p[1] == 0xE1) {
                     uint16_t len = (p[2] << 8) | p[3];
@@ -798,6 +793,29 @@ static void *capture_thread(void *arg) {
             }
         }
 
+        // Filter 2: drop buffers without a usable embedded timestamp
+        // (e.g. partial MJPEG frames missing the TS__ APP1 marker).
+        if (timestamp == 0) {
+            if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+                fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+                close(ctx->fd);
+                ctx->fd = -1;
+            }
+            continue;
+        }
+
+        // Filter 3: drop duplicates — the UVC driver can redeliver the same buffer
+        // when the host polls faster than the sender produces new frames.
+        if (timestamp == ctx->last_timestamp) {
+            if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+                fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+                close(ctx->fd);
+                ctx->fd = -1;
+            }
+            continue;
+        }
+        ctx->last_timestamp = timestamp;
+
         if (g_ctx.img_cb) {
             g_ctx.img_cb(ctx->cam_id,
                          (uint8_t*)ctx->buffers[buf.index].start,
@@ -812,7 +830,7 @@ static void *capture_thread(void *arg) {
         frame_count++;
 
         if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF");
+            fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
             close(ctx->fd);
             ctx->fd = -1;
         }
@@ -840,12 +858,9 @@ static void *hid_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
+    uint64_t last_ts = 0;
 
-    const long desired_interval_us = (idx == 0 ? 2500L : 33333L); // IMU 400Hz, VIO 30Hz
-    struct timespec last_cb_ts;
-    clock_gettime(CLOCK_MONOTONIC, &last_cb_ts);
-
-    printf("HID thread %d started, device %s\n", idx, g_ctx.hid_devs[idx]);
+    printf("[HID%d] thread started, dev=%s\n", idx, g_ctx.hid_devs[idx]);
 
     while (g_ctx.running) {
         const char *device = g_ctx.hid_devs[idx];
@@ -854,44 +869,41 @@ static void *hid_thread(void *arg) {
             device = g_ctx.hid_devs[idx];
             fd = open(device, O_RDONLY | O_NONBLOCK);
             if (fd < 0) {
-                if (errno != ENOENT) perror("open HID");
+                if (errno != ENOENT)
+                    fprintf(stderr, "[HID%d][ERR] open %s: %s\n", idx, device, strerror(errno));
                 usleep(1000000);
                 continue;
             }
-            printf("Opened HID device %s successfully\n", device);
+            printf("[HID%d] opened %s\n", idx, device);
+            last_ts = 0;
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, -1); // Fast response; rate limiting is handled in the loop.
+        int ret = poll(&pfd, 1, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            perror("poll HID");
+            fprintf(stderr, "[HID%d][ERR] poll: %s\n", idx, strerror(errno));
             close(fd);
             fd = -1;
             continue;
         }
         if (ret == 0) continue;
 
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_us = (now.tv_sec - last_cb_ts.tv_sec) * 1000000L +
-                          (now.tv_nsec - last_cb_ts.tv_nsec) / 1000L;
-
         if (idx == 0) {
             struct imu_hid_report rpt;
             int n = read(fd, &rpt, sizeof(rpt));
             if (n == sizeof(rpt)) {
-                if (elapsed_us >= desired_interval_us) {
-                    last_cb_ts = now;
-                    if (g_ctx.imu_cb) {
-                        g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
-                                     rpt.gx, rpt.gy, rpt.gz,
-                                     rpt.timestamp,
-                                     g_ctx.imu_userdata);
-                    }
+                // Drop duplicates if the device redelivers the same sample.
+                if (rpt.timestamp != 0 && rpt.timestamp == last_ts) continue;
+                last_ts = rpt.timestamp;
+                if (g_ctx.imu_cb) {
+                    g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
+                                 rpt.gx, rpt.gy, rpt.gz,
+                                 rpt.timestamp,
+                                 g_ctx.imu_userdata);
                 }
             } else if (n < 0) {
-                perror("read IMU");
+                fprintf(stderr, "[HID%d][ERR] read IMU: %s\n", idx, strerror(errno));
                 close(fd);
                 fd = -1;
             }
@@ -899,17 +911,16 @@ static void *hid_thread(void *arg) {
             struct vio_hid_payload payload;
             int n = read(fd, &payload, sizeof(payload));
             if (n == sizeof(payload)) {
-                if (elapsed_us >= desired_interval_us) {
-                    last_cb_ts = now;
-                    if (g_ctx.vio_cb) {
-                        g_ctx.vio_cb(payload.px, payload.py, payload.pz,
-                                     payload.qx, payload.qy, payload.qz, payload.qw,
-                                     payload.timestamp,
-                                     g_ctx.vio_userdata);
-                    }
+                if (payload.timestamp != 0 && payload.timestamp == last_ts) continue;
+                last_ts = payload.timestamp;
+                if (g_ctx.vio_cb) {
+                    g_ctx.vio_cb(payload.px, payload.py, payload.pz,
+                                 payload.qx, payload.qy, payload.qz, payload.qw,
+                                 payload.timestamp,
+                                 g_ctx.vio_userdata);
                 }
             } else if (n < 0) {
-                perror("read VIO");
+                fprintf(stderr, "[HID%d][ERR] read VIO: %s\n", idx, strerror(errno));
                 close(fd);
                 fd = -1;
             }
@@ -917,14 +928,14 @@ static void *hid_thread(void *arg) {
     }
 
     if (fd >= 0) close(fd);
-    printf("HID thread %d exited\n", idx);
+    printf("[HID%d] thread exited\n", idx);
     return NULL;
 }
 
 // ==================== SDK API Implementation ====================
 int insight9_receive_init(void) {
     if (g_ctx.initialized) {
-        fprintf(stderr, "Insight_9_receive already initialized\n");
+        fprintf(stderr, "[SDK][WARN] already initialized\n");
         return -1;
     }
 
@@ -934,7 +945,7 @@ int insight9_receive_init(void) {
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < 3) {
-        fprintf(stderr, "Error: need at least 3 UVC devices with VID=0x%04x PID=0x%04x, found %d\n",
+        fprintf(stderr, "[SDK][ERR] need >= 3 UVC devices with VID=0x%04x PID=0x%04x, found %d\n",
                 VENDOR_ID, PRODUCT_ID, uvc_count);
         return -1;
     }
@@ -942,7 +953,7 @@ int insight9_receive_init(void) {
     int selected_idx[] = {0, 2, 4};
     for (int i = 0; i < CAM_NUM; i++) {
         if (selected_idx[i] >= uvc_count) {
-            fprintf(stderr, "Error: cannot select 3 devices by skipping one (need at least 6 devices)\n");
+            fprintf(stderr, "[SDK][ERR] cannot select 3 devices by skipping one (need >= 6 devices)\n");
             return -1;
         }
         strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
@@ -950,14 +961,14 @@ int insight9_receive_init(void) {
         if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
             g_ctx.video_usb_paths[i][0] = '\0';
         }
-        printf("Selected UVC device %d: %s\n", i, g_ctx.video_devs[i]);
+        printf("[SDK] selected UVC[%d]=%s\n", i, g_ctx.video_devs[i]);
     }
 
     // Find HID devices.
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
     if (hid_count < 2) {
-        fprintf(stderr, "Error: need at least 2 HID devices with VID=0x%04x PID=0x%04x, found %d\n",
+        fprintf(stderr, "[SDK][ERR] need >= 2 HID devices with VID=0x%04x PID=0x%04x, found %d\n",
                 VENDOR_ID, PRODUCT_ID, hid_count);
         return -1;
     }
@@ -972,7 +983,7 @@ int insight9_receive_init(void) {
     if (get_hid_usb_device_path(g_ctx.hid_devs[1], g_ctx.hid_usb_paths[1], MAX_PATH) < 0) {
         g_ctx.hid_usb_paths[1][0] = '\0';
     }
-    printf("Selected HID devices: IMU=%s, VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
+    printf("[SDK] selected HID: IMU=%s VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
 
     // Initialize camera contexts.
     for (int i = 0; i < CAM_NUM; i++) {
@@ -996,13 +1007,13 @@ int insight9_receive_init(void) {
     if (g_ctx.video_devs[0][0] != '\0') {
         g_ctx.xu_control = new viewer::UvcExtensionUnit();
         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-            printf("Warning: The expansion unit cannot be opened. The adjustment of camera parameters will be unavailable\n");
+            fprintf(stderr, "[XU][WARN] cannot open extension unit, camera params will be unavailable\n");
             delete g_ctx.xu_control;
             g_ctx.xu_control = nullptr;
             g_ctx.xu_ready = false;
         } else {
             g_ctx.xu_ready = true;
-            printf("Extension unit initialized successfully, device: %s\n", g_ctx.video_devs[0]);
+            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
         }
     } else {
         g_ctx.xu_control = nullptr;
@@ -1010,17 +1021,17 @@ int insight9_receive_init(void) {
     }
 
     g_ctx.initialized = 1;
-    printf("Insight_9_receive initialized.\n");
+    printf("[SDK] initialized\n");
     return 0;
 }
 
 int insight9_receive_start(void) {
     if (!g_ctx.initialized) {
-        fprintf(stderr, "Insight_9_receive not initialized\n");
+        fprintf(stderr, "[SDK][ERR] not initialized\n");
         return -1;
     }
     if (g_ctx.running) {
-        fprintf(stderr, "Insight_9_receive already running\n");
+        fprintf(stderr, "[SDK][WARN] already running\n");
         return -1;
     }
 
@@ -1033,7 +1044,7 @@ int insight9_receive_start(void) {
         pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
     }
 
-    printf("Insight_9_receive started.\n");
+    printf("[SDK] started\n");
     return 0;
 }
 
@@ -1057,7 +1068,7 @@ void insight9_receive_stop(void) {
     for (int i = 0; i < 2; i++) {
         pthread_join(g_ctx.hid_tids[i], NULL);
     }
-    printf("Insight_9_receive stopped.\n");
+    printf("[SDK] stopped\n");
 }
 
 void insight9_receive_cleanup(void) {
@@ -1091,7 +1102,7 @@ void insight9_receive_cleanup(void) {
     }
 
     g_ctx.initialized = 0;
-    printf("Insight_9_receive cleaned up.\n");
+    printf("[SDK] cleaned up\n");
 }
 
 void insight9_receive_register_image_callback(image_callback cb, void *userdata) {
@@ -1162,7 +1173,7 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
 int insight9_receive_reset_camera_params(int cam_id) {
     // Reading factory defaults from the device requires additional implementation. A simple approach is to read
     // and save the current values during initialization, then write them back when a reset is needed.
-    fprintf(stderr, "reset_camera_params not implemented, use set_camera_params with saved defaults\n");
+    fprintf(stderr, "[XU][ERR] reset_camera_params not implemented, use set_camera_params with saved defaults\n");
     return -1;
 }
 
@@ -1171,6 +1182,12 @@ void insight9_receive_print_camera_params(const camera_params *params) {
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(xu_params));
     viewer::printParams(xu_params);
+}
+
+std::string insight9_receive_get_hardware_type() {
+    viewer::camera_params xu_params;
+    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) return "unknown";
+    return hardware_model[xu_params.hardware_model];
 }
 
 } // extern "C"

@@ -22,7 +22,7 @@ struct camera_params {
     uint8_t auto_white_balance; //0 or 1
     float white_balance;  //2800~6500, mapped to 1~255
     uint8_t decimation;     //1~8, mapped to 1~255
-    uint8_t rotation;       //-90~180, mapped to 1~255
+    uint8_t hardware_model;
 };
 #pragma pack(pop)
 

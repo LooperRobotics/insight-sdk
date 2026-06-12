@@ -60,8 +60,8 @@ bool UvcExtensionUnit::open(const std::string& devicePath) {
     }
 
     // Check whether the required selectors exist.
-    if (!selector_exists(fd_, unitId_, 4) || !selector_exists(fd_, unitId_, 7)) {
-        fprintf(stderr, "UVC extension unit %d missing selector 4 or 7\n", unitId_);
+    if (!selector_exists(fd_, unitId_, kCameraParamsSelector) || !selector_exists(fd_, unitId_, kActiveCameraSelector)) {
+        fprintf(stderr, "UVC extension unit %d missing selector %d or %d\n", unitId_, kCameraParamsSelector, kActiveCameraSelector);
         close();
         return false;
     }
@@ -86,7 +86,7 @@ bool UvcExtensionUnit::isOpen() const { return fd_ >= 0; }
 bool UvcExtensionUnit::getActiveCamera(uint8_t& camId) const {
     if (!isOpen()) return false;
     uint8_t val = 0;
-    if (uvc_control_query(fd_, unitId_, 7, UVC_GET_CUR, &val, sizeof(val)) == 0) {
+    if (uvc_control_query(fd_, unitId_, kActiveCameraSelector, UVC_GET_CUR, &val, sizeof(val)) == 0) {
         camId = val;
         return true;
     }
@@ -95,19 +95,19 @@ bool UvcExtensionUnit::getActiveCamera(uint8_t& camId) const {
 
 bool UvcExtensionUnit::setActiveCamera(uint8_t camId) const {
     if (!isOpen()) return false;
-    return uvc_control_query(fd_, unitId_, 7, UVC_SET_CUR, &camId, sizeof(camId)) == 0;
+    return uvc_control_query(fd_, unitId_, kActiveCameraSelector, UVC_SET_CUR, &camId, sizeof(camId)) == 0;
 }
 
 bool UvcExtensionUnit::readCurrentCameraParams(camera_params& params) const {
     if (!isOpen()) return false;
     memset(&params, 0, sizeof(params));
-    return uvc_control_query(fd_, unitId_, 4, UVC_GET_CUR, &params, sizeof(params)) == 0;
+    return uvc_control_query(fd_, unitId_, kCameraParamsSelector, UVC_GET_CUR, &params, sizeof(params)) == 0;
 }
 
 bool UvcExtensionUnit::writeCurrentCameraParams(const camera_params& params) const {
     if (!isOpen()) return false;
     camera_params copy = params;
-    return uvc_control_query(fd_, unitId_, 4, UVC_SET_CUR, &copy, sizeof(copy)) == 0;
+    return uvc_control_query(fd_, unitId_, kCameraParamsSelector, UVC_SET_CUR, &copy, sizeof(copy)) == 0;
 }
 
 bool UvcExtensionUnit::readCameraParams(uint8_t camId, camera_params& params) const {

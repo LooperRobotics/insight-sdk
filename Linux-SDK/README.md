@@ -517,6 +517,8 @@ Device count requirement: The SDK expects at least 6 UVC devices (to select indi
 
 Hot‑plug: After device disconnection, the acquisition threads will automatically attempt to reconnect using the same device roles. Data flow will pause and resume when the device becomes available again.
 
+USB stability: Repeated SDK restart cycles or rapid device disconnect/reconnect operations can expose weaknesses in the host USB stack or driver. If the host stops recognizing USB devices after heavy reuse, replug the hardware or reboot the computer before restarting the SDK.
+
 Parameter validation: All set functions validate each parameter against the defined range. The SDK will reject out-of-range values and return an error without sending anything to the device. This prevents invalid configurations that could cause USB communication errors.
 
 Extension unit availability: The extension unit is opened on the first camera (/dev/video0). If it cannot be opened (e.g., missing kernel support), camera parameter functions will return -1. The rest of the SDK (video capture) will still work.

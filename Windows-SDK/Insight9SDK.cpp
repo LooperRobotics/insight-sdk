@@ -32,22 +32,13 @@ extern "C" {
 #pragma comment(lib, "swscale.lib")
 #pragma comment(lib, "ole32.lib")
 
-// ========== 复用 Windows Viewer 中的类（略作调整�?==========
-// 这里直接引入 viewer 中的类，但为�?SDK 独立，将关键类复制并重命�?
-#include "ExtensionUnitControl.hpp"   // 已提�?Windows �?
-// 注意：ExtensionUnitControl.hpp �?camera_params 定义相同，需要避免冲突，可以重命名或者使用同一�?
-
-// FFmpegVideoSource 需要适配回调（不内置回调，改为在 SDK 层调用）
-// 简化：不重�?FFmpegVideoSource 内部回调，而是 SDK 单独轮询并调用回�?
-
-// 以下�?Windows SDK 内部实现结构（与 Linux 类似但使�?Windows API�?
+#include "ExtensionUnitControl.hpp"
 
 #define VENDOR_ID  0x1d6b
 #define PRODUCT_ID 0x0104
 #define CAM_NUM 3
 #define HID_NUM 2
 
-// 视频格式定义
 enum class PixelFormat {
     Unknown,
     MJPEG,
@@ -69,39 +60,29 @@ enum class PixelFormat {
 class FFmpegVideoSource;
 class HidDevice;
 
-// 全局上下�?
 struct sdk_ctx_t {
-    // 视频�?
     FFmpegVideoSource* videos[CAM_NUM];
-    // HID
     HidDevice* hidDevs[HID_NUM];
-    // 扩展单元
     viewer::ExtensionUnitControl *xu;
-    // 线程
     std::thread videoThreads[CAM_NUM];
     std::thread hidThreads[HID_NUM];
     std::atomic<bool> running;
-    // 回调
     image_callback imgCb = nullptr;
     void* imgUser = nullptr;
     imu_callback imuCb = nullptr;
     void* imuUser = nullptr;
     vio_callback vioCb = nullptr;
     void* vioUser = nullptr;
-    // 设备路径缓存
     std::string videoPaths[CAM_NUM];
     std::string hidPaths[HID_NUM];
-    // 同步
     std::mutex imgMutex;
     std::mutex imuMutex;
     std::mutex vioMutex;
-    // 初始化标�?
     bool initialized = false;
     uint64_t last_img_timestamp[CAM_NUM] = {0};
 } g_ctx;
 
 std::string getDirectShowDeviceName(const std::string& devicePath) {
-    // 枚举所有 DirectShow 视频设备，找到匹配的
     ICreateDevEnum* pDevEnum = nullptr;
     IEnumMoniker* pEnum = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER, 
@@ -122,14 +103,12 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
             VARIANT var;
             VariantInit(&var);
             
-            // 获取设备路径
             hr = pPropBag->Read(L"DevicePath", &var, 0);
             if (SUCCEEDED(hr) && var.vt == VT_BSTR) {
                 std::wstring wpath = var.bstrVal;
                 std::string path(wpath.begin(), wpath.end());
                 
                 if (path == devicePath) {
-                    // 找到匹配的设备，获取友好名称
                     VariantClear(&var);
                     VariantInit(&var);
                     hr = pPropBag->Read(L"FriendlyName", &var, 0);
@@ -156,7 +135,6 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
     return "";
 }
 
-// 辅助函数：通过 VID/PID 枚举 DirectShow 视频设备路径
 static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     std::vector<std::string> paths;
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -186,10 +164,8 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
                     std::string lower = path;
                     for (char& c : lower) c = tolower(c);
                     
-                    // 必须同时包含 VID 和 PID
                     if (lower.find(vidStr) != std::string::npos && 
                         lower.find(pidStr) != std::string::npos) {
-                        // 还要确保是需要的接口号
                         if (lower.find("mi_04") != std::string::npos ||  // RGB
                             lower.find("mi_06") != std::string::npos ||  // GREY
                             lower.find("mi_08") != std::string::npos) {  // Depth
@@ -206,12 +182,10 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     }
     pDevEnum->Release();
     if (SUCCEEDED(hr)) CoUninitialize();
-    // 按设备编号排序（简单按字符串）
     std::sort(paths.begin(), paths.end());
     return paths;
 }
 
-// 通过 VID/PID 枚举 HID 设备（指定接口）
 static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid, int interfaceNum) {
     std::vector<std::string> paths;
     struct hid_device_info *devs, *cur;
@@ -225,7 +199,6 @@ static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid, int i
     return paths;
 }
 
-// ========== FFmpegVideoSource 简化实现（只取流，不解码，直接输出原始数据�?==========
 class FFmpegVideoSource {
 public:
     bool open(const std::string& devicePath, int deviceIndex, int width, int height, PixelFormat fmt, int fps) {
@@ -236,7 +209,7 @@ public:
         height_ = height;
         format_ = fmt;
         fps_ = fps;
-        return true; // 实际打开�?start �?
+        return true;
     }
     void close() {
         if (fmtCtx_) avformat_close_input(&fmtCtx_);
@@ -254,7 +227,6 @@ public:
             return false;
         }
         
-        // 从设备路径获取 DirectShow 设备名称
         std::string deviceName = getDirectShowDeviceName(devicePath_);
         if (deviceName.empty()) {
             fprintf(stderr, "[FFmpegVideoSource] Cannot find DirectShow device name for path: %s\n", devicePath_.c_str());
@@ -328,7 +300,6 @@ public:
             return false;
         }
 
-        // 拷贝数据到新分配的内存
         uint8_t* copy = new uint8_t[packet_->size];
         memcpy(copy, packet_->data, packet_->size);
         data = copy;
@@ -337,7 +308,6 @@ public:
         height = height_;
         fmt = format_;
 
-        // 提取时间戳（从拷贝后的数据中）
         ts = 0;
         tsRight = 0;
         if (format_ == PixelFormat::MJPEG) {
@@ -383,7 +353,6 @@ private:
     std::atomic<bool>* runningPtr_ = nullptr;
 };
 
-// ========== HidDevice 简单封�?==========
 class HidDevice {
 public:
     bool open(const std::string& path) {
@@ -415,7 +384,6 @@ int FFmpegVideoSource::interruptCallback(void* ctx) {
     return (self->runningPtr_ && !(*self->runningPtr_)) ? 1 : 0;
 }
 
-// 视频线程入口
 static void videoThreadFunc(int camId) {
     auto* src = g_ctx.videos[camId];
     if (!src) return;
@@ -435,19 +403,16 @@ static void videoThreadFunc(int camId) {
             continue;
         }
 
-        // 有效性过滤
         bool shouldCallCallback = true;
         if (data == nullptr || size == 0) shouldCallCallback = false;
         else if (ts == 0) shouldCallCallback = false;
         else if (ts == last_ts) shouldCallCallback = false;
         else last_ts = ts;
 
-        // 准备回调使用的缓冲区（默认使用原始数据）
         uint8_t* callbackData = data;
         size_t callbackSize = size;
-        bool customAllocated = false;   // 是否分配了新的缓冲区
+        bool customAllocated = false;
 
-        // MJPEG 格式：尝试移除 APP1 段
         if (shouldCallCallback && fmt == PixelFormat::MJPEG && size >= 4) {
             if (data[0] == 0xFF && data[1] == 0xD8 && size > 4) {
                 size_t pos = 2;
@@ -455,9 +420,8 @@ static void videoThreadFunc(int camId) {
                     if (data[pos] == 0xFF && data[pos+1] == 0xE1) {
                         if (pos + 3 < size) {
                             uint16_t segLen = (data[pos+2] << 8) | data[pos+3];
-                            size_t appTotal = 2 + segLen;   // marker(2) + length(2) + data
+                            size_t appTotal = 2 + segLen;
                             if (pos + appTotal <= size) {
-                                // 新缓冲区：SOI (0xFF 0xD8) + APP1 之后的数据
                                 uint8_t* remaining = data + pos + appTotal;
                                 size_t remainingSize = size - (pos + appTotal);
                                 uint8_t* newBuf = new uint8_t[2 + remainingSize];
@@ -477,7 +441,6 @@ static void videoThreadFunc(int camId) {
             }
         }
 
-        // 调用回调（如果有效）
         if (shouldCallCallback && g_ctx.imgCb) {
             unsigned int v4l2Fmt = 0;
             if (fmt == PixelFormat::MJPEG) v4l2Fmt = 0x47504A4D;
@@ -487,15 +450,13 @@ static void videoThreadFunc(int camId) {
             g_ctx.imgCb(camId, callbackData, callbackSize, w, h, v4l2Fmt, ts, tsRight, g_ctx.imgUser);
         }
 
-        // 释放内存：原始 data 始终需要释放；如果分配了新缓冲区，也要释放
         if (customAllocated) {
-            delete[] callbackData;   // 新缓冲区
+            delete[] callbackData;
         }
-        delete[] data;               // 原始缓冲区
+        delete[] data;
     }
 }
 
-// HID 线程入口
 static void hidThreadFunc(int idx) {
     auto* dev = g_ctx.hidDevs[idx];
     if (!dev) return;
@@ -504,7 +465,6 @@ static void hidThreadFunc(int idx) {
         size_t len = sizeof(buf);
         if (dev->read(buf, len)) {
             if (idx == 0 && g_ctx.imuCb) {
-                // 解析 IMU 报告 (6 floats + uint64)
                 if (len >= 32) {
                     float ax, ay, az, gx, gy, gz;
                     uint64_t ts;
@@ -518,7 +478,6 @@ static void hidThreadFunc(int idx) {
                     g_ctx.imuCb(ax, ay, az, gx, gy, gz, ts, g_ctx.imuUser);
                 }
             } else if (idx == 1 && g_ctx.vioCb) {
-                // 解析 VIO 报告 (timestamp + 3pos + 4quat + seq)
                 if (len >= 32) {
                     uint64_t ts; float px, py, pz, qx, qy, qz, qw;
                     memcpy(&ts, buf, 8);
@@ -538,7 +497,6 @@ static void hidThreadFunc(int idx) {
     }
 }
 
-// SDK API 实现
 int insight9_receive_init() {
     if (g_ctx.initialized) return -1;
 
@@ -551,13 +509,11 @@ int insight9_receive_init() {
     avdevice_register_all();
     hid_init();
 
-    // 查找 UVC 设备
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
     if (uvcPaths.size() < 3) {
         fprintf(stderr, "[SDK] Need at least 3 UVC devices, found %zu\n", uvcPaths.size());
         return -1;
     }
-    // 按顺序取前三个作为 RGB、Gray、Depth（实际可根据设备描述匹配）
     for (int i = 0; i < CAM_NUM; ++i) {
         g_ctx.videoPaths[i] = uvcPaths[i];
         g_ctx.videos[i] = new FFmpegVideoSource();
@@ -569,7 +525,6 @@ int insight9_receive_init() {
             return -1;
         }
     }
-    // 查找 HID 设备 (IMU接口0, VIO接口1)
     auto imuPaths = findHidDevices(VENDOR_ID, PRODUCT_ID, 0);
     auto vioPaths = findHidDevices(VENDOR_ID, PRODUCT_ID, 1);
     if (imuPaths.empty() || vioPaths.empty()) {
@@ -589,7 +544,6 @@ int insight9_receive_init() {
         return -1;
     }
 
-    // 初始化扩展单元（使用第一个视频设备）
     g_ctx.xu = new viewer::ExtensionUnitControl();
     if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open XU control\n");
@@ -645,7 +599,6 @@ void insight9_receive_cleanup() {
     CoUninitialize();
 }
 
-// 其余 API 实现（大部分转发�?g_ctx.xu 或返回默认值）
 const char* insight9_receive_get_video_dev(int cam_id) {
     return (cam_id >=0 && cam_id < CAM_NUM) ? g_ctx.videoPaths[cam_id].c_str() : nullptr;
 }
@@ -693,11 +646,11 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     return 0;
 }
 int insight9_receive_reset_camera_params(int) { return -1; }
-void insight9_receive_print_camera_params(const camera_params *p) { /* 打印 */ }
+void insight9_receive_print_camera_params(const camera_params *p) {}
 const char* insight9_receive_get_hardware_type() {
     static std::string result;
     camera_params params;
-    params.hardware_model = 0xFF; // 默认未知
+    params.hardware_model = 0xFF;
     if (insight9_receive_get_camera_params(&params) == 0) {
         const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
         if (params.hardware_model < 4) {

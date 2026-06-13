@@ -1,70 +1,59 @@
-# Insight 9 SDK Windows 版用户指南
+# Insight 9 SDK Windows Edition User Guide
 
-## 1. 概述
-Insight 9 SDK Windows 版是一个静态库，用于从三路 UVC 相机（主 MJPEG、左/右 Mono8）和两路 HID 设备（IMU、VIO）采集数据，并通过 UVC 扩展单元（Extension Unit）提供相机参数（曝光、增益、亮度、白平衡等）的控制能力。
+## 1. Overview
+The Insight 9 SDK for Windows is a static library that captures data from three UVC cameras (primary MJPEG, left/right Mono8) and two HID devices (IMU, VIO), and provides camera parameter control (exposure, gain, brightness, white balance, etc.) through the UVC Extension Unit.
 
-SDK 基于 DirectShow 和 FFmpeg 实现视频捕获，通过 HIDAPI 读取 IMU/VIO 数据，利用 IKsControl 访问 UVC 扩展单元。设备发现使用指定的 VID/PID（默认 0x1d6b / 0x0104），自动排序并选择三个视频设备和两个 HID 设备。捕获的图像和传感器数据通过回调函数实时传递给应用程序。
-（！注：FFmpeg 预编译库为修改版本，包含了对深度相机的特殊处理，确保 Z16 格式正确识别和解码。若使用官方 FFmpeg 预编译版本，可能无法正确处理深度数据。处理代码已经开源，可在 GitHub 上找到。）
+The SDK implements video capture via DirectShow and FFmpeg, reads IMU/VIO data through HIDAPI, and accesses the UVC Extension Unit using IKsControl. Device discovery uses fixed VID/PID (default 0x1d6b / 0x0104), automatically sorting and selecting three video devices and two HID devices. Captured images and sensor data are delivered to the application in real-time via callback functions.
 
-## 2. 特性
-自动设备发现：根据 VID=0x1d6b、PID=0x0104 自动查找 UVC 和 HID 设备。
+(*Note: The precompiled FFmpeg library is a modified version that includes special handling for depth cameras to ensure correct Z16 format identification and decoding. The official FFmpeg precompiled version may not handle depth data correctly. The modified code is open source and available on GitHub.*)
 
-智能选择：
+## 2. Features
+- **Automatic Device Discovery**: Automatically finds UVC and HID devices using VID=0x1d6b, PID=0x0104.
+- **Smart Selection**:
+  - **UVC**: Enumerates all matching video nodes, sorts by path string, and selects the first three as RGB, grayscale, and depth cameras (initialization fails if fewer than 3 devices are found).
+  - **HID**: Enumerates matching HID devices, distinguishing IMU (interface 0) and VIO (interface 1) by interface number.
+- **Multi-threaded Capture**: Each device runs on an independent thread without blocking others.
+- **Callback Mechanism**: Image, IMU, and VIO data are delivered to the application in real-time.
+- **Extension Unit (XU) Parameter Control**: Full control over camera parameters including exposure, gain, brightness, contrast, gamma, hue, saturation, sharpness, white balance, etc.
+- **Simple API**: Only a few calls are required to start/stop data capture and adjust camera parameters.
 
-UVC：枚举所有匹配的视频节点，按路径字符串排序，取前三个作为 RGB、灰度、深度相机（初始化失败如果少于3个设备）。
+## 3. Dependencies
+- **Operating System**: Windows 7 / 8 / 10 / 11 (x64)
+- **Build Tools**: Visual Studio 2019 or later, CMake 3.20+
+- **Runtime**:
+  - FFmpeg precompiled libraries (shared version, including avcodec, avformat, avdevice, avutil, swscale, swresample)
+  - HIDAPI precompiled libraries (Windows version, including hidapi.dll and hidapi.lib)
+- **Permissions**: Administrator privileges required for running the example (necessary for accessing the UVC Extension Unit).
 
-HID：枚举匹配的 HID 设备，按接口号区分 IMU（接口0）和 VIO（接口1）。
+## 4. Building and Installation
+### 4.1 Install Build Environment
+- Install Visual Studio 2019 or later, ensuring the "Desktop development with C++" workload is installed.
+- Install CMake 3.20 or later and add it to the system PATH.
+- Specific version requirements may be updated over time; please refer to the minimum version specified in the SDK's `CMakeLists.txt`.
+- If download is unavailable, the `tools` folder provides Visual Studio 2026 and cmake-4.3.3 installers for manual installation.
 
-多线程采集：每个设备独立线程，互不阻塞。
-
-回调机制：图像、IMU、VIO 数据实时回调给应用程序。
-
-扩展单元（XU）参数控制：完整控制相机参数，包括曝光、增益、亮度、对比度、伽马、色调、饱和度、锐度、白平衡等。
-
-简洁 API：仅需少量调用即可启动/停止数据采集和调整相机参数。
-
-## 3. 依赖项
-操作系统：Windows 7 / 8 / 10 / 11（x64）
-
-构建工具：Visual Studio 2019 或更高版本，CMake 3.20+
-
-运行时：
-
-FFmpeg 预编译库（shared 版本，包含 avcodec, avformat, avdevice, avutil, swscale, swresample）
-
-HIDAPI 预编译库（Windows 版，包含 hidapi.dll 和 hidapi.lib）
-
-权限：运行示例需要管理员权限（访问 UVC 扩展单元需要）
-
-## 4. 构建与安装
-### 4.1 安装编译环境
-安装 Visual Studio 2019 或更高版本，确保安装了“使用 C++ 的桌面开发”工作负载。
-安装 CMake 3.20 或更高版本，并将其添加到系统 PATH 中。
-具体版本要求可能会随时间更新，请参考 SDK 的 CMakeLists.txt 中的最低版本要求。
-若无法下载，tools中提供了 Visual Studio 2026 和 cmake-4.3.3安装包，可自行下载安装。
-
-### 4.2 准备预编译库
-将 FFmpeg 和 HIDAPI 的预编译文件按以下目录结构放置于 SDK 根目录：
-
-text
+### 4.2 Prepare Precompiled Libraries
+Place the FFmpeg and HIDAPI precompiled files in the SDK root directory as follows:
 Insight_SDK_Windows/
 ├── ffmpeg-z16/
-│   ├── include/          # FFmpeg 头文件（libavcodec, libavformat...）
-│   ├── lib/              # .lib 文件（avcodec.lib, avformat.lib...）
-│   └── bin/              # .dll 文件（avcodec-*.dll, avfilter-*.dll...）
+│ ├── include/ # FFmpeg header files (libavcodec, libavformat...)
+│ ├── lib/ # .lib files (avcodec.lib, avformat.lib...)
+│ └── bin/ # .dll files (avcodec-.dll, avfilter-.dll...)
 ├── hidapi-prebuilt/
-│   ├── include/          # hidapi.h
-│   ├── lib/              # hidapi.lib
-│   └── bin/              # hidapi.dll
+│ ├── include/ # hidapi.h
+│ ├── lib/ # hidapi.lib
+│ └── bin/ # hidapi.dll
 ├── CMakeLists.txt
 ├── Insight9SDK.cpp/h
 ├── ExtensionUnitControl.cpp/hpp
 └── example.cpp
 
-### 4.3 使用 CMake 构建
-提供 build.bat 脚本，内容如下：
+text
 
-batch
+### 4.3 Build with CMake
+A `build.bat` script is provided with the following contents:
+
+```batch
 @echo off
 setlocal enabledelayedexpansion
 
@@ -85,49 +74,46 @@ cmake --build . --config Release
 cd ..
 echo.
 echo Build completed. Example executable is in build\Release\example.exe
+Note: Adjust the generator name according to your Visual Studio version (e.g., the provided "Visual Studio 18 2026").
 
-注意：根据你的 Visual Studio 版本调整生成器名称（如提供的 "Visual Studio 18 2026"）。
+Open a Developer Command Prompt for VS (installed with the VS environment), navigate to the SDK root directory, and run build.bat to generate Insight9SDK.lib and the example program example.exe.
 
-打开 VS环境 安装的 Developer Command Prompt for VS，cd进入文件根目录下运行 build.bat 即可生成 Insight9SDK.lib 和示例程序 example.exe。
+### 4.4 Manual Build (Optional)
+If you prefer not to use CMake, you can create a static library project in Visual Studio, add all .cpp files, and configure:
 
-### 4.4 手动构建（可选）
-若不想使用 CMake，可使用 Visual Studio 创建静态库项目，添加所有 .cpp 文件，并配置：
+Additional Include Directories: ffmpeg-z16/include, hidapi-prebuilt/include
 
-附加包含目录：ffmpeg-z16/include，hidapi-prebuilt/include
+Additional Library Directories: ffmpeg-z16/lib, hidapi-prebuilt/lib
 
-附加库目录：ffmpeg-z16/lib，hidapi-prebuilt/lib
+Additional Dependencies: avcodec.lib avformat.lib avdevice.lib avutil.lib swscale.lib swresample.lib hidapi.lib ole32.lib strmiids.lib uuid.lib
 
-附加依赖项：avcodec.lib avformat.lib avdevice.lib avutil.lib swscale.lib swresample.lib hidapi.lib ole32.lib strmiids.lib uuid.lib
-
-## 5. API 参考
-### 5.1 头文件
+## 5. API Reference
+### 5.1 Header File
 c
 #include "Insight9SDK.h"
-
-### 5.2 数据结构 camera_params
-与 Linux 版本相同，定义如下：
+### 5.2 Data Structure camera_params
+Identical to the Linux version, defined as follows:
 
 c
 typedef struct {
-    uint8_t cam_id;             // 相机 ID (0: RGB, 1: Mono)
-    uint8_t resolution;         // 分辨率索引（未启用）
-    uint8_t frame_rate;         // 帧率索引（未启用）
-    float exposure_time;        // 曝光时间（0.0 ~ 0.03 秒）
-    float exposure_gain;        // 曝光增益（1.0 ~ 16.0）
-    uint8_t auto_exposure;      // 自动曝光（0 或 1）
-    float brightness;           // 亮度（0.0 ~ 127.0）
-    float contrast;             // 对比度（0.0 ~ 1.9）
-    float gamma_dark;           // 暗部伽马（1.0 ~ 4.0）
-    float hue;                  // 色调（0.0 ~ 87.0）
-    float saturation;           // 饱和度（0.0 ~ 1.999）
-    uint8_t sharpness;          // 锐度（1 ~ 255）
-    uint8_t auto_white_balance; // 自动白平衡（0 或 1）
-    float white_balance;        // 白平衡（1.0 ~ 3.0）
-    uint8_t decimation;         // 抽取因子（未启用）
-    uint8_t hardware_model;     // 硬件型号（只读）
+    uint8_t cam_id;             // Camera ID (0: RGB, 1: Mono)
+    uint8_t resolution;         // Resolution index (not enabled)
+    uint8_t frame_rate;         // Frame rate index (not enabled)
+    float exposure_time;        // Exposure time (0.0 ~ 0.03 seconds)
+    float exposure_gain;        // Exposure gain (1.0 ~ 16.0)
+    uint8_t auto_exposure;      // Auto exposure (0 or 1)
+    float brightness;           // Brightness (0.0 ~ 127.0)
+    float contrast;             // Contrast (0.0 ~ 1.9)
+    float gamma_dark;           // Dark gamma (1.0 ~ 4.0)
+    float hue;                  // Hue (0.0 ~ 87.0)
+    float saturation;           // Saturation (0.0 ~ 1.999)
+    uint8_t sharpness;          // Sharpness (1 ~ 255)
+    uint8_t auto_white_balance; // Auto white balance (0 or 1)
+    float white_balance;        // White balance (1.0 ~ 3.0)
+    uint8_t decimation;         // Decimation factor (not enabled)
+    uint8_t hardware_model;     // Hardware model (read-only)
 } camera_params;
-
-### 5.3 回调函数类型
+### 5.3 Callback Function Types
 c
 typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
                                int width, int height, unsigned int format,
@@ -141,34 +127,34 @@ typedef void (*imu_callback)(float ax, float ay, float az,
 typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint64_t timestamp, void *userdata);
-cam_id：0 = RGB (MJPEG)，1 = 左灰度 (GREY)，2 = 右灰度 (GREY)，3 = 深度 (Z16)
+cam_id: 0 = RGB (MJPEG), 1 = Left Grayscale (GREY), 2 = Right Grayscale (GREY), 3 = Depth (Z16)
 
-format：使用 V4L2 四字符码（如 'MJPEG'、'GREY'、'Z16 '）
+format: V4L2 four-character code (e.g., 'MJPEG', 'GREY', 'Z16 ')
 
-timestamp：设备微秒时间戳
+timestamp: Device timestamp in microseconds
 
-right_timestamp：右图时间戳（立体相机）
+right_timestamp: Timestamp for the right image (stereo camera)
 
-### 5.4 SDK 控制函数
-函数	说明
-int insight9_receive_init(void)	初始化 SDK，扫描设备。成功返回 0，失败返回 -1。
-int insight9_receive_start(void)	启动所有采集线程。
-void insight9_receive_stop(void)	停止所有采集线程。
-void insight9_receive_cleanup(void)	释放所有资源。
-const char* insight9_receive_get_video_dev(int cam_id)	获取指定相机的设备路径（DirectShow 路径）。
-void insight9_receive_register_image_callback(...)	注册图像回调。
-void insight9_receive_register_imu_callback(...)	注册 IMU 回调。
-void insight9_receive_register_vio_callback(...)	注册 VIO 回调。
-int insight9_receive_set_active_camera(int cam_id)	设置当前活跃相机（用于参数读写）。
-int insight9_receive_get_active_camera(int *cam_id)	获取当前活跃相机。
-int insight9_receive_set_camera_params(const camera_params *params)	设置当前活跃相机的参数。
-int insight9_receive_get_camera_params(camera_params *params)	获取当前活跃相机的参数。
-int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params)	设置指定相机的参数。
-int insight9_receive_get_camera_params_for(int cam_id, camera_params *params)	获取指定相机的参数。
-const char* insight9_receive_get_hardware_type(void)	返回硬件型号字符串。
-所有 set 函数内部都会进行范围校验，超出范围的值将导致函数返回 -1 且不发送任何控制命令。
+5.4 SDK Control Functions
+Function	Description
+int insight9_receive_init(void)	Initializes the SDK and scans for devices. Returns 0 on success, -1 on failure.
+int insight9_receive_start(void)	Starts all capture threads.
+void insight9_receive_stop(void)	Stops all capture threads.
+void insight9_receive_cleanup(void)	Releases all resources.
+const char* insight9_receive_get_video_dev(int cam_id)	Returns the device path (DirectShow path) for the specified camera.
+void insight9_receive_register_image_callback(...)	Registers the image callback.
+void insight9_receive_register_imu_callback(...)	Registers the IMU callback.
+void insight9_receive_register_vio_callback(...)	Registers the VIO callback.
+int insight9_receive_set_active_camera(int cam_id)	Sets the currently active camera (for parameter reading/writing).
+int insight9_receive_get_active_camera(int *cam_id)	Gets the currently active camera.
+int insight9_receive_set_camera_params(const camera_params *params)	Sets parameters for the currently active camera.
+int insight9_receive_get_camera_params(camera_params *params)	Gets parameters for the currently active camera.
+int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params)	Sets parameters for the specified camera.
+int insight9_receive_get_camera_params_for(int cam_id, camera_params *params)	Gets parameters for the specified camera.
+const char* insight9_receive_get_hardware_type(void)	Returns the hardware model string.
+All set functions perform range validation internally; out-of-range values will cause the function to return -1 without sending any control commands.
 
-## 6. 使用示例
+## 6. Usage Example
 c
 #include "Insight9SDK.h"
 #include <stdio.h>
@@ -203,7 +189,7 @@ int main() {
         return -1;
     }
 
-    // 设置 RGB 相机参数
+    // Configure RGB camera parameters
     camera_params params = {0};
     params.cam_id = 0;
     params.brightness = 80.0f;
@@ -218,82 +204,81 @@ int main() {
     insight9_receive_cleanup();
     return 0;
 }
-编译运行（使用 CMake 生成的工程）：
+Compilation and Execution (using the CMake-generated project):
 
-打开 Visual Studio 解决方案 build/Insight9SDK.sln
+Open the Visual Studio solution build/Insight9SDK.sln
 
-编译 Release 配置
+Build the Release configuration
 
-将 ffmpeg-z16/bin/*.dll 和 hidapi-prebuilt/bin/hidapi.dll 复制到 build/Release/
+Copy ffmpeg-z16/bin/*.dll and hidapi-prebuilt/bin/hidapi.dll to build/Release/
 
-以管理员身份运行 example.exe
+Run example.exe as Administrator
 
-或者直接使用 build.bat 自动完成编译和 DLL 复制（需正确配置 CMakeLists.txt 中的自定义命令）。
+Alternatively, use build.bat to automatically complete the build and DLL copying (ensure the custom commands in CMakeLists.txt are properly configured).
 
-## 7. 重要说明
-数据生命周期：图像回调中的 data 指针指向 SDK 内部缓冲区，会在下一次帧到达时被覆盖。如需保留数据，请在回调中拷贝。
+## 7. Important Notes
+Data Lifecycle: The data pointer in the image callback points to an internal SDK buffer that will be overwritten when the next frame arrives. Copy the data if it needs to be retained.
 
-线程安全：回调运行在采集线程中，避免阻塞操作（如文件 I/O、长时间计算）以免丢帧。
+Thread Safety: Callbacks run on capture threads; avoid blocking operations (e.g., file I/O, long computations) to prevent frame drops.
 
-权限要求：访问 UVC 扩展单元需要管理员权限，否则 XU 控制函数会失败（但视频采集仍可工作）。
+Permission Requirements: Administrator privileges are required to access the UVC Extension Unit; otherwise, XU control functions will fail (though video capture may still work).
 
-设备数量要求：SDK 要求至少 3 个匹配 VID/PID 的 UVC 设备和 2 个 HID 设备（接口 0 和 1），否则 init 会失败。
+Device Count Requirement: The SDK requires at least 3 UVC devices and 2 HID devices (interfaces 0 and 1) matching the VID/PID; otherwise, initialization will fail.
 
-热插拔：设备断开后采集线程会自动尝试重连，恢复后数据流继续。
+Hot-Plugging: If a device is disconnected, the capture thread will automatically attempt to reconnect, and the data stream will resume once the device is restored.
 
-USB 稳定性：反复快速插拔可能导致 USB 栈不稳定，遇到问题时请重启计算机或重新插拔设备。
+USB Stability: Rapid and repeated plugging/unplugging may cause USB stack instability. If issues occur, restart the computer or re-plug the device.
 
-参数校验：所有参数设置函数都会进行范围校验，拒绝超限值以防止 USB 通信错误。
+Parameter Validation: All parameter set functions perform range validation and reject out-of-range values to prevent USB communication errors.
 
-扩展单元可用性：如果 XU 初始化失败（如驱动不支持），相机参数函数会返回 -1，但视频采集仍正常工作。
+Extension Unit Availability: If XU initialization fails (e.g., due to driver incompatibility), camera parameter functions will return -1, but video capture will continue to work normally.
 
-## 8. 参数范围参考
-参数	最小值	最大值	说明
-exposure_time(s)	0.0	0.03	线性映射
-exposure_gain	1.0	16.0	线性映射
-auto_exposure	0	1	布尔值
-brightness	0.0	127.0	线性映射
-contrast	0.0	1.9	线性映射
-gamma_dark	1.0	4.0	线性映射
-hue	0.0	87.0	线性映射
-saturation	0.0	1.999	线性映射
-sharpness	1	255	线性映射
-auto_white_balance	0	1	布尔值
-white_balance	1.0	3.0	线性映射
+## 8. Parameter Range Reference
+Parameter	Min	Max	Description
+exposure_time(s)	0.0	0.03	Linear mapping
+exposure_gain	1.0	16.0	Linear mapping
+auto_exposure	0	1	Boolean value
+brightness	0.0	127.0	Linear mapping
+contrast	0.0	1.9	Linear mapping
+gamma_dark	1.0	4.0	Linear mapping
+hue	0.0	87.0	Linear mapping
+saturation	0.0	1.999	Linear mapping
+sharpness	1	255	Linear mapping
+auto_white_balance	0	1	Boolean value
+white_balance	1.0	3.0	Linear mapping
+## 9. Frequently Asked Questions
+Q: How do I verify that devices are properly detected?
+A: When running example.exe, the found UVC device paths are printed (debug information in findUvcDevices). You can also call insight9_receive_get_video_dev() to obtain device paths.
 
-9. 常见问题
-Q: 如何验证设备被正确检测？
-A: 运行 example.exe 时会打印找到的 UVC 设备路径（已在 findUvcDevices 中输出调试信息）。也可调用 insight9_receive_get_video_dev() 获取设备路径。
+Q: The image data is MJPEG. How do I decode it?
+A: You can use libjpeg-turbo, Windows Imaging Component (WIC), or OpenCV's imdecode. Grayscale data is 8-bit raw pixels, and Z16 is 16-bit depth data (little-endian).
 
-Q: 图像数据是 MJPEG，如何解码？
-A: 可使用 libjpeg-turbo、Windows Imaging Component (WIC) 或 OpenCV 的 imdecode。灰度数据为 8-bit 原始像素，Z16 为 16-bit 深度数据（小端序）。
+Q: Why does setting camera parameters return -1?
+A: Possible reasons:
 
-Q: 设置相机参数返回 -1 是什么原因？
-A: 可能原因：
+The Extension Unit was not successfully initialized (check the console for [XU] errors).
 
-扩展单元未成功初始化（检查控制台是否有 [XU] 错误）
+The parameter value is outside the allowed range.
 
-参数值超出允许范围
+The device is disconnected or the XU is busy.
 
-设备断开或 XU 繁忙
+The program was not run with administrator privileges.
 
-未以管理员权限运行程序
+Q: I get DLL errors like "avfilter-11.dll not found" at runtime.
+A: Ensure all .dll files from ffmpeg-z16/bin are copied to the executable's directory, or add that directory to the PATH environment variable. The CMakeLists.txt is configured for automatic copying (the wildcard list may need to be modified to include avfilter-*.dll).
 
-Q: 运行时提示“找不到 avfilter-11.dll”等 DLL 错误。
-A: 请确保 ffmpeg-z16/bin 下的所有 .dll 文件已复制到可执行文件所在目录，或设置 PATH 环境变量包含该目录。CMakeLists.txt 已配置自动复制（需修改通配符列表包含 avfilter-*.dll）。
+Q: Are administrator privileges required?
+A: Yes, accessing the UVC Extension Unit requires administrator privileges. If you do not use XU functionality (i.e., do not call any parameter control APIs), you can run as a normal user, and video capture and HID data will still work.
 
-Q: 是否需要管理员权限？
-A: 是的，访问 UVC 扩展单元需要管理员权限。如果不使用 XU 功能（即不调用任何参数控制 API），可以普通用户身份运行，但视频采集和 HID 数据仍可正常工作。
+Q: Can this SDK run in a virtual machine or WSL?
+A: This SDK relies on DirectShow and native USB drivers, so running on a native Windows environment is recommended. In a virtual machine or WSL2, USB passthrough may be required, and the VID/PID may be virtualized, causing device matching to fail.
 
-Q: 能否在虚拟机或 WSL 中运行？
-A: 本 SDK 依赖 DirectShow 和原生 USB 驱动，建议在原生 Windows 环境运行。在虚拟机或 WSL2 中可能需要 USB 直通且 VID/PID 会被虚拟化，会导致设备匹配失败。
+Q: How can I debug XU communication issues?
+A: Error printing ([XU] KsProperty failed...) has been added in the query function in ExtensionUnitControl.cpp. You can use USB analysis tools (e.g., USBPcap) or check Windows Event Logs.
 
-Q: 如何调试 XU 通信问题？
-A: 在 ExtensionUnitControl.cpp 中的 query 函数内已添加错误打印（[XU] KsProperty failed...）。可以使用 USB 分析工具（如 USBPcap）或查看 Windows 事件日志。
+## 10. Changelog
+v1.1 (2025-06): Windows port, based on DirectShow + FFmpeg + HIDAPI, with XU parameter control support.
 
-## 10. 更新日志
-v1.1 (2025-06)：Windows 移植版，基于 DirectShow + FFmpeg + HIDAPI 实现，支持 XU 参数控制。
+v1.0 (2025-03): Initial Linux version.
 
-v1.0 (2025-03)：初始 Linux 版本。
-
-如需进一步协助或定制，请联系开发者。
+For further assistance or customization, please contact the developer.

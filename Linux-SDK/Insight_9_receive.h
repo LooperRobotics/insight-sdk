@@ -8,21 +8,21 @@
 #pragma pack(push, 1)
 typedef struct {
     uint8_t cam_id;             // Camera ID, 0/1
-    uint8_t resolution;         // Resolution index, RGB:[0-3], "3840x2160", "1088x1920", "1280x720", "640x480", grayscale:[0-1] "1088x1280", "544x640"
-    uint8_t frame_rate;         // Frame-rate index, 0-5 map to 10/15/20/30/60/90 fps
+    uint8_t resolution;         // Resolution index
+    uint8_t frame_rate;         // Frame-rate index, 0-5
     float exposure_time;        // Exposure time in seconds, range 0.0~0.03
     float exposure_gain;        // Exposure gain, range 1.0~16.0
-    uint8_t auto_exposure;      // Auto exposure, 0 or 1
+    uint8_t auto_exposure;      // Auto exposure, 0/1
     float brightness;           // Brightness, range 0.0~127.0
     float contrast;             // Contrast, range 0.0~1.9
     float gamma_dark;           // Dark gamma, range 1.0~4.0
     float hue;                  // Hue, range 0.0~87.0
     float saturation;           // Saturation, range 0.0~1.999
-    uint8_t sharpness;          // Sharpness, currently unused
+    uint8_t sharpness;          // Sharpness (1~255)
     uint8_t auto_white_balance; // Auto white balance, 0 or 1
     float white_balance;        // White balance, range 1.0~3.0
-    uint8_t decimation;         // Decimation, currently unused
-    uint8_t hardware_model;     // Hardware model, currently unused
+    uint8_t decimation;         // Decimation (1~255)
+    uint8_t hardware_model;     // Hardware model
 } camera_params;
 #pragma pack(pop)
 

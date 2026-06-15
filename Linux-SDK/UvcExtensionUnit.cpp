@@ -126,14 +126,14 @@ bool UvcExtensionUnit::writeCameraParams(uint8_t camId, const camera_params& par
 
 void printParams(const camera_params& params) {
     std::printf(
-        "[XU] cam=%u res=%u fps=%u exp_t=%.4f exp_g=%.4f bl=%u bright=%.4f contrast=%.4f "
+        "[XU] cam=%u res=%u fps=%u exp_t=%.4f exp_g=%.4f ae=%u bright=%.4f contrast=%.4f "
         "gamma=%.4f hue=%.4f sat=%.4f sharp=%u awb=%u wb=%.4f dec=%u\n",
         static_cast<unsigned>(params.cam_id),
         static_cast<unsigned>(params.resolution),
         static_cast<unsigned>(params.frame_rate),
         params.exposure_time,
         params.exposure_gain,
-        static_cast<unsigned>(params.backlight_comp),
+        static_cast<unsigned>(params.auto_exposure),
         params.brightness,
         params.contrast,
         params.gamma_dark,

@@ -279,12 +279,28 @@ int main() {
     InterlockedExchange64(&last_image_time, GetTickCount64());
     printf("SDK running, press Ctrl+C to stop...\n");
     while (keep_running) {
-        Sleep(1000);   // 每秒检查一次
+        Sleep(3000);   // 每秒检查一次
         LONGLONG now = GetTickCount64();
         LONGLONG last = last_image_time;   // 直接读取（对齐，x64 下原子）
         if (last != 0 && (now - last) > 5000) {
-            fprintf(stderr, "No image for 5 seconds, restarting...\n");
-            break;
+            insight9_receive_stop();
+            insight9_receive_cleanup();
+                
+            if (insight9_receive_init() != 0) {
+                printf("[ReconnectWorker] SDK init failed\n");
+            } else {
+                // 正确：传递两个参数
+                insight9_receive_register_image_callback(my_image_cb, NULL);
+                insight9_receive_register_imu_callback(my_imu_cb, NULL);
+                insight9_receive_register_vio_callback(my_vio_cb, NULL);
+                
+                if (insight9_receive_start() != 0) {
+                    printf("[ReconnectWorker] SDK start failed\n");
+                    insight9_receive_cleanup();
+                } else {
+                    printf("[ReconnectWorker] SDK restarted successfully\n");
+                }
+            }
         }
     }
 

@@ -280,6 +280,10 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
         snprintf(video_sysfs, sizeof(video_sysfs), "/sys/class/video4linux/%s", entry->d_name);
         snprintf(dev_paths[count], MAX_PATH, "/dev/%s", entry->d_name);
 
+        if (access(dev_paths[count], F_OK) != 0) {
+            continue;
+        }
+
         // Check whether this is a UVC capture device.
         if (!is_uvc_device(dev_paths[count]))
             continue;
@@ -294,16 +298,24 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
     }
     closedir(dir);
 
+    if (count == 0) return 0;
+
     // Sort by device number.
     if (count > 1) {
-        // Temporary pointer array for sorting.
-        const char *ptrs[count];
-        for (int i = 0; i < count; i++) ptrs[i] = dev_paths[i];
-        qsort(ptrs, count, sizeof(char *), compare_device_numbers);
-        // Reorder the device paths.
-        char tmp[count][MAX_PATH];
-        for (int i = 0; i < count; i++) strcpy(tmp[i], ptrs[i]);
-        for (int i = 0; i < count; i++) strcpy(dev_paths[i], tmp[i]);
+        const char **ptrs = (const char **)malloc(count * sizeof(const char *));
+        if (ptrs) {
+            for (int i = 0; i < count; i++) ptrs[i] = dev_paths[i];
+            qsort(ptrs, count, sizeof(char *), compare_device_numbers);
+            
+            // 分配临时存储并重新排序
+            char (*tmp)[MAX_PATH] = (char(*)[MAX_PATH])malloc(count * MAX_PATH);
+            if (tmp) {
+                for (int i = 0; i < count; i++) strcpy(tmp[i], ptrs[i]);
+                for (int i = 0; i < count; i++) strcpy(dev_paths[i], tmp[i]);
+                free(tmp);
+            }
+            free(ptrs);
+        }
     }
     return count;
 }
@@ -1165,7 +1177,7 @@ int insight9_receive_get_camera_params(camera_params *params) {
     if (ensure_xu_available() != 0) return -1;
     viewer::camera_params xu_params;
     if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) return -1;
-    memcpy(params, &xu_params, sizeof(camera_params));
+    memcpy(params, &xu_params, sizeof(viewer::camera_params));
     return 0;
 }
 
@@ -1182,7 +1194,7 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     if (ensure_xu_available() != 0) return -1;
     viewer::camera_params xu_params;
     if (!g_ctx.xu_control->readCameraParams(static_cast<uint8_t>(cam_id), xu_params)) return -1;
-    memcpy(params, &xu_params, sizeof(camera_params));
+    memcpy(params, &xu_params, sizeof(viewer::camera_params));
     return 0;
 }
 
@@ -1196,14 +1208,23 @@ int insight9_receive_reset_camera_params(int cam_id) {
 void insight9_receive_print_camera_params(const camera_params *params) {
     if (!params) return;
     viewer::camera_params xu_params;
-    memcpy(&xu_params, params, sizeof(xu_params));
+    memcpy(&xu_params, params, sizeof(viewer::camera_params));
     viewer::printParams(xu_params);
 }
 
 std::string insight9_receive_get_hardware_type() {
     viewer::camera_params xu_params;
-    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) return "unknown";
-    return hardware_model[xu_params.hardware_model];
+    if (!g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
+        return "unknown";
+    }
+    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) {
+        return "unknown";
+    }
+    uint8_t model = xu_params.hardware_model;
+    if (model >= 4) {
+        return "unknown";
+    }
+    return hardware_model[model];
 }
 
 } // extern "C"

@@ -34,25 +34,57 @@ The SDK automatically discovers devices with the specified VID/PID, selects appr
 
 ## 4. Building and Installation
 
-### 4.1 Build the shared library
-
-Place `Insight_9_receive.cpp`, `Insight_9_receive.h`, `UvcExtensionUnit.cpp`, and `UvcExtensionUnit.hpp` in the same directory and execute:
+### 4.1 Build with CMake (Recommended)
 
 ```bash
-g++ -c -fPIC Insight_9_receive.cpp -o Insight_9_receive.o
-g++ -c -fPIC UvcExtensionUnit.cpp -o UvcExtensionUnit.o
-g++ -shared -o libinsight9.so Insight_9_receive.o UvcExtensionUnit.o -lpthread
+# Clone or navigate to the SDK directory
+cd Insight_9_SDK
+
+# Create build directory
+mkdir build && cd build
+
+# Configure with CMake
+cmake ..
+
+# Build the library and example
+make -j$(nproc)
+
+# Run the example (requires root for device access)
+sudo ./example
 ```
 
-This generates libinsight9.so.
-
-### 4.2 Install
+### 4.2 Manual Build (Alternative)
 
 Copy libinsight9.so and Insight_9_receive.h to system or project directories, e.g.:
 
 ```bash
 sudo cp libinsight9.so /usr/local/lib/
 sudo cp Insight_9_receive.h /usr/local/include/
+sudo ldconfig
+```
+
+### 4.3 Build Options
+
+CMake supports different build types:
+
+```bash
+# Release build (default, optimized)
+cmake -DCMAKE_BUILD_TYPE=Release ..
+
+# Debug build (with debug symbols)
+cmake -DCMAKE_BUILD_TYPE=Debug ..
+
+# Custom install prefix
+cmake -DCMAKE_INSTALL_PREFIX=/usr/local ..
+```
+
+### 4.4 Installation
+
+```bash
+# Install library and headers to system
+sudo make install
+
+# Update linker cache
 sudo ldconfig
 ```
 
@@ -501,9 +533,15 @@ int main() {
 Compile and run:
 
 ```bash
-g++ -o example example.c -L. -linsight9 -lpthread -Wl,-rpath=.
-export LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH
+# Using CMake (recommended)
+cd build
+cmake ..
+make
 sudo ./example
+
+# Or manually compile
+g++ -o example example.cpp -L. -linsight9 -lpthread -Wl,-rpath=.
+sudo LD_LIBRARY_PATH=. ./example
 ```
 
 ## 7. Important Notes
@@ -562,17 +600,32 @@ The kernel UVC driver does not support the control.
 Q: How do I save current parameters as defaults for reset?
 A: Use insight9_receive_get_camera_params_for() to read the current parameters and store them. Later, call insight9_receive_set_camera_params_for() with the stored values to reset.
 
-Q: I get “cannot find libinsight9.so” when running the example.
-A: Ensure the library path is in LD_LIBRARY_PATH or use -Wl,-rpath during compilation, e.g.:
+Q: I get "cannot find libinsight9.so" when running the example.
+A: Ensure the library path is set correctly:
 
+With CMake: The executable has RPATH set automatically.
+
+Manual build: Use -Wl,-rpath=. during compilation or set LD_LIBRARY_PATH:
 
 ```bash
-g++ -o example example.c -L. -linsight9 -Wl,-rpath=.
+export LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH
+sudo ./example
+```
+
+Q: CMake build fails with buffer overflow detection.
+A: The CMake configuration already disables Fortify Source checks. If you still encounter issues, try:
+
+```bash
+cmake -DCMAKE_BUILD_TYPE=Debug ..
+make clean
+make
 ```
 
 ## 10. Changelog
-v1.1 (2025-05): Added Extension Unit API for camera parameter control (exposure, gain, white balance, etc.). Range validation implemented. Updated to C++ for compatibility with UvcExtensionUnit class.
+v1.1.0 (2026-06): Added CMake build system support; fixed VLA buffer overflow issues; improved device discovery robustness.
 
-v1.0 (2025-03): Initial release – supports automatic device discovery and acquisition for three UVC cameras and two HID devices.
+v1.1 (2026-05): Added Extension Unit API for camera parameter control (exposure, gain, white balance, etc.). Range validation implemented. Updated to C++ for compatibility with UvcExtensionUnit class.
+
+v1.0 (2026-03): Initial release – supports automatic device discovery and acquisition for three UVC cameras and two HID devices.
 
 For further assistance or customisations, please contact the developer.

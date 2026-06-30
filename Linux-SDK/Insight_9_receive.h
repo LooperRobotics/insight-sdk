@@ -26,6 +26,28 @@ typedef struct {
 } camera_params;
 #pragma pack(pop)
 
+enum class PixelFormat {
+    Unknown,
+    MJPEG,
+    GREY,
+    Z16,
+    RGB8,
+    Y8I
+};
+
+typedef struct {
+    int width;
+    int height;
+    int fps;
+    unsigned int pixel_format;
+} video_config_t;
+
+typedef struct {
+    video_config_t rgb_config;
+    video_config_t gray_config;
+    video_config_t depth_config;
+} insight9_config_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -70,10 +92,17 @@ typedef void (*vio_callback)(float px, float py, float pz,
                              uint64_t timestamp, void *userdata);
 
 /**
- * @brief Initialize the SDK by opening all devices without starting capture.
+ * @brief Initialize the SDK with custom configuration.
+ * @param config Configuration structure containing resolution, fps, and pixel format for each camera.
  * @return 0 on success, -1 on failure.
  */
-int insight9_receive_init(void);
+int insight9_receive_init(const insight9_config_t* config);
+
+/**
+ * @brief Initialize the SDK with default configuration.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_init_default(void);
 
 /**
  * @brief Start all capture threads.
@@ -89,9 +118,51 @@ int insight9_receive_start(void);
 const char *insight9_receive_get_video_dev(int cam_id);
 
 /**
+ * @brief Get the metadata device path for the specified camera.
+ * @param cam_id Camera index (0..2).
+ * @return Device path string, or NULL on failure.
+ */
+const char *insight9_receive_get_metadata_dev(int cam_id);
+
+/**
+ * @brief Read metadata timestamp from the metadata device.
+ * @param cam_id Camera index.
+ * @param timestamp Output parameter for the timestamp.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
+
+/**
+ * @brief Start a specific camera.
+ * @param cam_id Camera ID (0: RGB, 1: Grayscale, 2: Depth).
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_start_camera(int cam_id);
+
+/**
+ * @brief Stop a specific camera.
+ * @param cam_id Camera ID.
+ */
+void insight9_receive_stop_camera(int cam_id);
+
+/**
+ * @brief Restart a specific camera (stop and start again).
+ * @param cam_id Camera ID.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_restart_camera(int cam_id);
+
+/**
+ * @brief Check if a camera is currently running.
+ * @param cam_id Camera ID.
+ * @return 1 if running, 0 otherwise.
+ */
+int insight9_receive_is_camera_running(int cam_id);
+
+/**
  * @brief Stop all capture threads.
  */
-void insight9_receive_stop(void);
+void insight9_receive_all_stop(void);
 
 /**
  * @brief Release all resources. Must be called after stopping.
@@ -114,6 +185,14 @@ void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
  * @brief Register the VIO callback.
  */
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
+
+/**
+ * @brief Set the frame rate for a specific camera (stored in config, requires restart).
+ * @param cam_id Camera ID.
+ * @param fps Desired frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_set_camera_fps(int cam_id, int fps);
 
 /**
  * @brief Set the currently active camera.
@@ -161,7 +240,7 @@ int insight9_receive_set_camera_params_for(int cam_id, const camera_params *para
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params);
 
 /**
- * @brief Restore the specified camera to its initial values, such as factory defaults or previously read initial values.
+ * @brief Restore the specified camera to its initial values.
  * @param cam_id Camera ID.
  * @return 0 on success, -1 on failure.
  */
@@ -174,10 +253,10 @@ int insight9_receive_reset_camera_params(int cam_id);
 void insight9_receive_print_camera_params(const camera_params *params);
 
 /**
- * @brief Get the hardware type/model as a string. This requires reading the current camera parameters to determine the hardware_model field, which is then mapped to a string.
+ * @brief Get the hardware type/model as a string.
  * @return Hardware type/model string, or "unknown" on failure.
  */
-std::string insight9_receive_get_hardware_type();
+const char* insight9_receive_get_hardware_type(void);
 
 #ifdef __cplusplus
 }

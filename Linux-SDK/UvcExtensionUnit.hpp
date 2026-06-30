@@ -30,6 +30,8 @@ inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
 inline constexpr uint8_t kXuUnitId = 4;
 inline constexpr uint8_t kCameraParamsSelector = 4;
 inline constexpr uint8_t kActiveCameraSelector = 7;
+inline constexpr uint8_t kIntrinsicsSelector = 0x14;
+inline constexpr uint8_t kExtrinsicSelector = 0x15;
 
 class UvcExtensionUnit {
 public:

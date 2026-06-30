@@ -124,6 +124,12 @@ bool UvcExtensionUnit::writeCameraParams(uint8_t camId, const camera_params& par
     return writeCurrentCameraParams(params);
 }
 
+// bool UvcExtensionUnit::readCameraIntrinsics()  const {
+//     if (!isOpen()) return false;
+//     memset(&params, 0, sizeof(params));
+//     return uvc_control_query(fd_, unitId_, kCameraParamsSelector, UVC_GET_CUR, &params, sizeof(params)) == 0;
+// }
+
 void printParams(const camera_params& params) {
     std::printf(
         "[XU] cam=%u res=%u fps=%u exp_t=%.4f exp_g=%.4f ae=%u bright=%.4f contrast=%.4f "

@@ -25,28 +25,29 @@
 #endif
 
 // ==================== Target Device VID/PID ====================
-#define VENDOR_ID  0x1d6b
-#define PRODUCT_ID 0x0104
+#define VENDOR_ID  0x8086
+#define PRODUCT_ID 0x0b5c
 
 // ==================== Camera Configuration ====================
 #define CAM_NUM 3
 #define HID_NUM 2
-#define MAIN_WIDTH   1088
-#define MAIN_HEIGHT  1920
-#define MAIN_FORMAT  V4L2_PIX_FMT_MJPEG
-#define SUB_WIDTH    544
-#define SUB_HEIGHT   1281
-#define SUB_FORMAT   V4L2_PIX_FMT_GREY
-#define DEPTH_WIDTH  544
-#define DEPTH_HEIGHT 642
+#define MAIN_WIDTH   848
+#define MAIN_HEIGHT  480
+#define MAIN_FORMAT  V4L2_PIX_FMT_YUYV
+#define SUB_WIDTH    848
+#define SUB_HEIGHT   480
+#define SUB_FORMAT   V4L2_PIX_FMT_Y8I
+#define DEPTH_WIDTH  848
+#define DEPTH_HEIGHT 480
 #define DEPTH_FORMAT V4L2_PIX_FMT_Z16
 #define FRAME_RATE 30
 #define BUFFER_COUNT 8
+#define METADATA_SIZE 258
 
 // ==================== Data Structures ====================
 #define MAX_PATH 1024
 
-std::string hardware_model[50] = { "Insight 9", "Insight 7", "Insight 7p", "Insight 3u" };
+// std::string hardware_model[50] = { "Insight 9", "Insight 7", "Insight 7p", "Insight 3u" };
 
 struct buffer {
     void *start;
@@ -56,6 +57,9 @@ struct buffer {
 struct cam_ctx {
     int fd;                         // Device file descriptor
     struct buffer *buffers;         // mmap buffer array
+    int meta_fd;                    // Metadata node file descriptor
+    struct buffer *meta_buffers;    // mmap metadata buffer array
+    int meta_buffer_count;          // Metadata buffer count
     int buffer_count;               // Buffer count
     pthread_t tid;                  // Capture thread ID
     int cam_id;
@@ -85,7 +89,12 @@ typedef struct {
     vio_callback vio_cb;
     void *vio_userdata;
     // Running flag
-    volatile int running;
+    std::atomic<bool> running;
+    insight9_config_t config;
+    std::atomic<bool> cam_running[CAM_NUM];
+    pthread_t video_tids[CAM_NUM];
+    struct timespec last_frame_time[CAM_NUM];
+    bool first_frame_received[CAM_NUM];
     // Initialization flag
     int initialized;
     viewer::UvcExtensionUnit *xu_control;
@@ -262,7 +271,7 @@ static int compare_device_numbers(const void *a, const void *b) {
     return na - nb;
 }
 
-// Find all UVC devices matching the VID/PID, return device paths (/dev/videoX) sorted by numeric suffix.
+// Find all video4linux nodes matching the VID/PID, return device paths (/dev/videoX) sorted by numeric suffix.
 static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int target_pid,
                                        char dev_paths[][MAX_PATH], int max_devs) {
     DIR *dir = opendir("/sys/class/video4linux");
@@ -307,7 +316,6 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
             for (int i = 0; i < count; i++) ptrs[i] = dev_paths[i];
             qsort(ptrs, count, sizeof(char *), compare_device_numbers);
             
-            // 分配临时存储并重新排序
             char (*tmp)[MAX_PATH] = (char(*)[MAX_PATH])malloc(count * MAX_PATH);
             if (tmp) {
                 for (int i = 0; i < count; i++) strcpy(tmp[i], ptrs[i]);
@@ -350,12 +358,18 @@ static void refresh_video_device_path(int cam_id) {
                     g_ctx.video_usb_paths[cam_id][0] = '\0';
                 }
             }
+            int meta_index = get_device_number(uvc_list[i]) + 1;
+            snprintf(g_ctx.metadata_devs[cam_id], MAX_PATH, "/dev/video%d", meta_index);
+            if (get_video_usb_device_path(g_ctx.metadata_devs[cam_id], g_ctx.metadata_usb_paths[cam_id], MAX_PATH) < 0) {
+                g_ctx.metadata_usb_paths[cam_id][0] = '\0';
+            }
             return;
         }
     }
 
     // Fallback: select by the predefined device index.
     int selected_idx[CAM_NUM] = {0, 2, 4};
+    int metadata_idx[CAM_NUM] = {1, 3, 5};
     int index = (uvc_count >= 6 ? selected_idx[cam_id] : cam_id);
     if (index >= uvc_count) index = cam_id;
     if (index >= uvc_count) {
@@ -370,6 +384,16 @@ static void refresh_video_device_path(int cam_id) {
     }
     if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
         g_ctx.video_usb_paths[cam_id][0] = '\0';
+    }
+    if (uvc_count >= 6 && metadata_idx[cam_id] < uvc_count) {
+        if (strcmp(uvc_list[metadata_idx[cam_id]], g_ctx.metadata_devs[cam_id]) != 0) {
+            printf("[CAM%d][META] rematched %s -> %s\n",
+                   cam_id, g_ctx.metadata_devs[cam_id], uvc_list[metadata_idx[cam_id]]);
+            strcpy(g_ctx.metadata_devs[cam_id], uvc_list[metadata_idx[cam_id]]);
+        }
+        if (get_video_usb_device_path(g_ctx.metadata_devs[cam_id], g_ctx.metadata_usb_paths[cam_id], MAX_PATH) < 0) {
+            g_ctx.metadata_usb_paths[cam_id][0] = '\0';
+        }
     }
 }
 
@@ -506,10 +530,13 @@ static int init_capture(struct cam_ctx *ctx) {
            ctx->cam_id, ctx->width, ctx->height, ctx->format);
     
     int target_framerate = 30;
-    if (ctx->format == V4L2_PIX_FMT_GREY) {
-        target_framerate = 20;
-    } else if (ctx->format == V4L2_PIX_FMT_Z16) {
-        target_framerate = 15;
+    int cam_id = ctx->cam_id;
+    if (ctx->format == MAIN_FORMAT) {
+        target_framerate = g_ctx.config.rgb_config.fps;
+    } else if (ctx->format == SUB_FORMAT) {
+        target_framerate = g_ctx.config.gray_config.fps;
+    } else if (ctx->format == SUB_FORMAT) {
+        target_framerate = g_ctx.config.depth_config.fps;
     }
     set_framerate(ctx->fd, target_framerate);
 
@@ -593,6 +620,172 @@ static int stop_capture(int fd) {
         return -1;
     }
     return 0;
+}
+
+static void free_buffer_array(struct buffer **buffers, int *buffer_count) {
+    if (!buffers || !*buffers) return;
+    for (int i = 0; i < *buffer_count; i++) {
+        if ((*buffers)[i].start) {
+            munmap((*buffers)[i].start, (*buffers)[i].length);
+            (*buffers)[i].start = NULL;
+        }
+    }
+    free(*buffers);
+    *buffers = NULL;
+    *buffer_count = 0;
+}
+
+static uint32_t read_le32(const uint8_t *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t parse_uvc_metadata_timestamp(const uint8_t *data, size_t size) {
+    if (!data || size < 10) return 0;
+
+    // Firmware writes the low 32 bits of ts_us into the UVC payload header:
+    // bytes 2..5 are PTS, bytes 6..9 are the low SCR bytes.
+    //
+    // Linux UVC metadata nodes usually prepend struct uvc_meta_buf:
+    //   u64 ns, u16 sof, u8 length, u8 flags, then the UVC payload header.
+    // In that common layout, the device header "f8 8e ..." starts at data + 12.
+    if (size >= 22 && data[10] >= 10 && data[10] <= size - 12) {
+        const uint8_t *uvc_header = data + 12;
+        uint32_t pts = read_le32(uvc_header + 2);
+        if (pts != 0) return pts;
+        uint32_t scr_low = read_le32(uvc_header + 6);
+        if (scr_low != 0) return scr_low;
+    }
+
+    // Fallback for drivers that expose the UVC payload header directly.
+    uint32_t pts = read_le32(data + 12);
+    if (pts != 0) return pts;
+
+    return 0;
+}
+
+static int init_metadata_capture(struct cam_ctx *ctx) {
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_META_CAPTURE;
+    fmt.fmt.meta.dataformat = V4L2_META_FMT_UVC;
+    fmt.fmt.meta.buffersize = METADATA_SIZE;
+
+    if (ioctl(ctx->meta_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        fprintf(stderr, "[CAM%d][META][WARN] VIDIOC_S_FMT: %s\n", ctx->cam_id, strerror(errno));
+    }
+
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = BUFFER_COUNT;
+    req.type = V4L2_BUF_TYPE_META_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(ctx->meta_fd, VIDIOC_REQBUFS, &req) < 0) {
+        fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_REQBUFS: %s\n", ctx->cam_id, strerror(errno));
+        return -1;
+    }
+
+    if (req.count < 2) {
+        fprintf(stderr, "[CAM%d][META][ERR] insufficient buffers (%u)\n", ctx->cam_id, req.count);
+        return -1;
+    }
+
+    ctx->meta_buffers = (buffer*)calloc(req.count, sizeof(struct buffer));
+    if (!ctx->meta_buffers) {
+        fprintf(stderr, "[CAM%d][META][ERR] calloc: %s\n", ctx->cam_id, strerror(errno));
+        return -1;
+    }
+    ctx->meta_buffer_count = req.count;
+
+    for (int i = 0; i < ctx->meta_buffer_count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_META_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if (ioctl(ctx->meta_fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_QUERYBUF: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
+
+        ctx->meta_buffers[i].length = buf.length;
+        ctx->meta_buffers[i].start = mmap(NULL, buf.length,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, ctx->meta_fd, buf.m.offset);
+        if (ctx->meta_buffers[i].start == MAP_FAILED) {
+            fprintf(stderr, "[CAM%d][META][ERR] mmap: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
+
+        if (ioctl(ctx->meta_fd, VIDIOC_QBUF, &buf) < 0) {
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int start_metadata_capture(int fd) {
+    int type = V4L2_BUF_TYPE_META_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        fprintf(stderr, "[META][ERR] VIDIOC_STREAMON: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int stop_metadata_capture(int fd) {
+    int type = V4L2_BUF_TYPE_META_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
+        fprintf(stderr, "[META][ERR] VIDIOC_STREAMOFF: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static uint64_t read_latest_metadata_timestamp(struct cam_ctx *ctx) {
+    if (ctx->meta_fd < 0 || !ctx->meta_buffers) return 0;
+
+    uint64_t latest_ts = 0;
+    while (1) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_META_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(ctx->meta_fd, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN) break;
+            if (errno == ENODEV) {
+                fprintf(stderr, "[CAM%d][META][WARN] metadata device removed\n", ctx->cam_id);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+                break;
+            }
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_DQBUF: %s\n", ctx->cam_id, strerror(errno));
+            break;
+        }
+
+        uint64_t ts = parse_uvc_metadata_timestamp(
+            (uint8_t*)ctx->meta_buffers[buf.index].start,
+            buf.bytesused);
+        if (ts != 0) latest_ts = ts;
+
+        if (ioctl(ctx->meta_fd, VIDIOC_QBUF, &buf) < 0) {
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+            close(ctx->meta_fd);
+            ctx->meta_fd = -1;
+            free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+            break;
+        }
+    }
+
+    return latest_ts;
 }
 
 // ==================== Extension Unit Helpers ====================
@@ -713,23 +906,51 @@ static void *capture_thread(void *arg) {
             printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
+            
+            printf("[CAM%d][META] opening %s\n", ctx->cam_id, g_ctx.metadata_devs[ctx->cam_id]);
+            ctx->meta_fd = open(g_ctx.metadata_devs[ctx->cam_id], O_RDWR | O_NONBLOCK);
+            if (ctx->meta_fd < 0) {
+                fprintf(stderr, "[CAM%d][META][ERR] open failed: %s\n", ctx->cam_id, strerror(errno));
+                usleep(500000);
+                continue;
+            }
+            if (init_metadata_capture(ctx) < 0 || start_metadata_capture(ctx->meta_fd) < 0) {
+                fprintf(stderr, "[CAM%d][META][ERR] init/start failed\n", ctx->cam_id);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                usleep(500000);
+                continue;
+            }
+            
             printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
                 fprintf(stderr, "[CAM%d][ERR] open failed: %s, retry in 1s\n",
                         ctx->cam_id, strerror(errno));
+                stop_metadata_capture(ctx->meta_fd);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 usleep(1000000);
                 continue;
             }
             if (init_capture(ctx) < 0) {
                 close(ctx->fd);
                 ctx->fd = -1;
+                stop_metadata_capture(ctx->meta_fd);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 usleep(1000000);
                 continue;
             }
             
             if (start_capture(ctx->fd) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] failed to start stream\n", ctx->cam_id);
+                stop_metadata_capture(ctx->meta_fd);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 close(ctx->fd);
                 ctx->fd = -1;
                 usleep(1000000);
@@ -740,13 +961,22 @@ static void *capture_thread(void *arg) {
             frame_count = 0;
         }
 
+        if (!g_ctx.running) break;
         int ret = poll(&fds, 1, 200);
         if (ret < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR){
+                if (!g_ctx.running) break;
                 continue;
+            }
             fprintf(stderr, "[CAM%d][ERR] poll: %s\n", ctx->cam_id, strerror(errno));
             close(ctx->fd);
             ctx->fd = -1;
+            free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+            if (ctx->meta_fd >= 0) {
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+            }
+            free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
             continue;
         } else if (ret == 0) {
             // Timed out; continue the loop.
@@ -767,15 +997,12 @@ static void *capture_thread(void *arg) {
                 fprintf(stderr, "[CAM%d][WARN] device removed, waiting for reconnect\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
-                if (ctx->buffers) {
-                    for (int i = 0; i < ctx->buffer_count; i++) {
-                        if (ctx->buffers[i].start)
-                            munmap(ctx->buffers[i].start, ctx->buffers[i].length);
-                    }
-                    free(ctx->buffers);
-                    ctx->buffers = NULL;
+                free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+                if (ctx->meta_fd >= 0) {
+                    close(ctx->meta_fd);
+                    ctx->meta_fd = -1;
                 }
-                ctx->buffer_count = 0;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 continue;
             }
             fprintf(stderr, "[CAM%d][ERR] VIDIOC_DQBUF: %s\n", ctx->cam_id, strerror(errno));
@@ -792,34 +1019,16 @@ static void *capture_thread(void *arg) {
             continue;
         }
 
-        uint64_t timestamp = 0;
+        uint64_t timestamp = read_latest_metadata_timestamp(ctx);
         uint64_t right_timestamp = 0;
-        if (ctx->format == V4L2_PIX_FMT_MJPEG) {
-            uint8_t *p = (uint8_t*)ctx->buffers[buf.index].start;
-            if (p[0] == 0xFF && p[1] == 0xD8) {
-                p += 2;
-                if (p[0] == 0xFF && p[1] == 0xE1) {
-                    uint16_t len = (p[2] << 8) | p[3];
-                    if (len >= 4+8 && memcmp(p+4, "TS__", 4) == 0) {
-                        memcpy(&timestamp, p+8, sizeof(timestamp));
-                    }
-                }
+        if (ctx->meta_fd < 0) {
+            if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+                fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
             }
-        } else if (ctx->format == V4L2_PIX_FMT_GREY) {
-            if (buf.bytesused >= (ctx->width * ctx->height)) {
-                memcpy(&timestamp,
-                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 1),
-                       sizeof(timestamp));
-                memcpy(&right_timestamp,
-                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 1) + sizeof(timestamp),
-                       sizeof(right_timestamp));
-            }
-        } else if (ctx->format == V4L2_PIX_FMT_Z16) {
-            if (buf.bytesused >= (ctx->width * ctx->height)) {
-                memcpy(&timestamp,
-                       (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 2) * 2,
-                       sizeof(timestamp));
-            }
+            close(ctx->fd);
+            ctx->fd = -1;
+            free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+            continue;
         }
 
         // Filter 2: drop buffers until matching UVC metadata provides a usable timestamp.
@@ -864,6 +1073,20 @@ static void *capture_thread(void *arg) {
         }
     }
 
+    if (ctx->fd >= 0) {
+        stop_capture(ctx->fd);
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+    if (ctx->meta_fd >= 0) {
+        stop_metadata_capture(ctx->meta_fd);
+        close(ctx->meta_fd);
+        ctx->meta_fd = -1;
+    }
+    free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+    free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+
+    printf("[CAM%d] capture thread exited\n", ctx->cam_id);
     return NULL;
 }
 
@@ -872,6 +1095,38 @@ struct __attribute__((packed)) imu_hid_report {
     float ax, ay, az;
     float gx, gy, gz;
     uint64_t timestamp;
+};
+
+struct __attribute__((packed)) imu_gyro_report_t {
+    uint8_t  report_id;
+    uint8_t  sensor_state;
+    uint64_t timestamp;
+    int32_t  gyro_x;
+    int32_t  gyro_y;
+    int32_t  gyro_z;
+    int32_t  custom_data1;
+    int32_t  custom_data2;
+    int16_t  custom_data3;
+    int16_t  custom_data4;
+    int16_t  custom_data5;
+    int8_t   custom_data6;
+    int8_t   custom_data7;
+};
+
+struct __attribute__((packed)) imu_accel_report_t {
+    uint8_t  report_id;
+    uint8_t  sensor_state;
+    uint64_t timestamp;
+    int32_t  accel_x;
+    int32_t  accel_y;
+    int32_t  accel_z;
+    int32_t  custom_data1;
+    int32_t  custom_data2;
+    int16_t  custom_data3;
+    int16_t  custom_data4;
+    int16_t  custom_data5;
+    int8_t   custom_data6;
+    int8_t   custom_data7;
 };
 
 struct __attribute__((packed)) vio_hid_payload {
@@ -886,7 +1141,11 @@ static void *hid_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
-    uint64_t last_ts = 0;
+    uint64_t last_accel_ts = 0;
+    uint64_t last_gyro_ts = 0;
+    uint64_t last_imu_ts = 0;
+    float last_ax = 0, last_ay = 0, last_az = 0;
+    float last_gx = 0, last_gy = 0, last_gz = 0;
 
     printf("[HID%d] thread started, dev=%s\n", idx, g_ctx.hid_devs[idx]);
 
@@ -903,44 +1162,103 @@ static void *hid_thread(void *arg) {
                 continue;
             }
             printf("[HID%d] opened %s\n", idx, device);
-            last_ts = 0;
+            last_accel_ts = 0;
+            last_gyro_ts = 0;
         }
 
+        if (!g_ctx.running) break;
+
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, -1);
+        int ret = poll(&pfd, 1, 100);
         if (ret < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (!g_ctx.running) break;
+                continue;
+            }
             fprintf(stderr, "[HID%d][ERR] poll: %s\n", idx, strerror(errno));
             close(fd);
             fd = -1;
             continue;
         }
-        if (ret == 0) continue;
+        if (ret == 0) {
+            static int cnt = 0;
+            if (++cnt % 20 == 0)
+                printf("[HID%d] poll timeout\n", idx);
+            continue;
+        }
 
-        if (idx == 0) {
-            struct imu_hid_report rpt;
-            int n = read(fd, &rpt, sizeof(rpt));
-            if (n == sizeof(rpt)) {
-                // Drop duplicates if the device redelivers the same sample.
-                if (rpt.timestamp != 0 && rpt.timestamp == last_ts) continue;
-                last_ts = rpt.timestamp;
+        uint8_t buf[256];
+        int n = read(fd, buf, sizeof(buf));
+        printf("[HID] read=%d errno=%d\n", n, errno);
+        if (n < 0) {
+            fprintf(stderr, "[HID%d][ERR] read: %s\n", idx, strerror(errno));
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        if (n == 0) continue;
+
+        uint8_t report_id = buf[0];
+
+        if (idx == 0) { // IMU device
+            if (report_id == 0x01 && n >= (int)sizeof(imu_accel_report_t)) {
+                imu_accel_report_t *accel = (imu_accel_report_t*)buf;
+                printf("[IMU] ACCEL: id=0x%02X size=%d ts=%lu x=%d y=%d z=%d\n", 
+                    report_id, n, accel->timestamp, accel->accel_x, accel->accel_y, accel->accel_z);
+                
+                if (accel->timestamp == last_accel_ts) {
+                    printf("[IMU] Duplicate accel, skipping\n");
+                    continue;
+                }
+                last_accel_ts = accel->timestamp;
+                
+                last_ax = (float)accel->accel_x;
+                last_ay = (float)accel->accel_y;
+                last_az = (float)accel->accel_z;
+                
+                printf("[IMU] ACCEL: ts=%lu ax=%.1f ay=%.1f az=%.1f\n", 
+                       accel->timestamp, last_ax, last_ay, last_az);
+                
                 if (g_ctx.imu_cb) {
-                    g_ctx.imu_cb(rpt.ax, rpt.ay, rpt.az,
-                                 rpt.gx, rpt.gy, rpt.gz,
-                                 rpt.timestamp,
+                    g_ctx.imu_cb(last_ax, last_ay, last_az,
+                                 last_gx, last_gy, last_gz,
+                                 accel->timestamp,
                                  g_ctx.imu_userdata);
                 }
-            } else if (n < 0) {
-                fprintf(stderr, "[HID%d][ERR] read IMU: %s\n", idx, strerror(errno));
-                close(fd);
-                fd = -1;
+            } 
+            else if (report_id == 0x02 && n >= (int)sizeof(imu_gyro_report_t)) {
+                imu_gyro_report_t *gyro = (imu_gyro_report_t*)buf;
+
+                printf("[IMU] GYRO: id=0x%02X size=%d ts=%lu x=%d y=%d z=%d\n", 
+                    report_id, n, gyro->timestamp, gyro->gyro_x, gyro->gyro_y, gyro->gyro_z);
+                
+                if (gyro->timestamp == last_gyro_ts) {
+                    printf("[IMU] Duplicate gyro, skipping\n");
+                    continue;
+                }
+                last_gyro_ts = gyro->timestamp;
+                
+                last_gx = (float)gyro->gyro_x;
+                last_gy = (float)gyro->gyro_y;
+                last_gz = (float)gyro->gyro_z;
+                
+                printf("[IMU] GYRO: ts=%lu gx=%.3f gy=%.3f gz=%.3f\n", 
+                       gyro->timestamp, last_gx, last_gy, last_gz);
+                
+                if (g_ctx.imu_cb) {
+                    g_ctx.imu_cb(last_ax, last_ay, last_az,
+                                 last_gx, last_gy, last_gz,
+                                 gyro->timestamp,
+                                 g_ctx.imu_userdata);
+                }
             }
         } else {
             struct vio_hid_payload payload;
-            int n = read(fd, &payload, sizeof(payload));
             if (n == sizeof(payload)) {
-                if (payload.timestamp != 0 && payload.timestamp == last_ts) continue;
-                last_ts = payload.timestamp;
+                memcpy(&payload, buf, sizeof(payload));
+                if (payload.timestamp != 0 && payload.timestamp == last_imu_ts) continue;
+                last_imu_ts = payload.timestamp;
                 if (g_ctx.vio_cb) {
                     g_ctx.vio_cb(payload.px, payload.py, payload.pz,
                                  payload.qx, payload.qy, payload.qz, payload.qw,
@@ -961,13 +1279,32 @@ static void *hid_thread(void *arg) {
 }
 
 // ==================== SDK API Implementation ====================
-int insight9_receive_init(void) {
+int insight9_receive_init(const insight9_config_t* config) {
     if (g_ctx.initialized) {
         fprintf(stderr, "[SDK][WARN] already initialized\n");
         return -1;
     }
 
+    if (!config) {
+        fprintf(stderr, "[SDK][ERR] Config is NULL, using default\n");
+        return insight9_receive_init_default();
+    }
+
+    if (config->rgb_config.width <= 0 || config->rgb_config.height <= 0 ||
+        config->gray_config.width <= 0 || config->gray_config.height <= 0 ||
+        config->depth_config.width <= 0 || config->depth_config.height <= 0) {
+        fprintf(stderr, "[SDK] Invalid resolution in config\n");
+        return -1;
+    }
+
     memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.running = false;
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+        g_ctx.first_frame_received[i] = false;
+        clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
+    }
+    g_ctx.config = *config;
 
     // Find UVC devices.
     char uvc_list[10][MAX_PATH] = {{0}};
@@ -979,17 +1316,25 @@ int insight9_receive_init(void) {
     }
     // Select video nodes 0/2/4 and their matching metadata nodes 1/3/5.
     int selected_idx[] = {0, 2, 4};
+    int metadata_idx[] = {1, 3, 5};
     for (int i = 0; i < CAM_NUM; i++) {
-        if (selected_idx[i] >= uvc_count) {
-            fprintf(stderr, "Error: cannot select 3 devices by skipping one (need at least 6 devices)\n");
+        if (selected_idx[i] >= uvc_count || metadata_idx[i] >= uvc_count) {
+            fprintf(stderr, "[SDK][ERR] cannot select UVC video/metadata pair indexes %d/%d\n",
+                    selected_idx[i], metadata_idx[i]);
             return -1;
         }
         strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
+        strcpy(g_ctx.metadata_devs[i], uvc_list[metadata_idx[i]]);
         g_ctx.video_usb_paths[i][0] = '\0';
+        g_ctx.metadata_usb_paths[i][0] = '\0';
         if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
             g_ctx.video_usb_paths[i][0] = '\0';
         }
-        printf("Selected UVC device %d: %s\n", i, g_ctx.video_devs[i]);
+        if (get_video_usb_device_path(g_ctx.metadata_devs[i], g_ctx.metadata_usb_paths[i], MAX_PATH) < 0) {
+            g_ctx.metadata_usb_paths[i][0] = '\0';
+        }
+        printf("[SDK] selected UVC[%d]=%s metadata=%s\n",
+               i, g_ctx.video_devs[i], g_ctx.metadata_devs[i]);
     }
 
     // Find HID devices.
@@ -1017,18 +1362,149 @@ int insight9_receive_init(void) {
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cams[i].cam_id = i;
         g_ctx.cams[i].fd = -1;
+        g_ctx.cams[i].meta_fd = -1;
         if (i == 0) {
-            g_ctx.cams[i].width = MAIN_WIDTH;
-            g_ctx.cams[i].height = MAIN_HEIGHT;
-            g_ctx.cams[i].format = MAIN_FORMAT;
+            g_ctx.cams[i].width = config->depth_config.width;
+            g_ctx.cams[i].height = config->depth_config.height;
+            g_ctx.cams[i].format = config->depth_config.pixel_format;
+        } else if (i == 1) {
+            g_ctx.cams[i].width = config->gray_config.width;
+            g_ctx.cams[i].height = config->gray_config.height;
+            g_ctx.cams[i].format = config->gray_config.pixel_format;
+        } else if (i == 2) {
+            g_ctx.cams[i].width = config->rgb_config.width;
+            g_ctx.cams[i].height = config->rgb_config.height;
+            g_ctx.cams[i].format = config->rgb_config.pixel_format;
+        }
+    }
+
+    if (g_ctx.video_devs[0][0] != '\0') {
+        g_ctx.xu_control = new viewer::UvcExtensionUnit();
+        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+            fprintf(stderr, "[XU][WARN] cannot open extension unit, camera params will be unavailable\n");
+            delete g_ctx.xu_control;
+            g_ctx.xu_control = nullptr;
+            g_ctx.xu_ready = false;
+        } else {
+            g_ctx.xu_ready = true;
+            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
+        }
+    } else {
+        g_ctx.xu_control = nullptr;
+        g_ctx.xu_ready = false;
+    }
+
+    g_ctx.initialized = 1;
+    printf("[SDK] initialized\n");
+    return 0;
+}
+
+int insight9_receive_init_default(void) {
+    if (g_ctx.initialized) {
+        fprintf(stderr, "[SDK][WARN] already initialized\n");
+        return -1;
+    }
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+        g_ctx.first_frame_received[i] = false;
+        clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
+    }
+    
+    g_ctx.config.rgb_config.width = MAIN_WIDTH;
+    g_ctx.config.rgb_config.height = MAIN_HEIGHT;
+    g_ctx.config.rgb_config.fps = 30;
+    g_ctx.config.rgb_config.pixel_format = V4L2_PIX_FMT_YUYV;
+    
+    g_ctx.config.gray_config.width = SUB_WIDTH;
+    g_ctx.config.gray_config.height = SUB_HEIGHT;
+    g_ctx.config.gray_config.fps = 30;
+    g_ctx.config.gray_config.pixel_format = V4L2_PIX_FMT_Y8I;
+    
+    g_ctx.config.depth_config.width = DEPTH_WIDTH;
+    g_ctx.config.depth_config.height = DEPTH_HEIGHT;
+    g_ctx.config.depth_config.fps = 30;
+    g_ctx.config.depth_config.pixel_format = V4L2_PIX_FMT_Z16;
+
+    char uvc_list[10][MAX_PATH] = {{0}};
+    int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
+    if (uvc_count < 6) {
+        fprintf(stderr, "[SDK][ERR] need >= 6 UVC video/metadata nodes with VID=0x%04x PID=0x%04x, found %d\n",
+                VENDOR_ID, PRODUCT_ID, uvc_count);
+        return -1;
+    }
+    // Select video nodes 0/2/4 and their matching metadata nodes 1/3/5.
+    int selected_idx[] = {0, 2, 4};
+    int metadata_idx[] = {1, 3, 5};
+    for (int i = 0; i < CAM_NUM; i++) {
+        if (selected_idx[i] >= uvc_count) {
+            fprintf(stderr, "Error: cannot select 3 devices by skipping one (need at least 6 devices)\n");
+            return -1;
+        }
+        strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
+        strcpy(g_ctx.metadata_devs[i], uvc_list[metadata_idx[i]]);
+        g_ctx.video_usb_paths[i][0] = '\0';
+        g_ctx.metadata_usb_paths[i][0] = '\0';
+        if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
+            g_ctx.video_usb_paths[i][0] = '\0';
+        }
+        if (get_video_usb_device_path(g_ctx.metadata_devs[i], g_ctx.metadata_usb_paths[i], MAX_PATH) < 0) {
+            g_ctx.metadata_usb_paths[i][0] = '\0';
+        }
+        printf("Selected UVC[%d]: video=%s metadata=%s\n", 
+               i, g_ctx.video_devs[i], g_ctx.metadata_devs[i]);
+    }
+
+    // Find HID devices.
+    char hid_list[10][MAX_PATH] = {{0}};
+    int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
+
+    g_ctx.hid_devs[0][0] = '\0';
+    g_ctx.hid_devs[1][0] = '\0';
+
+    if (hid_count >= 1) {
+        strcpy(g_ctx.hid_devs[0], hid_list[0]);
+        printf("[SDK] selected HID: IMU=%s\n", g_ctx.hid_devs[0]);
+    } else {
+        fprintf(stderr, "[SDK][WARN] No HID devices found\n");
+    }
+
+    if (hid_count >= 2) {
+        strcpy(g_ctx.hid_devs[1], hid_list[1]);
+        printf("[SDK] selected HID: VIO=%s\n", g_ctx.hid_devs[1]);
+    } else {
+        g_ctx.hid_devs[1][0] = '\0';
+    }
+
+    if (g_ctx.hid_devs[0][0] != '\0') {
+        if (get_hid_usb_device_path(g_ctx.hid_devs[0], g_ctx.hid_usb_paths[0], MAX_PATH) < 0) {
+            g_ctx.hid_usb_paths[0][0] = '\0';
+        }
+    }
+    if (g_ctx.hid_devs[1][0] != '\0') {
+        if (get_hid_usb_device_path(g_ctx.hid_devs[1], g_ctx.hid_usb_paths[1], MAX_PATH) < 0) {
+            g_ctx.hid_usb_paths[1][0] = '\0';
+        }
+    }
+    printf("[SDK] selected HID: IMU=%s VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
+
+    // Initialize camera contexts.
+    for (int i = 0; i < CAM_NUM; i++) {
+        g_ctx.cams[i].cam_id = i;
+        g_ctx.cams[i].fd = -1;
+        if (i == 0) {
+            g_ctx.cams[i].width = DEPTH_WIDTH;
+            g_ctx.cams[i].height = DEPTH_HEIGHT;
+            g_ctx.cams[i].format = DEPTH_FORMAT;
         } else if (i == 1) {
             g_ctx.cams[i].width = SUB_WIDTH;
             g_ctx.cams[i].height = SUB_HEIGHT;
             g_ctx.cams[i].format = SUB_FORMAT;
         } else if (i == 2) {
-            g_ctx.cams[i].width = DEPTH_WIDTH;
-            g_ctx.cams[i].height = DEPTH_HEIGHT;
-            g_ctx.cams[i].format = DEPTH_FORMAT;
+            g_ctx.cams[i].width = MAIN_WIDTH;
+            g_ctx.cams[i].height = MAIN_HEIGHT;
+            g_ctx.cams[i].format = MAIN_FORMAT;
         }
     }
 
@@ -1063,16 +1539,76 @@ int insight9_receive_start(void) {
         return -1;
     }
 
-    g_ctx.running = 1;
+    g_ctx.running = true;
 
     for (int i = 0; i < CAM_NUM; i++) {
         pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
     }
-    for (int i = 0; i < 2; i++) {
-        pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
+    for (int i = 0; i < HID_NUM; i++) {
+        if (g_ctx.hid_devs[i][0] != '\0') {
+            pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
+        }
     }
 
     printf("[SDK] started\n");
+    return 0;
+}
+
+int insight9_receive_start_camera(int cam_id) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (g_ctx.cam_running[cam_id]) return 0;
+
+    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
+    
+    if (ctx->fd < 0) {
+        refresh_video_device_path(cam_id);
+        const char *dev_path = g_ctx.video_devs[cam_id];
+        ctx->fd = open(dev_path, O_RDWR);
+        if (ctx->fd < 0) {
+            fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
+            return -1;
+        }
+        
+        if (cam_id == 0) {
+            ctx->width = g_ctx.config.depth_config.width;
+            ctx->height = g_ctx.config.depth_config.height;
+            ctx->format = g_ctx.config.depth_config.pixel_format;
+        } else if (cam_id == 1) {
+            ctx->width = g_ctx.config.gray_config.width;
+            ctx->height = g_ctx.config.gray_config.height;
+            ctx->format = g_ctx.config.gray_config.pixel_format;
+        } else {
+            ctx->width = g_ctx.config.rgb_config.width;
+            ctx->height = g_ctx.config.rgb_config.height;
+            ctx->format = g_ctx.config.rgb_config.pixel_format;
+        }
+        
+        if (init_capture(ctx) < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            return -1;
+        }
+        
+        if (start_capture(ctx->fd) < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            return -1;
+        }
+        
+        ctx->last_timestamp = 0;
+    }
+
+    g_ctx.cam_running[cam_id] = true;
+    g_ctx.first_frame_received[cam_id] = false;
+    clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[cam_id]);
+    
+    if (g_ctx.video_tids[cam_id]) {
+        pthread_join(g_ctx.video_tids[cam_id], NULL);
+    }
+    pthread_create(&g_ctx.video_tids[cam_id], NULL, capture_thread, ctx);
+    
+    printf("[CAM%d] started\n", cam_id);
     return 0;
 }
 
@@ -1086,36 +1622,146 @@ const char *insight9_receive_get_video_dev(int cam_id) {
     return g_ctx.video_devs[cam_id][0] ? g_ctx.video_devs[cam_id] : NULL;
 }
 
-void insight9_receive_stop(void) {
+const char *insight9_receive_get_metadata_dev(int cam_id) {
+    if (!g_ctx.initialized) {
+        return NULL;
+    }
+    if (cam_id < 0 || cam_id >= CAM_NUM) {
+        return NULL;
+    }
+    return g_ctx.metadata_devs[cam_id][0] ? g_ctx.metadata_devs[cam_id] : NULL;
+}
+
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp) {
+    if (!g_ctx.initialized || !timestamp || cam_id < 0 || cam_id >= CAM_NUM) {
+        return -1;
+    }
+
+    *timestamp = 0;
+
+    struct cam_ctx tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.cam_id = cam_id;
+    tmp.meta_fd = open(g_ctx.metadata_devs[cam_id], O_RDWR | O_NONBLOCK);
+    if (tmp.meta_fd < 0) {
+        fprintf(stderr, "[CAM%d][META][ERR] open %s: %s\n",
+                cam_id, g_ctx.metadata_devs[cam_id], strerror(errno));
+        return -1;
+    }
+
+    if (init_metadata_capture(&tmp) < 0 || start_metadata_capture(tmp.meta_fd) < 0) {
+        if (tmp.meta_buffers) {
+            free_buffer_array(&tmp.meta_buffers, &tmp.meta_buffer_count);
+        }
+        if (tmp.meta_fd >= 0) close(tmp.meta_fd);
+        return -1;
+    }
+
+    struct pollfd pfd = {.fd = tmp.meta_fd, .events = POLLIN};
+    int ret = poll(&pfd, 1, 1000);
+    if (ret > 0 && (pfd.revents & POLLIN)) {
+        *timestamp = read_latest_metadata_timestamp(&tmp);
+    }
+
+    stop_metadata_capture(tmp.meta_fd);
+    free_buffer_array(&tmp.meta_buffers, &tmp.meta_buffer_count);
+    close(tmp.meta_fd);
+
+    return *timestamp != 0 ? 0 : -1;
+}
+
+void insight9_receive_stop_camera(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return;
+    
+    g_ctx.cam_running[cam_id] = false;
+    
+    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
+    if (ctx->fd >= 0) {
+        stop_capture(ctx->fd);
+        if (ctx->buffers) {
+            for (int j = 0; j < ctx->buffer_count; j++) {
+                if (ctx->buffers[j].start)
+                    munmap(ctx->buffers[j].start, ctx->buffers[j].length);
+            }
+            free(ctx->buffers);
+            ctx->buffers = NULL;
+        }
+        close(ctx->fd);
+        ctx->fd = -1;
+        ctx->buffer_count = 0;
+    }
+    
+    if (g_ctx.video_tids[cam_id]) {
+        pthread_join(g_ctx.video_tids[cam_id], NULL);
+        g_ctx.video_tids[cam_id] = 0;
+    }
+    
+    printf("[CAM%d] stopped\n", cam_id);
+}
+
+int insight9_receive_restart_camera(int cam_id) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    
+    insight9_receive_stop_camera(cam_id);
+    usleep(100000);
+    return insight9_receive_start_camera(cam_id);
+}
+
+int insight9_receive_is_camera_running(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
+    return g_ctx.cam_running[cam_id] ? 1 : 0;
+}
+
+void insight9_receive_all_stop(void) {
     if (!g_ctx.running) return;
-    g_ctx.running = 0;
+    g_ctx.running = false;
+
+    printf("[SDK] Stopping all cameras...\n");
 
     for (int i = 0; i < CAM_NUM; i++) {
-        pthread_join(g_ctx.cams[i].tid, NULL);
+        g_ctx.cam_running[i] = false;
+        struct cam_ctx *ctx = &g_ctx.cams[i];
+        if (ctx->fd >= 0) {
+            stop_capture(ctx->fd);
+            close(ctx->fd);
+            ctx->fd = -1;
+        }
+        if (ctx->meta_fd >= 0) {
+            stop_metadata_capture(ctx->meta_fd);
+            close(ctx->meta_fd);
+            ctx->meta_fd = -1;
+        }
+        if (g_ctx.video_tids[i]) {
+            pthread_join(g_ctx.video_tids[i], NULL);
+            g_ctx.video_tids[i] = 0;
+        }
     }
-    for (int i = 0; i < 2; i++) {
-        pthread_join(g_ctx.hid_tids[i], NULL);
+
+    for (int i = 0; i < HID_NUM; i++) {
+        if (g_ctx.hid_tids[i]) {
+            pthread_join(g_ctx.hid_tids[i], NULL);
+            g_ctx.hid_tids[i] = 0;
+        }
     }
+
     printf("[SDK] stopped\n");
 }
 
 void insight9_receive_cleanup(void) {
     if (!g_ctx.initialized) return;
 
-    if (g_ctx.xu_control) {
-        g_ctx.xu_control->close();
-        delete g_ctx.xu_control;
-        g_ctx.xu_control = nullptr;
-    }
+    printf("[SDK] Cleaning up...\n");
 
     if (g_ctx.running) {
-        insight9_receive_stop();
+        insight9_receive_all_stop();
     }
 
     for (int i = 0; i < CAM_NUM; i++) {
         struct cam_ctx *ctx = &g_ctx.cams[i];
         if (ctx->fd >= 0) {
             stop_capture(ctx->fd);
+            // free_buffer_array(&ctx->buffers, &ctx->buffer_count);
             if (ctx->buffers) {
                 for (int j = 0; j < ctx->buffer_count; j++) {
                     if (ctx->buffers[j].start)
@@ -1127,10 +1773,39 @@ void insight9_receive_cleanup(void) {
             close(ctx->fd);
             ctx->fd = -1;
         }
+        if (ctx->meta_fd >= 0) {
+            stop_metadata_capture(ctx->meta_fd);
+            free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+            close(ctx->meta_fd);
+            ctx->meta_fd = -1;
+        }
+    }
+
+    if (g_ctx.xu_control) {
+        g_ctx.xu_control->close();
+        delete g_ctx.xu_control;
+        g_ctx.xu_control = nullptr;
     }
 
     g_ctx.initialized = 0;
     printf("[SDK] cleaned up\n");
+}
+
+int insight9_receive_set_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (fps <= 0) return -1;
+    
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.fps = fps;
+    } else if (cam_id == 1) {
+        g_ctx.config.gray_config.fps = fps;
+    } else {
+        g_ctx.config.depth_config.fps = fps;
+    }
+    
+    printf("[SDK] Set camera %d FPS to %d\n", cam_id, fps);
+    return 0;
 }
 
 void insight9_receive_register_image_callback(image_callback cb, void *userdata) {
@@ -1212,19 +1887,25 @@ void insight9_receive_print_camera_params(const camera_params *params) {
     viewer::printParams(xu_params);
 }
 
-std::string insight9_receive_get_hardware_type() {
+const char* insight9_receive_get_hardware_type(void) {
+    static std::string result;
     viewer::camera_params xu_params;
+    
     if (!g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
         return "unknown";
     }
+    
     if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) {
         return "unknown";
     }
+    
     uint8_t model = xu_params.hardware_model;
-    if (model >= 4) {
-        return "unknown";
+    const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
+    if (model < 4) {
+        result = models[model];
+        return result.c_str();
     }
-    return hardware_model[model];
+    return "unknown";
 }
 
 } // extern "C"

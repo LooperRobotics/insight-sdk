@@ -42,8 +42,11 @@ endif()
 # ==================== 动态库 ====================
 set(LIB_SOURCES
     Insight_9_receive.cpp
+    hid.c
     UvcExtensionUnit.cpp
 )
+
+set_source_files_properties(hid.c PROPERTIES LANGUAGE CXX)
 
 set(LIB_HEADERS
     Insight_9_receive.h

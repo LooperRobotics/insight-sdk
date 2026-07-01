@@ -1,4 +1,5 @@
 #include "Insight_9_receive.h"
+#include "hid.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -119,13 +120,14 @@ static void maybe_print_img_stats_locked(void) {
     printf("\n========= Image Callbacks : 1/s =========\n");
     for (int i = 0; i < 3; i++) {
         const struct cam_stats *cs = &g_stats[i];
-        printf("IMG[%d]: fps=%.1f ts=%lu size=%zu %dx%d format=%s\n",
+        printf("IMG[%d]: fps=%.1f ts=%lu size=%zu %dx%d format=0x%x %s\n",
                i,
                cs->cb_count / elapsed,
                (unsigned long)cs->last_ts,
                cs->last_size,
                cs->width,
                cs->height,
+               cs->format,
                image_format_to_string(cs->format));
     }
     fflush(stdout);
@@ -291,6 +293,7 @@ int main() {
 
     int active_cam = -1;
     camera_params params = {0};
+    hid_init();
 
     if (insight9_receive_init_default() != 0) {
         fprintf(stderr, "SDK init failed\n");
@@ -307,73 +310,24 @@ int main() {
         return -1;
     }
 
-    // // Example: Get current active camera and its parameters
-    // if (insight9_receive_get_active_camera(&active_cam) == 0) {
-    //     printf("Current active camera: %d\n", active_cam);
-    //     if(insight9_receive_get_camera_params(&params) == 0) {
-    //         printf("Camera parameters retrieved successfully\n");
-    //         insight9_receive_print_camera_params(&params);
-    //     } else {
-    //         printf("Failed to get camera parameters\n");
-    //     }
-    // } else {
-    //     printf("Failed to get active camera\n");
-    // }
-
-    // if(insight9_receive_get_camera_params_for(1, &params) == 0) {
-    //     printf("Camera parameters for cam %d retrieved successfully\n", active_cam);
-    //     insight9_receive_print_camera_params(&params);
-    // } else {
-    //     printf("Failed to get camera parameters for cam %d\n", active_cam);
-    // }
-
-    // if (insight9_receive_get_active_camera(&active_cam) == 0) {
-    //     printf("Current active camera: %d\n", active_cam);
-    // } else {
-    //     printf("Failed to get active camera\n");
-    // }
-
-    // // Example: Adjust RGB camera parameters
-    // params.cam_id = 0;
-    // params.brightness = 80.0f;
-    // params.contrast = 1.2f;
-    // params.exposure_time = 0.015f;
-    // params.exposure_gain = 4.0f;
-    // params.auto_white_balance = 1;
-    // params.resolution = 0;
-    // params.frame_rate = 2;
-    // params.auto_exposure = 0;
-    // params.gamma_dark = 2.0f;
-    // params.hue = 40.0f;
-    // params.saturation = 1.0f;
-    // params.sharpness = 128;
-    // params.white_balance = 2.0f;
-    // params.decimation = 1;
-
-    // if (insight9_receive_set_camera_params_for(0, &params) == 0) {
-    //     printf("Camera parameters set successfully\n");
-    //     if(insight9_receive_get_camera_params_for(0, &params) == 0) {
-    //         printf("Camera parameters for cam %d after setting:\n", 0);
-    //         insight9_receive_print_camera_params(&params);
-    //     } else {
-    //         printf("Failed to get camera parameters for cam %d after setting\n", 0);
-    //     }
-    // } else {
-    //     printf("Failed to set camera parameters (invalid range or XU not available)\n");
-    // }
-
-    // printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
-
-    // pthread_t fps_thread;
-    // pthread_create(&fps_thread, NULL, [](void*) -> void* {
-    //     while (keep_running) {
-    //         sleep(10);
-    //         if (keep_running) {
-    //             toggle_gray_camera_fps();
-    //         }
-    //     }
-    //     return NULL;
-    // }, NULL);
+    pthread_mutex_lock(&g_stats_lock);
+    for (int cam_id = 0; cam_id < 3; cam_id++) {
+        int width = 0, height = 0;
+        unsigned int format = 0;
+        if (insight9_receive_get_current_format(cam_id, &width, &height, &format) == 0) {
+            g_stats[cam_id].cb_count = 0;
+            g_stats[cam_id].last_ts = 0;
+            g_stats[cam_id].last_size = 0;
+            g_stats[cam_id].width = width;
+            g_stats[cam_id].height = height;
+            g_stats[cam_id].format = format;
+            printf("Camera %d format: %dx%d fmt=0x%x %s\n",
+                   cam_id, width, height, format, image_format_to_string(format));
+        } else {
+            printf("Camera %d failed to query current format\n", cam_id);
+        }
+    }
+    pthread_mutex_unlock(&g_stats_lock);
 
     pthread_t reconnect_thread;
     pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);

@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <string>
 
 #pragma pack(push, 1)
 typedef struct {
@@ -109,6 +108,16 @@ int insight9_receive_init_default(void);
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_start(void);
+
+/**
+ * @brief Get current video format for a specific camera device.
+ * @param cam_id Camera ID (0..2).
+ * @param width Output width.
+ * @param height Output height.
+ * @param format Output V4L2 pixel format.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_current_format(int cam_id, int *width, int *height, unsigned int *format);
 
 /**
  * @brief Get the video device path for the specified camera.

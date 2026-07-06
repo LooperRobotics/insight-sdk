@@ -39,6 +39,20 @@
 #define FRAME_RATE 30
 #define BUFFER_COUNT 8
 
+// ==================== Reconnect Backoff / Retry Limits ====================
+// Rationale: repeatedly opening / S_FMT-ing a device that is in a bad state
+// (e.g. a composite UVC+NCM gadget that is warm-restarting) generates a USB
+// transaction storm that can wedge the whole xhci controller. We therefore
+// back off exponentially between reconnect attempts and cap the number of
+// consecutive failures so a dead device cannot keep hammering the bus forever.
+#define RECONNECT_BACKOFF_BASE_MS 1000   // first retry delay
+#define RECONNECT_BACKOFF_MAX_MS  30000  // delay ceiling (exponential, capped)
+// Max consecutive failed reconnect attempts before a thread stops actively
+// reconnecting and idles at the ceiling interval (set to 0 to retry forever).
+// After the limit is hit the thread no longer generates fast USB traffic, but
+// still wakes periodically so a recovered device can be picked back up.
+#define RECONNECT_MAX_ATTEMPTS    30
+
 // ==================== Data Structures ====================
 #define MAX_PATH 1024
 
@@ -85,6 +99,46 @@ typedef struct {
 } sdk_ctx_t;
 
 static sdk_ctx_t g_ctx = {0};
+
+// Compute the exponential backoff delay (ms) for the Nth consecutive failure
+// (attempt counted from 1), capped at RECONNECT_BACKOFF_MAX_MS.
+static int reconnect_backoff_ms(int attempt) {
+    if (attempt < 1) attempt = 1;
+    long delay = RECONNECT_BACKOFF_BASE_MS;
+    for (int i = 1; i < attempt && delay < RECONNECT_BACKOFF_MAX_MS; ++i)
+        delay <<= 1;
+    if (delay > RECONNECT_BACKOFF_MAX_MS) delay = RECONNECT_BACKOFF_MAX_MS;
+    return (int)delay;
+}
+
+// Sleep up to total_ms, but wake every 200ms to re-check g_ctx.running so a
+// pending stop() / pthread_join() is not blocked by a long backoff delay.
+static void interruptible_sleep_ms(int total_ms) {
+    int slept = 0;
+    while (slept < total_ms && g_ctx.running) {
+        int chunk = (total_ms - slept) > 200 ? 200 : (total_ms - slept);
+        usleep(chunk * 1000);
+        slept += chunk;
+    }
+}
+
+// Apply exponential backoff after a failed (re)connect attempt. Increments
+// *fails and sleeps for the capped backoff delay. Logs every attempt up to
+// RECONNECT_MAX_ATTEMPTS, then logs once to announce slow-retry mode and stays
+// silent afterwards so a permanently-dead device cannot spam the log or hammer
+// the USB bus. Reset *fails to 0 once the device reconnects successfully.
+static void reconnect_backoff_apply(const char *tag, int id, int *fails, const char *reason) {
+    (*fails)++;
+    int delay = reconnect_backoff_ms(*fails);
+    if (RECONNECT_MAX_ATTEMPTS <= 0 || *fails <= RECONNECT_MAX_ATTEMPTS) {
+        fprintf(stderr, "[%s%d][ERR] %s, retry in %dms (attempt %d)\n",
+                tag, id, reason, delay, *fails);
+    } else if (*fails == RECONNECT_MAX_ATTEMPTS + 1) {
+        fprintf(stderr, "[%s%d][ERR] %s failed %d times, slowing to %ds retry to avoid USB storm\n",
+                tag, id, reason, RECONNECT_MAX_ATTEMPTS, RECONNECT_BACKOFF_MAX_MS / 1000);
+    }
+    interruptible_sleep_ms(delay);
+}
 
 // ==================== Utilities: sysfs Reads, VID/PID Parsing, etc. ====================
 static void trim_newline(char *str) {
@@ -675,6 +729,7 @@ static int is_camera_params_valid(const camera_params *params) {
 static void *capture_thread(void *arg) {
     struct cam_ctx *ctx = (struct cam_ctx *)arg;
     unsigned long frame_count = 0;
+    int reconnect_fails = 0;
 
     printf("[CAM%d] capture thread started, dev=%s\n",
            ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
@@ -691,25 +746,23 @@ static void *capture_thread(void *arg) {
             printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
-                fprintf(stderr, "[CAM%d][ERR] open failed: %s, retry in 1s\n",
-                        ctx->cam_id, strerror(errno));
-                usleep(1000000);
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "open failed");
                 continue;
             }
             if (init_capture(ctx) < 0) {
                 close(ctx->fd);
                 ctx->fd = -1;
-                usleep(1000000);
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "init_capture failed");
                 continue;
             }
             if (start_capture(ctx->fd) < 0) {
-                fprintf(stderr, "[CAM%d][ERR] failed to start stream\n", ctx->cam_id);
                 close(ctx->fd);
                 ctx->fd = -1;
-                usleep(1000000);
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "failed to start stream");
                 continue;
             }
             ctx->last_timestamp = 0;
+            reconnect_fails = 0;   // reconnected successfully; reset backoff
             printf("[CAM%d] device reinitialized\n", ctx->cam_id);
             frame_count = 0;
         }
@@ -862,6 +915,7 @@ static void *hid_thread(void *arg) {
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
     uint64_t last_ts = 0;
+    int reconnect_fails = 0;
 
     printf("[HID%d] thread started, dev=%s\n", idx, g_ctx.hid_devs[idx]);
 
@@ -872,17 +926,19 @@ static void *hid_thread(void *arg) {
             device = g_ctx.hid_devs[idx];
             fd = open(device, O_RDONLY | O_NONBLOCK);
             if (fd < 0) {
-                if (errno != ENOENT)
-                    fprintf(stderr, "[HID%d][ERR] open %s: %s\n", idx, device, strerror(errno));
-                usleep(1000000);
+                reconnect_backoff_apply("HID", idx, &reconnect_fails, "open failed");
                 continue;
             }
             printf("[HID%d] opened %s\n", idx, device);
+            reconnect_fails = 0;   // reconnected successfully; reset backoff
             last_ts = 0;
         }
 
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int ret = poll(&pfd, 1, -1);
+        // Use a finite timeout so the loop periodically re-checks g_ctx.running.
+        // With an infinite timeout, a stalled endpoint (no data) would block here
+        // forever and pthread_join() in insight9_receive_stop() would deadlock.
+        int ret = poll(&pfd, 1, 200);
         if (ret < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "[HID%d][ERR] poll: %s\n", idx, strerror(errno));
@@ -890,7 +946,14 @@ static void *hid_thread(void *arg) {
             fd = -1;
             continue;
         }
-        if (ret == 0) continue;
+        if (ret == 0) continue;  // timed out, re-check running and retry
+        // Endpoint hang-up / error: close and let the loop reopen instead of
+        // spinning on a dead fd.
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
 
         if (idx == 0) {
             struct imu_hid_report rpt;
@@ -905,7 +968,13 @@ static void *hid_thread(void *arg) {
                                  rpt.timestamp,
                                  g_ctx.imu_userdata);
                 }
+            } else if (n == 0) {
+                // EOF: endpoint went away (e.g. gadget warm-restart). Reopen.
+                fprintf(stderr, "[HID%d][WARN] IMU read returned 0 (EOF), reopening\n", idx);
+                close(fd);
+                fd = -1;
             } else if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
                 fprintf(stderr, "[HID%d][ERR] read IMU: %s\n", idx, strerror(errno));
                 close(fd);
                 fd = -1;
@@ -922,7 +991,13 @@ static void *hid_thread(void *arg) {
                                  payload.timestamp,
                                  g_ctx.vio_userdata);
                 }
+            } else if (n == 0) {
+                // EOF: endpoint went away (e.g. gadget warm-restart). Reopen.
+                fprintf(stderr, "[HID%d][WARN] VIO read returned 0 (EOF), reopening\n", idx);
+                close(fd);
+                fd = -1;
             } else if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
                 fprintf(stderr, "[HID%d][ERR] read VIO: %s\n", idx, strerror(errno));
                 close(fd);
                 fd = -1;
@@ -1185,6 +1260,24 @@ void insight9_receive_print_camera_params(const camera_params *params) {
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(xu_params));
     viewer::printParams(xu_params);
+}
+
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib) {
+    static_assert(sizeof(camera_calib) == sizeof(viewer::camera_calib),
+                  "camera_calib layout mismatch between C API and UVC payload");
+    if (!calib || cam_idx < 0 || cam_idx >= viewer::kCalibCamCount) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    viewer::camera_calib xu_calib;
+    if (!g_ctx.xu_control->readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib)) return -1;
+    memcpy(calib, &xu_calib, sizeof(camera_calib));
+    return 0;
+}
+
+void insight9_receive_print_camera_calib(const camera_calib *calib) {
+    if (!calib) return;
+    viewer::camera_calib xu_calib;
+    memcpy(&xu_calib, calib, sizeof(xu_calib));
+    viewer::printCalib(xu_calib);
 }
 
 } // extern "C"

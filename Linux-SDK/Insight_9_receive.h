@@ -118,21 +118,6 @@ int insight9_receive_start(void);
 const char *insight9_receive_get_video_dev(int cam_id);
 
 /**
- * @brief Get the metadata device path for the specified camera.
- * @param cam_id Camera index (0..2).
- * @return Device path string, or NULL on failure.
- */
-const char *insight9_receive_get_metadata_dev(int cam_id);
-
-/**
- * @brief Read metadata timestamp from the metadata device.
- * @param cam_id Camera index.
- * @param timestamp Output parameter for the timestamp.
- * @return 0 on success, -1 on failure.
- */
-int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
-
-/**
  * @brief Start a specific camera.
  * @param cam_id Camera ID (0: RGB, 1: Grayscale, 2: Depth).
  * @return 0 on success, -1 on failure.
@@ -162,7 +147,7 @@ int insight9_receive_is_camera_running(int cam_id);
 /**
  * @brief Stop all capture threads.
  */
-void insight9_receive_all_stop(void);
+void insight9_receive_stop(void);
 
 /**
  * @brief Release all resources. Must be called after stopping.
@@ -251,6 +236,13 @@ int insight9_receive_reset_camera_params(int cam_id);
  * @param params Pointer to camera_params
  */
 void insight9_receive_print_camera_params(const camera_params *params);
+
+/**
+ * @brief Get the current frame rate.
+ * @param fps Pointer to store the current frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_current_fps(int* fps);
 
 /**
  * @brief Get the hardware type/model as a string.

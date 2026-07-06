@@ -124,11 +124,10 @@ bool UvcExtensionUnit::writeCameraParams(uint8_t camId, const camera_params& par
     return writeCurrentCameraParams(params);
 }
 
-// bool UvcExtensionUnit::readCameraIntrinsics()  const {
-//     if (!isOpen()) return false;
-//     memset(&params, 0, sizeof(params));
-//     return uvc_control_query(fd_, unitId_, kCameraParamsSelector, UVC_GET_CUR, &params, sizeof(params)) == 0;
-// }
+bool UvcExtensionUnit::readCurrentFps(uint8_t& fpsIndex) const {
+    if (!isOpen()) return false;
+    return uvc_control_query(fd_, unitId_, kCurrentFpsSelector, UVC_GET_CUR, &fpsIndex, sizeof(fpsIndex)) == 0;
+}
 
 void printParams(const camera_params& params) {
     std::printf(

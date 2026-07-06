@@ -18,13 +18,35 @@ typedef struct {
     float gamma_dark;           // Dark gamma, range 1.0~4.0
     float hue;                  // Hue, range 0.0~87.0
     float saturation;           // Saturation, range 0.0~1.999
-    uint8_t sharpness;          // Sharpness, 1~255
+    uint8_t sharpness;         // Sharpness, 1~4095
     uint8_t auto_white_balance; // Auto white balance, 0 or 1
     float white_balance;        // White balance, range 1.0~3.0
     uint8_t decimation;         // Decimation, 1~255
     uint8_t hardware_model;     // Hardware model, 0..3
 } camera_params;
 #pragma pack(pop)
+
+enum class PixelFormat {
+    Unknown,
+    MJPEG,
+    GREY,
+    Z16,
+    RGB8,
+    Y8I,
+    YUYV
+};
+typedef struct {
+    int width;
+    int height;
+    int fps;
+    PixelFormat pixel_format;
+} video_config_t;
+
+typedef struct {
+    video_config_t rgb_config;
+    video_config_t gray_config;
+    video_config_t depth_config;
+} insight9_config_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,12 +65,15 @@ typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint64_t timestamp, void *userdata);
 
-int insight9_receive_init(void);
+int insight9_receive_init(const insight9_config_t* config);
+int insight9_receive_init_default(void);
 int insight9_receive_start(void);
 const char *insight9_receive_get_video_dev(int cam_id);
-const char *insight9_receive_get_metadata_dev(int cam_id);
-int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
-void insight9_receive_stop(void);
+int insight9_receive_start_camera(int cam_id);
+void insight9_receive_stop_camera(int cam_id);
+int insight9_receive_restart_camera(int cam_id);
+int insight9_receive_is_camera_running(int cam_id);
+void insight9_receive_all_stop(void);
 void insight9_receive_cleanup(void);
 void insight9_receive_register_image_callback(image_callback cb, void *userdata);
 void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
@@ -61,6 +86,7 @@ int insight9_receive_set_camera_params_for(int cam_id, const camera_params *para
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params);
 int insight9_receive_reset_camera_params(int cam_id);
 void insight9_receive_print_camera_params(const camera_params *params);
+int insight9_receive_get_current_fps(int* fps);
 const char* insight9_receive_get_hardware_type();
 
 #ifdef __cplusplus

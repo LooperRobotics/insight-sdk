@@ -27,9 +27,10 @@ struct camera_params {
 #pragma pack(pop)
 
 inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
-inline constexpr uint8_t kXuUnitId = 4;
+inline constexpr uint8_t kXuUnitId = 3;
 inline constexpr uint8_t kCameraParamsSelector = 4;
 inline constexpr uint8_t kActiveCameraSelector = 7;
+inline constexpr uint8_t kCurrentFpsSelector = 0x17;
 
 class UvcExtensionUnit {
 public:
@@ -50,6 +51,7 @@ public:
     bool writeCurrentCameraParams(const camera_params& params) const;
     bool readCameraParams(uint8_t camId, camera_params& params) const;
     bool writeCameraParams(uint8_t camId, const camera_params& params) const;
+    bool readCurrentFps(uint8_t& fpsIndex) const;
 
 private:
     int fd_ = -1;

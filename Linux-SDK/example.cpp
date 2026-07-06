@@ -12,7 +12,9 @@
 static volatile int keep_running = 1;
 
 void sigint_handler(int sig) {
+    printf("\n[Signal] Received SIGINT, stopping...\n");
     keep_running = 0;
+    insight9_receive_stop();
 }
 
 struct cam_stats {
@@ -58,6 +60,8 @@ static struct timespec g_hid_last_print;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
+static int gray_fps_state = 0;
+static const int GRAY_FPS_VALUES[] = {20, 30};
 
 static void reset_img_stats(void) {
     for (int i = 0; i < 3; i++) {
@@ -90,10 +94,14 @@ static const char *image_format_to_string(unsigned int format) {
     switch (format) {
         case V4L2_PIX_FMT_MJPEG:
             return "RGB";
+        case V4L2_PIX_FMT_YUYV:
+            return "yuyv";
         case V4L2_PIX_FMT_GREY:
             return "GREY";
         case V4L2_PIX_FMT_Z16:
             return "Z16";
+        case V4L2_PIX_FMT_Y8I:
+            return "Y8I";
         default:
             return "UNKNOWN";
     }
@@ -210,20 +218,88 @@ void my_vio_cb(float px, float py, float pz,
     pthread_mutex_unlock(&g_stats_lock);
 }
 
+void toggle_gray_camera_fps() {
+    int new_fps = GRAY_FPS_VALUES[gray_fps_state];
+    gray_fps_state = (gray_fps_state + 1) % 2;
+    
+    printf("\n========= Switching Gray Camera FPS =========\n");
+    printf("New FPS: %d\n", new_fps);
+
+    insight9_receive_stop_camera(1);
+    usleep(500000);
+    
+    int ret = insight9_receive_set_camera_fps(1, new_fps);
+    printf("insight9_receive_set_camera_fps returned: %d\n", ret);
+    
+    if (insight9_receive_restart_camera(1) == 0) {
+        printf("Gray camera restarted successfully at %d FPS\n", new_fps);
+    } else {
+        printf("Failed to restart gray camera!\n");
+    }
+}
+
+void* reconnect_worker(void* arg) {
+    while (keep_running) {
+        sleep(10);
+        if (!keep_running) break;
+        
+        if (insight9_receive_is_camera_running(0) == 0 &&
+            insight9_receive_is_camera_running(1) == 0 &&
+            insight9_receive_is_camera_running(2) == 0) {
+            printf("[ReconnectWorker] All cameras stopped, attempting reconnect...\n");
+            
+            insight9_receive_stop();
+            insight9_receive_cleanup();
+            
+            insight9_config_t config_reinit;
+            config_reinit.rgb_config.width = 1088;
+            config_reinit.rgb_config.height = 1920;
+            config_reinit.rgb_config.fps = 30;
+            config_reinit.rgb_config.pixel_format = V4L2_PIX_FMT_MJPEG;
+            config_reinit.gray_config.width = 544;
+            config_reinit.gray_config.height = 1281;
+            config_reinit.gray_config.fps = GRAY_FPS_VALUES[gray_fps_state];
+            config_reinit.gray_config.pixel_format = V4L2_PIX_FMT_GREY;
+            config_reinit.depth_config.width = 544;
+            config_reinit.depth_config.height = 642;
+            config_reinit.depth_config.fps = 30;
+            config_reinit.depth_config.pixel_format = V4L2_PIX_FMT_Z16;
+            
+            if (insight9_receive_init(&config_reinit) != 0) {
+                printf("[ReconnectWorker] SDK init failed\n");
+            } else {
+                insight9_receive_register_image_callback(my_image_cb, NULL);
+                insight9_receive_register_imu_callback(my_imu_cb, NULL);
+                insight9_receive_register_vio_callback(my_vio_cb, NULL);
+                
+                if (insight9_receive_start() != 0) {
+                    printf("[ReconnectWorker] SDK start failed\n");
+                    insight9_receive_cleanup();
+                } else {
+                    printf("[ReconnectWorker] SDK restarted successfully\n");
+                }
+            }
+        }
+    }
+    insight9_receive_stop();
+    insight9_receive_cleanup();
+    return NULL;
+}
+
 int main() {
     signal(SIGINT, sigint_handler);
 
     int active_cam = -1;
     camera_params params = {0};
 
-    if (insight9_receive_init() != 0) {
+    if (insight9_receive_init_default() != 0) {
         fprintf(stderr, "SDK init failed\n");
         return -1;
     }
 
     insight9_receive_register_image_callback(my_image_cb, NULL);
     insight9_receive_register_imu_callback(my_imu_cb, NULL);
-    insight9_receive_register_vio_callback(my_vio_cb, NULL);
+    // insight9_receive_register_vio_callback(my_vio_cb, NULL);
 
     if (insight9_receive_start() != 0) {
         fprintf(stderr, "SDK start failed\n");
@@ -286,14 +362,30 @@ int main() {
         printf("Failed to set camera parameters (invalid range or XU not available)\n");
     }
 
-    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type().c_str());
+    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
 
-    printf("SDK running, press Ctrl+C to stop...\n");
+    int fps = 0;
+    if (insight9_receive_get_current_fps(&fps) == 0) {
+        printf("Current FPS for gray camera: %d\n", fps);
+    } else {
+        printf("Failed to get current FPS for gray camera\n");
+    }
+    
+    pthread_t reconnect_thread;
+    pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);
+
+    printf("SDK running with all 3 cameras\n");
+    printf("Gray camera will toggle between 20fps and 30fps every 10 seconds\n");
+    printf("Press Ctrl+C to stop...\n");
+
     while (keep_running) {
         sleep(1);
     }
 
+    pthread_join(reconnect_thread, NULL);
+
     insight9_receive_stop();
     insight9_receive_cleanup();
+    printf("Program exited.\n");
     return 0;
 }

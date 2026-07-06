@@ -127,7 +127,6 @@ bool ExtensionUnitControl::setActiveCamera(uint8_t camId) const {
 
 bool ExtensionUnitControl::readCurrentCameraParams(camera_params& params) const {
     std::memset(&params, 0, sizeof(params));
-    printParams(params);
     return query(kCameraParamsSelector, KSPROPERTY_TYPE_GET, &params, sizeof(params));
 }
 
@@ -153,6 +152,10 @@ bool ExtensionUnitControl::writeCameraParams(uint8_t camId, const camera_params&
     printf("[XU] Set active camera to %u for writing params\n", static_cast<unsigned>(camId));
     ::Sleep(50);
     return writeCurrentCameraParams(params);
+}
+
+bool ExtensionUnitControl::readCurrentFps(uint8_t& fpsIndex) const {
+    return query(kCurrentFpsSelector, KSPROPERTY_TYPE_GET, &fpsIndex, sizeof(fpsIndex));
 }
 
 bool ExtensionUnitControl::bindFilterByDevicePath(const std::string& devicePath) {
@@ -243,7 +246,18 @@ bool ExtensionUnitControl::resolveNodeId() {
         if (FAILED(topology->get_NodeType(i, &nodeType))) {
             continue;
         }
-
+        if (SUCCEEDED(topology->get_NodeType(i, &nodeType))) {
+            printf("[XU] Node %lu: GUID={%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
+                   i, nodeType.Data1, nodeType.Data2, nodeType.Data3,
+                   nodeType.Data4[0], nodeType.Data4[1], nodeType.Data4[2], nodeType.Data4[3],
+                   nodeType.Data4[4], nodeType.Data4[5], nodeType.Data4[6], nodeType.Data4[7]);
+            
+            if (InlineIsEqualGUID(nodeType, kKsNodeTypeDevSpecific)) {
+                nodeId_ = i;
+                found = true;
+                break;
+            }
+        }
         // Most UVC extension units show up as a device-specific topology node.
         if (InlineIsEqualGUID(nodeType, kKsNodeTypeDevSpecific)) {
             nodeId_ = i;
@@ -258,6 +272,7 @@ bool ExtensionUnitControl::resolveNodeId() {
 
 bool ExtensionUnitControl::query(uint8_t selector, unsigned long flags, void* data, unsigned long size) const {
     if (!ksControl_) {
+        printf("[XU] query failed: ksControl_ is null\n");
         return false;
     }
 
@@ -284,7 +299,7 @@ void printParams(const camera_params& params) {
         ? kFramerateMap[params.frame_rate]
         : -1;
 
-    printf("[XU] cam_id=%u, resolution=%u, framerate=%u (%d fps), exposure_time=%.4f, gain=%.4f, backlight=%u\n"
+    printf("[XU] cam_id=%u, resolution=%u, framerate=%u (%d fps), exposure_time=%.4f, gain=%.4f, auto_exposure=%u\n"
             "brightness=%.4f, contrast=%.4f, gamma=%.4f, hue=%.4f, saturation=%.4f, sharpness=%u, awb=%u\n"
             "white_balance=%.4f, filter=%u, Hardware_model=%u\n",
                 static_cast<unsigned>(params.cam_id),
@@ -293,7 +308,7 @@ void printParams(const camera_params& params) {
                 fps,
                 params.exposure_time,
                 params.exposure_gain,
-                static_cast<unsigned>(params.backlight_comp),
+                static_cast<unsigned>(params.auto_exposure),
                 params.brightness,
                 params.contrast,
                 params.gamma_dark,

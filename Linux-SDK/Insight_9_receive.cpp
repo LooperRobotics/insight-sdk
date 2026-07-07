@@ -20,12 +20,8 @@
 #include "UvcExtensionUnit.hpp"
 #include <atomic>
 
-#ifndef V4L2_META_FMT_UVC
-#define V4L2_META_FMT_UVC v4l2_fourcc('U', 'V', 'C', 'H')
-#endif
-
 // ==================== Target Device VID/PID ====================
-#define VENDOR_ID  0x1d6b
+#define VENDOR_ID  0x3652
 #define PRODUCT_ID 0x0104
 
 // ==================== Camera Configuration ====================
@@ -60,8 +56,6 @@
 // ==================== Data Structures ====================
 #define MAX_PATH 1024
 
-std::string hardware_model[50] = { "Insight 9", "Insight 7", "Insight 7p", "Insight 3u" };
-
 struct buffer {
     void *start;
     size_t length;
@@ -84,9 +78,7 @@ typedef struct {
     // Cameras
     struct cam_ctx cams[CAM_NUM];
     char video_devs[CAM_NUM][MAX_PATH];   // Dynamically resolved video device paths
-    char metadata_devs[CAM_NUM][MAX_PATH]; // Matching UVC metadata device paths
     char video_usb_paths[CAM_NUM][MAX_PATH]; // Matching USB root paths, used for rediscovery after reconnect
-    char metadata_usb_paths[CAM_NUM][MAX_PATH]; // Matching metadata USB root paths
     // HID devices (only two are used: 0=IMU, 1=VIO)
     char hid_devs[HID_NUM][MAX_PATH];           // Dynamically resolved hidraw device paths
     char hid_usb_paths[HID_NUM][MAX_PATH];   // Matching HID USB root paths, used for rediscovery after reconnect
@@ -99,7 +91,12 @@ typedef struct {
     vio_callback vio_cb;
     void *vio_userdata;
     // Running flag
-    volatile int running;
+    std::atomic<bool> running;
+    insight9_config_t config;
+    std::atomic<bool> cam_running[CAM_NUM];
+    pthread_t video_tids[CAM_NUM];
+    struct timespec last_frame_time[CAM_NUM];
+    bool first_frame_received[CAM_NUM];
     // Initialization flag
     int initialized;
     viewer::UvcExtensionUnit *xu_control;
@@ -316,7 +313,7 @@ static int compare_device_numbers(const void *a, const void *b) {
     return na - nb;
 }
 
-// Find all UVC devices matching the VID/PID, return device paths (/dev/videoX) sorted by numeric suffix.
+// Find all video4linux nodes matching the VID/PID, return device paths (/dev/videoX) sorted by numeric suffix.
 static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int target_pid,
                                        char dev_paths[][MAX_PATH], int max_devs) {
     DIR *dir = opendir("/sys/class/video4linux");
@@ -361,7 +358,6 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
             for (int i = 0; i < count; i++) ptrs[i] = dev_paths[i];
             qsort(ptrs, count, sizeof(char *), compare_device_numbers);
             
-            // 分配临时存储并重新排序
             char (*tmp)[MAX_PATH] = (char(*)[MAX_PATH])malloc(count * MAX_PATH);
             if (tmp) {
                 for (int i = 0; i < count; i++) strcpy(tmp[i], ptrs[i]);
@@ -382,8 +378,8 @@ static void refresh_video_device_path(int cam_id) {
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < CAM_NUM) {
-        printf("[CAM%d] Found %d UVC devices, fewer than %d; skipping reconnect\n", cam_id, uvc_count, CAM_NUM);
-        return;
+        fprintf(stderr, "[CAM%d][WARN] found %d UVC devices (< %d), skip reconnect\n", cam_id, uvc_count, CAM_NUM);
+        // return;
     } else {
         printf("[CAM%d] Found %d UVC devices, trying to match...\n", cam_id, uvc_count);
         for (int i = 0; i < uvc_count; ++i) {
@@ -560,10 +556,13 @@ static int init_capture(struct cam_ctx *ctx) {
            ctx->cam_id, ctx->width, ctx->height, ctx->format);
     
     int target_framerate = 30;
-    if (ctx->format == V4L2_PIX_FMT_GREY) {
-        target_framerate = 20;
-    } else if (ctx->format == V4L2_PIX_FMT_Z16) {
-        target_framerate = 15;
+    int cam_id = ctx->cam_id;
+    if (ctx->format == MAIN_FORMAT) {
+        target_framerate = g_ctx.config.rgb_config.fps;
+    } else if (ctx->format == SUB_FORMAT) {
+        target_framerate = g_ctx.config.gray_config.fps;
+    } else if (ctx->format == SUB_FORMAT) {
+        target_framerate = g_ctx.config.depth_config.fps;
     }
     set_framerate(ctx->fd, target_framerate);
 
@@ -756,8 +755,7 @@ static void *capture_thread(void *arg) {
     unsigned long frame_count = 0;
     int reconnect_fails = 0;
 
-    printf("[CAM%d] capture thread started, dev=%s meta=%s\n",
-           ctx->cam_id, g_ctx.video_devs[ctx->cam_id], g_ctx.metadata_devs[ctx->cam_id]);
+    printf("[CAM%d] capture thread started, dev=%s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
 
     while (g_ctx.running) {
         struct pollfd fds;
@@ -768,6 +766,7 @@ static void *capture_thread(void *arg) {
             printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
+            
             printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
@@ -793,10 +792,13 @@ static void *capture_thread(void *arg) {
             frame_count = 0;
         }
 
+        if (!g_ctx.running) break;
         int ret = poll(&fds, 1, 200);
         if (ret < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR){
+                if (!g_ctx.running) break;
                 continue;
+            }
             fprintf(stderr, "[CAM%d][ERR] poll: %s\n", ctx->cam_id, strerror(errno));
             close(ctx->fd);
             ctx->fd = -1;
@@ -849,7 +851,7 @@ static void *capture_thread(void *arg) {
         uint64_t right_timestamp = 0;
         if (ctx->format == V4L2_PIX_FMT_MJPEG) {
             uint8_t *p = (uint8_t*)ctx->buffers[buf.index].start;
-            if (p[0] == 0xFF && p[1] == 0xD8) {
+            if (buf.bytesused >= 12 && p[0] == 0xFF && p[1] == 0xD8) {
                 p += 2;
                 if (p[0] == 0xFF && p[1] == 0xE1) {
                     uint16_t len = (p[2] << 8) | p[3];
@@ -875,7 +877,8 @@ static void *capture_thread(void *arg) {
             }
         }
 
-        // Filter 2: drop buffers until matching UVC metadata provides a usable timestamp.
+        // Filter 2: drop buffers without a usable embedded timestamp
+        // (e.g. partial MJPEG frames missing the TS__ APP1 marker).
         if (timestamp == 0) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
@@ -917,6 +920,15 @@ static void *capture_thread(void *arg) {
         }
     }
 
+    if (ctx->fd >= 0) {
+        stop_capture(ctx->fd);
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+
+    // free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+
+    printf("[CAM%d] capture thread exited\n", ctx->cam_id);
     return NULL;
 }
 
@@ -1036,27 +1048,46 @@ static void *hid_thread(void *arg) {
 }
 
 // ==================== SDK API Implementation ====================
-int insight9_receive_init(void) {
+int insight9_receive_init(const insight9_config_t* config) {
     if (g_ctx.initialized) {
         fprintf(stderr, "[SDK][WARN] already initialized\n");
         return -1;
     }
 
+    if (!config) {
+        fprintf(stderr, "[SDK][ERR] Config is NULL, using default\n");
+        return insight9_receive_init_default();
+    }
+
+    if (config->rgb_config.width <= 0 || config->rgb_config.height <= 0 ||
+        config->gray_config.width <= 0 || config->gray_config.height <= 0 ||
+        config->depth_config.width <= 0 || config->depth_config.height <= 0) {
+        fprintf(stderr, "[SDK] Invalid resolution in config\n");
+        return -1;
+    }
+
     memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.running = false;
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+        g_ctx.first_frame_received[i] = false;
+        clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
+    }
+    g_ctx.config = *config;
 
     // Find UVC devices.
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
-    if (uvc_count < 6) {
-        fprintf(stderr, "[SDK][ERR] need >= 6 UVC video/metadata nodes with VID=0x%04x PID=0x%04x, found %d\n",
+    if (uvc_count < 3) {
+        fprintf(stderr, "[SDK][ERR] need >= 3 UVC devices with VID=0x%04x PID=0x%04x, found %d\n",
                 VENDOR_ID, PRODUCT_ID, uvc_count);
         return -1;
     }
-    // Select video nodes 0/2/4 and their matching metadata nodes 1/3/5.
+    // Select every other device: indexes 0, 2, and 4.
     int selected_idx[] = {0, 2, 4};
     for (int i = 0; i < CAM_NUM; i++) {
         if (selected_idx[i] >= uvc_count) {
-            fprintf(stderr, "Error: cannot select 3 devices by skipping one (need at least 6 devices)\n");
+            fprintf(stderr, "[SDK][ERR] cannot select 3 devices by skipping one (need >= 6 devices)\n");
             return -1;
         }
         strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
@@ -1064,7 +1095,7 @@ int insight9_receive_init(void) {
         if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
             g_ctx.video_usb_paths[i][0] = '\0';
         }
-        printf("Selected UVC device %d: %s\n", i, g_ctx.video_devs[i]);
+        printf("[SDK] selected UVC[%d]=%s\n", i, g_ctx.video_devs[i]);
     }
 
     // Find HID devices.
@@ -1085,6 +1116,129 @@ int insight9_receive_init(void) {
     }
     if (get_hid_usb_device_path(g_ctx.hid_devs[1], g_ctx.hid_usb_paths[1], MAX_PATH) < 0) {
         g_ctx.hid_usb_paths[1][0] = '\0';
+    }
+    printf("[SDK] selected HID: IMU=%s VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
+
+    // Initialize camera contexts.
+    for (int i = 0; i < CAM_NUM; i++) {
+        g_ctx.cams[i].cam_id = i;
+        g_ctx.cams[i].fd = -1;
+        if (i == 0) {
+            g_ctx.cams[i].width = config->depth_config.width;
+            g_ctx.cams[i].height = config->depth_config.height;
+            g_ctx.cams[i].format = config->depth_config.pixel_format;
+        } else if (i == 1) {
+            g_ctx.cams[i].width = config->gray_config.width;
+            g_ctx.cams[i].height = config->gray_config.height;
+            g_ctx.cams[i].format = config->gray_config.pixel_format;
+        } else if (i == 2) {
+            g_ctx.cams[i].width = config->rgb_config.width;
+            g_ctx.cams[i].height = config->rgb_config.height;
+            g_ctx.cams[i].format = config->rgb_config.pixel_format;
+        }
+    }
+
+    if (g_ctx.video_devs[0][0] != '\0') {
+        g_ctx.xu_control = new viewer::UvcExtensionUnit();
+        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+            fprintf(stderr, "[XU][WARN] cannot open extension unit, camera params will be unavailable\n");
+            delete g_ctx.xu_control;
+            g_ctx.xu_control = nullptr;
+            g_ctx.xu_ready = false;
+        } else {
+            g_ctx.xu_ready = true;
+            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
+        }
+    } else {
+        g_ctx.xu_control = nullptr;
+        g_ctx.xu_ready = false;
+    }
+
+    g_ctx.initialized = 1;
+    printf("[SDK] initialized\n");
+    return 0;
+}
+
+int insight9_receive_init_default(void) {
+    if (g_ctx.initialized) {
+        fprintf(stderr, "[SDK][WARN] already initialized\n");
+        return -1;
+    }
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+        g_ctx.first_frame_received[i] = false;
+        clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
+    }
+    
+    g_ctx.config.rgb_config.width = MAIN_WIDTH;
+    g_ctx.config.rgb_config.height = MAIN_HEIGHT;
+    g_ctx.config.rgb_config.fps = 30;
+    g_ctx.config.rgb_config.pixel_format = V4L2_PIX_FMT_YUYV;
+    
+    g_ctx.config.gray_config.width = SUB_WIDTH;
+    g_ctx.config.gray_config.height = SUB_HEIGHT;
+    g_ctx.config.gray_config.fps = 30;
+    g_ctx.config.gray_config.pixel_format = V4L2_PIX_FMT_Y8I;
+    
+    g_ctx.config.depth_config.width = DEPTH_WIDTH;
+    g_ctx.config.depth_config.height = DEPTH_HEIGHT;
+    g_ctx.config.depth_config.fps = 30;
+    g_ctx.config.depth_config.pixel_format = V4L2_PIX_FMT_Z16;
+
+    char uvc_list[10][MAX_PATH] = {{0}};
+    int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
+    if (uvc_count < 3) {
+        fprintf(stderr, "[SDK][ERR] need >= 3 UVC devices with VID=0x%04x PID=0x%04x, found %d\n",
+                VENDOR_ID, PRODUCT_ID, uvc_count);
+        return -1;
+    }
+    // Select every other device: indexes 0, 2, and 4.
+    int selected_idx[] = {0, 2, 4};
+    for (int i = 0; i < CAM_NUM; i++) {
+        if (selected_idx[i] >= uvc_count) {
+            fprintf(stderr, "Error: cannot select 3 devices by skipping one (need at least 6 devices)\n");
+            return -1;
+        }
+        strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
+        g_ctx.video_usb_paths[i][0] = '\0';
+        if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
+            g_ctx.video_usb_paths[i][0] = '\0';
+        }
+        printf("[SDK] selected UVC[%d]=%s\n", i, g_ctx.video_devs[i]);
+    }
+
+    // Find HID devices.
+    char hid_list[10][MAX_PATH] = {{0}};
+    int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
+
+    g_ctx.hid_devs[0][0] = '\0';
+    g_ctx.hid_devs[1][0] = '\0';
+
+    if (hid_count >= 1) {
+        strcpy(g_ctx.hid_devs[0], hid_list[0]);
+        printf("[SDK] selected HID: IMU=%s\n", g_ctx.hid_devs[0]);
+    } else {
+        fprintf(stderr, "[SDK][WARN] No HID devices found\n");
+    }
+
+    if (hid_count >= 2) {
+        strcpy(g_ctx.hid_devs[1], hid_list[1]);
+        printf("[SDK] selected HID: VIO=%s\n", g_ctx.hid_devs[1]);
+    } else {
+        g_ctx.hid_devs[1][0] = '\0';
+    }
+
+    if (g_ctx.hid_devs[0][0] != '\0') {
+        if (get_hid_usb_device_path(g_ctx.hid_devs[0], g_ctx.hid_usb_paths[0], MAX_PATH) < 0) {
+            g_ctx.hid_usb_paths[0][0] = '\0';
+        }
+    }
+    if (g_ctx.hid_devs[1][0] != '\0') {
+        if (get_hid_usb_device_path(g_ctx.hid_devs[1], g_ctx.hid_usb_paths[1], MAX_PATH) < 0) {
+            g_ctx.hid_usb_paths[1][0] = '\0';
+        }
     }
     printf("[SDK] selected HID: IMU=%s VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
 
@@ -1138,16 +1292,76 @@ int insight9_receive_start(void) {
         return -1;
     }
 
-    g_ctx.running = 1;
+    g_ctx.running = true;
 
     for (int i = 0; i < CAM_NUM; i++) {
         pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
     }
-    for (int i = 0; i < 2; i++) {
-        pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
+    for (int i = 0; i < HID_NUM; i++) {
+        if (g_ctx.hid_devs[i][0] != '\0') {
+            pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
+        }
     }
 
     printf("[SDK] started\n");
+    return 0;
+}
+
+int insight9_receive_start_camera(int cam_id) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (g_ctx.cam_running[cam_id]) return 0;
+
+    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
+    
+    if (ctx->fd < 0) {
+        refresh_video_device_path(cam_id);
+        const char *dev_path = g_ctx.video_devs[cam_id];
+        ctx->fd = open(dev_path, O_RDWR);
+        if (ctx->fd < 0) {
+            fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
+            return -1;
+        }
+        
+        if (cam_id == 0) {
+            ctx->width = g_ctx.config.depth_config.width;
+            ctx->height = g_ctx.config.depth_config.height;
+            ctx->format = g_ctx.config.depth_config.pixel_format;
+        } else if (cam_id == 1) {
+            ctx->width = g_ctx.config.gray_config.width;
+            ctx->height = g_ctx.config.gray_config.height;
+            ctx->format = g_ctx.config.gray_config.pixel_format;
+        } else {
+            ctx->width = g_ctx.config.rgb_config.width;
+            ctx->height = g_ctx.config.rgb_config.height;
+            ctx->format = g_ctx.config.rgb_config.pixel_format;
+        }
+        
+        if (init_capture(ctx) < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            return -1;
+        }
+        
+        if (start_capture(ctx->fd) < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            return -1;
+        }
+        
+        ctx->last_timestamp = 0;
+    }
+
+    g_ctx.cam_running[cam_id] = true;
+    g_ctx.first_frame_received[cam_id] = false;
+    clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[cam_id]);
+    
+    if (g_ctx.video_tids[cam_id]) {
+        pthread_join(g_ctx.video_tids[cam_id], NULL);
+    }
+    pthread_create(&g_ctx.video_tids[cam_id], NULL, capture_thread, ctx);
+    
+    printf("[CAM%d] started\n", cam_id);
     return 0;
 }
 
@@ -1161,27 +1375,83 @@ const char *insight9_receive_get_video_dev(int cam_id) {
     return g_ctx.video_devs[cam_id][0] ? g_ctx.video_devs[cam_id] : NULL;
 }
 
+void insight9_receive_stop_camera(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return;
+    
+    g_ctx.cam_running[cam_id] = false;
+    
+    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
+    if (ctx->fd >= 0) {
+        stop_capture(ctx->fd);
+        if (ctx->buffers) {
+            for (int j = 0; j < ctx->buffer_count; j++) {
+                if (ctx->buffers[j].start)
+                    munmap(ctx->buffers[j].start, ctx->buffers[j].length);
+            }
+            free(ctx->buffers);
+            ctx->buffers = NULL;
+        }
+        close(ctx->fd);
+        ctx->fd = -1;
+        ctx->buffer_count = 0;
+    }
+    
+    if (g_ctx.video_tids[cam_id]) {
+        pthread_join(g_ctx.video_tids[cam_id], NULL);
+        g_ctx.video_tids[cam_id] = 0;
+    }
+    
+    printf("[CAM%d] stopped\n", cam_id);
+}
+
+int insight9_receive_restart_camera(int cam_id) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    
+    insight9_receive_stop_camera(cam_id);
+    usleep(100000);
+    return insight9_receive_start_camera(cam_id);
+}
+
+int insight9_receive_is_camera_running(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
+    return g_ctx.cam_running[cam_id] ? 1 : 0;
+}
+
 void insight9_receive_stop(void) {
     if (!g_ctx.running) return;
-    g_ctx.running = 0;
+    g_ctx.running = false;
+
+    printf("[SDK] Stopping all cameras...\n");
 
     for (int i = 0; i < CAM_NUM; i++) {
-        pthread_join(g_ctx.cams[i].tid, NULL);
+        g_ctx.cam_running[i] = false;
+        struct cam_ctx *ctx = &g_ctx.cams[i];
+        if (ctx->fd >= 0) {
+            stop_capture(ctx->fd);
+            close(ctx->fd);
+            ctx->fd = -1;
+        }
+        if (g_ctx.video_tids[i]) {
+            pthread_join(g_ctx.video_tids[i], NULL);
+            g_ctx.video_tids[i] = 0;
+        }
     }
-    for (int i = 0; i < 2; i++) {
-        pthread_join(g_ctx.hid_tids[i], NULL);
+
+    for (int i = 0; i < HID_NUM; i++) {
+        if (g_ctx.hid_tids[i]) {
+            pthread_join(g_ctx.hid_tids[i], NULL);
+            g_ctx.hid_tids[i] = 0;
+        }
     }
+
     printf("[SDK] stopped\n");
 }
 
 void insight9_receive_cleanup(void) {
     if (!g_ctx.initialized) return;
 
-    if (g_ctx.xu_control) {
-        g_ctx.xu_control->close();
-        delete g_ctx.xu_control;
-        g_ctx.xu_control = nullptr;
-    }
+    printf("[SDK] Cleaning up...\n");
 
     if (g_ctx.running) {
         insight9_receive_stop();
@@ -1191,6 +1461,7 @@ void insight9_receive_cleanup(void) {
         struct cam_ctx *ctx = &g_ctx.cams[i];
         if (ctx->fd >= 0) {
             stop_capture(ctx->fd);
+            // free_buffer_array(&ctx->buffers, &ctx->buffer_count);
             if (ctx->buffers) {
                 for (int j = 0; j < ctx->buffer_count; j++) {
                     if (ctx->buffers[j].start)
@@ -1204,8 +1475,32 @@ void insight9_receive_cleanup(void) {
         }
     }
 
+    if (g_ctx.xu_control) {
+        g_ctx.xu_control->close();
+        delete g_ctx.xu_control;
+        g_ctx.xu_control = nullptr;
+    }
+    
+    usleep(200000);
     g_ctx.initialized = 0;
     printf("[SDK] cleaned up\n");
+}
+
+int insight9_receive_set_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (fps <= 0) return -1;
+    
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.fps = fps;
+    } else if (cam_id == 1) {
+        g_ctx.config.gray_config.fps = fps;
+    } else {
+        g_ctx.config.depth_config.fps = fps;
+    }
+    
+    printf("[SDK] Set camera %d FPS to %d\n", cam_id, fps);
+    return 0;
 }
 
 void insight9_receive_register_image_callback(image_callback cb, void *userdata) {
@@ -1305,19 +1600,39 @@ void insight9_receive_print_camera_calib(const camera_calib *calib) {
     viewer::printCalib(xu_calib);
 }
 
-std::string insight9_receive_get_hardware_type() {
+int insight9_receive_get_current_fps(int* fps) {
+    if (!fps) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    uint8_t val;
+    if (!g_ctx.xu_control->readCurrentFps(val)) return -1;
+    const int validFps[] = {0, 20, 30, 40, 50};
+    if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+        *fps = validFps[val];
+    } else {
+        *fps = 0;
+    }
+    return 0;
+}
+
+const char* insight9_receive_get_hardware_type(void) {
+    static std::string result;
     viewer::camera_params xu_params;
+    
     if (!g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
         return "unknown";
     }
+    
     if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) {
         return "unknown";
     }
+    
     uint8_t model = xu_params.hardware_model;
-    if (model >= 4) {
-        return "unknown";
+    const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
+    if (model < 4) {
+        result = models[model];
+        return result.c_str();
     }
-    return hardware_model[model];
+    return "unknown";
 }
 
 } // extern "C"

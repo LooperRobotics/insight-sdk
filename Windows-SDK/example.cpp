@@ -1,14 +1,14 @@
-// example_win.c - Windows 平台示例程序，使用 Insight9SDK.lib
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <signal.h>
+#include <thread>
+#include <chrono>
 
 #include "Insight9SDK.h"
 
-// 全局标志，用于响应 Ctrl+C
 static volatile BOOL keep_running = TRUE;
 static volatile LONGLONG last_image_time = 0;
 
@@ -20,7 +20,6 @@ BOOL WINAPI console_handler(DWORD dwCtrlType) {
     return FALSE;
 }
 
-// 统计结构体
 struct cam_stats {
     uint64_t cb_count;
     uint64_t last_ts;
@@ -195,14 +194,13 @@ void my_vio_cb(float px, float py, float pz,
 }
 
 int main() {
-    // 设置控制台 Ctrl+C 处理
     SetConsoleCtrlHandler(console_handler, TRUE);
     InitializeCriticalSection(&g_stats_lock);
 
     int active_cam = -1;
     camera_params params = {0};
 
-    if (insight9_receive_init() != 0) {
+    if (insight9_receive_init_default() != 0) {
         fprintf(stderr, "SDK init failed\n");
         DeleteCriticalSection(&g_stats_lock);
         return -1;
@@ -219,7 +217,6 @@ int main() {
         return -1;
     }
 
-    // 获取当前活跃摄像头及其参数
     if (insight9_receive_get_active_camera(&active_cam) == 0) {
         printf("Current active camera: %d\n", active_cam);
         if (insight9_receive_get_camera_params(&params) == 0) {
@@ -245,7 +242,13 @@ int main() {
         printf("Failed to get active camera\n");
     }
 
-    // 调整 RGB 摄像头参数
+    int fps = 0;
+    if (insight9_receive_get_current_fps(&fps) == 0) {
+        printf("Current FPS for gray camera: %d\n", fps);
+    } else {
+        printf("Failed to get current FPS for gray camera\n");
+    }
+
     params.cam_id = 0;
     params.brightness = 80.0f;
     params.contrast = 1.2f;
@@ -277,19 +280,33 @@ int main() {
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
 
     InterlockedExchange64(&last_image_time, GetTickCount64());
+    printf("SDK started with all 3 cameras\n");
     printf("SDK running, press Ctrl+C to stop...\n");
+
     while (keep_running) {
-        Sleep(3000);   // 每秒检查一次
+        Sleep(1000);
         LONGLONG now = GetTickCount64();
-        LONGLONG last = last_image_time;   // 直接读取（对齐，x64 下原子）
+        LONGLONG last = last_image_time;
         if (last != 0 && (now - last) > 5000) {
-            insight9_receive_stop();
+            insight9_receive_all_stop();
             insight9_receive_cleanup();
+
+            insight9_config_t config_reinit;
+            config_reinit.rgb_config.width = 1088;
+            config_reinit.rgb_config.height = 1920;
+            config_reinit.rgb_config.fps = 30;
+            config_reinit.rgb_config.pixel_format = PixelFormat::MJPEG;
+            config_reinit.gray_config.width = 544;
+            config_reinit.gray_config.height = 1281;
+            config_reinit.gray_config.pixel_format = PixelFormat::GREY;
+            config_reinit.depth_config.width = 544;
+            config_reinit.depth_config.height = 642;
+            config_reinit.depth_config.fps = 30;
+            config_reinit.depth_config.pixel_format = PixelFormat::Z16;
                 
-            if (insight9_receive_init() != 0) {
+            if (insight9_receive_init(&config_reinit) != 0) {
                 printf("[ReconnectWorker] SDK init failed\n");
             } else {
-                // 正确：传递两个参数
                 insight9_receive_register_image_callback(my_image_cb, NULL);
                 insight9_receive_register_imu_callback(my_imu_cb, NULL);
                 insight9_receive_register_vio_callback(my_vio_cb, NULL);
@@ -301,11 +318,13 @@ int main() {
                     printf("[ReconnectWorker] SDK restarted successfully\n");
                 }
             }
+            InterlockedExchange64(&last_image_time, GetTickCount64());
         }
     }
 
-    insight9_receive_stop();
+    insight9_receive_all_stop();
     insight9_receive_cleanup();
     DeleteCriticalSection(&g_stats_lock);
+    printf("Program exited.\n");
     return 0;
 }

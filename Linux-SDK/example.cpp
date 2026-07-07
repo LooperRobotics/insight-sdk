@@ -299,7 +299,7 @@ int main() {
 
     insight9_receive_register_image_callback(my_image_cb, NULL);
     insight9_receive_register_imu_callback(my_imu_cb, NULL);
-    // insight9_receive_register_vio_callback(my_vio_cb, NULL);
+    insight9_receive_register_vio_callback(my_vio_cb, NULL);
 
     if (insight9_receive_start() != 0) {
         fprintf(stderr, "SDK start failed\n");

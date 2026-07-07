@@ -868,7 +868,7 @@ int insight9_receive_is_camera_running(int cam_id) {
     return g_ctx.cam_running[cam_id] ? 1 : 0;
 }
 
-void insight9_receive_all_stop() {
+void insight9_receive_stop() {
     if (!g_ctx.running) return;
     g_ctx.running = false;
     
@@ -885,7 +885,7 @@ void insight9_receive_all_stop() {
 }
 
 void insight9_receive_cleanup() {
-    insight9_receive_all_stop();
+    insight9_receive_stop();
 
     fprintf(stderr, "[SDK] Cleaning up resources...\n");
     for (int i = 0; i < CAM_NUM; ++i) {

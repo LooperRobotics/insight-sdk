@@ -84,6 +84,7 @@ inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
 inline constexpr uint8_t kXuUnitId = 4;
 inline constexpr uint8_t kCameraParamsSelector = 4;
 inline constexpr uint8_t kActiveCameraSelector = 7;
+inline constexpr uint8_t kCurrentFpsSelector = 0x17;
 inline constexpr uint8_t kCameraCalibSelectorBase = 0x14;
 
 // The UVC gadget can only return 60 bytes per control request, so the
@@ -113,9 +114,7 @@ public:
     bool writeCurrentCameraParams(const camera_params& params) const;
     bool readCameraParams(uint8_t camId, camera_params& params) const;
     bool writeCameraParams(uint8_t camId, const camera_params& params) const;
-
-    // Read intrinsics + extrinsics of one camera in a single GET_CUR.
-    // camIdx: kCalibCamLeft / kCalibCamRight / kCalibCamRgb.
+    bool readCurrentFps(uint8_t& fpsIndex) const;
     bool readCameraCalib(uint8_t camIdx, camera_calib& calib) const;
 
 private:

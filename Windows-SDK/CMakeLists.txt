@@ -4,12 +4,10 @@ project(Insight9SDK)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 消除 MSVC 编码警告
 if(MSVC)
     add_compile_options("/utf-8")
 endif()
 
-# ---------- FFmpeg 选择 ----------
 option(USE_SYSTEM_FFMPEG "Use system FFmpeg libraries" OFF)
 
 if(USE_SYSTEM_FFMPEG)
@@ -27,7 +25,6 @@ else()
     )
 endif()
 
-# ---------- HIDAPI 选择 ----------
 option(USE_SYSTEM_HIDAPI "Use system HIDAPI (requires vcpkg or manual installation)" OFF)
 
 if(USE_SYSTEM_HIDAPI)
@@ -45,7 +42,6 @@ else()
     set(HIDAPI_TARGET hidapi_prebuilt)
 endif()
 
-# ---------- SDK 库 ----------
 add_library(Insight9SDK STATIC Insight9SDK.cpp ExtensionUnitControl.cpp)
 target_include_directories(Insight9SDK PRIVATE ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(Insight9SDK PRIVATE
@@ -56,11 +52,9 @@ target_link_libraries(Insight9SDK PRIVATE
     uuid
 )
 
-# ---------- 示例程序 ----------
 add_executable(example example.cpp)
 target_link_libraries(example Insight9SDK)
 
-# ---------- 自动复制运行时 DLL ----------
 if(NOT USE_SYSTEM_FFMPEG AND EXISTS "${FFMPEG_DIR}/bin")
     file(GLOB FFMPEG_DLLS 
         "${FFMPEG_DIR}/bin/avcodec-*.dll"

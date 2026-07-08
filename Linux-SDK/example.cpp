@@ -218,26 +218,6 @@ void my_vio_cb(float px, float py, float pz,
     pthread_mutex_unlock(&g_stats_lock);
 }
 
-void toggle_gray_camera_fps() {
-    int new_fps = GRAY_FPS_VALUES[gray_fps_state];
-    gray_fps_state = (gray_fps_state + 1) % 2;
-    
-    printf("\n========= Switching Gray Camera FPS =========\n");
-    printf("New FPS: %d\n", new_fps);
-
-    insight9_receive_stop_camera(1);
-    usleep(500000);
-    
-    int ret = insight9_receive_set_camera_fps(1, new_fps);
-    printf("insight9_receive_set_camera_fps returned: %d\n", ret);
-    
-    if (insight9_receive_restart_camera(1) == 0) {
-        printf("Gray camera restarted successfully at %d FPS\n", new_fps);
-    } else {
-        printf("Failed to restart gray camera!\n");
-    }
-}
-
 void* reconnect_worker(void* arg) {
     while (keep_running) {
         sleep(10);

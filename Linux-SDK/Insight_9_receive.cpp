@@ -507,7 +507,7 @@ static int init_capture(struct cam_ctx *ctx) {
         target_framerate = g_ctx.config.rgb_config.fps;
     } else if (ctx->format == SUB_FORMAT) {
         target_framerate = g_ctx.config.gray_config.fps;
-    } else if (ctx->format == SUB_FORMAT) {
+    } else if (ctx->format == DEPTH_FORMAT) {
         target_framerate = g_ctx.config.depth_config.fps;
     }
     set_framerate(ctx->fd, target_framerate);
@@ -1220,6 +1220,9 @@ int insight9_receive_start(void) {
     g_ctx.running = true;
 
     for (int i = 0; i < CAM_NUM; i++) {
+        g_ctx.cam_running[i] = true;
+        g_ctx.first_frame_received[i] = false;
+        clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
         pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
     }
     for (int i = 0; i < HID_NUM; i++) {

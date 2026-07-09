@@ -242,13 +242,6 @@ int main() {
         printf("Failed to get active camera\n");
     }
 
-    int fps = 0;
-    if (insight9_receive_get_current_fps(&fps) == 0) {
-        printf("Current FPS for gray camera: %d\n", fps);
-    } else {
-        printf("Failed to get current FPS for gray camera\n");
-    }
-
     params.cam_id = 0;
     params.brightness = 80.0f;
     params.contrast = 1.2f;
@@ -288,7 +281,7 @@ int main() {
         LONGLONG now = GetTickCount64();
         LONGLONG last = last_image_time;
         if (last != 0 && (now - last) > 5000) {
-            insight9_receive_all_stop();
+            insight9_receive_stop();
             insight9_receive_cleanup();
 
             insight9_config_t config_reinit;
@@ -322,7 +315,7 @@ int main() {
         }
     }
 
-    insight9_receive_all_stop();
+    insight9_receive_stop();
     insight9_receive_cleanup();
     DeleteCriticalSection(&g_stats_lock);
     printf("Program exited.\n");

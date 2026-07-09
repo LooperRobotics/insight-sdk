@@ -21,7 +21,7 @@
 #include <atomic>
 
 // ==================== Target Device VID/PID ====================
-#define VENDOR_ID  0x3652
+#define VENDOR_ID  0x1d6b
 #define PRODUCT_ID 0x0104
 
 // ==================== Camera Configuration ====================
@@ -1414,23 +1414,6 @@ void insight9_receive_cleanup(void) {
     printf("[SDK] cleaned up\n");
 }
 
-int insight9_receive_set_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized) return -1;
-    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    if (fps <= 0) return -1;
-    
-    if (cam_id == 0) {
-        g_ctx.config.rgb_config.fps = fps;
-    } else if (cam_id == 1) {
-        g_ctx.config.gray_config.fps = fps;
-    } else {
-        g_ctx.config.depth_config.fps = fps;
-    }
-    
-    printf("[SDK] Set camera %d FPS to %d\n", cam_id, fps);
-    return 0;
-}
-
 void insight9_receive_register_image_callback(image_callback cb, void *userdata) {
     g_ctx.img_cb = cb;
     g_ctx.img_userdata = userdata;
@@ -1508,20 +1491,6 @@ void insight9_receive_print_camera_params(const camera_params *params) {
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(viewer::camera_params));
     viewer::printParams(xu_params);
-}
-
-int insight9_receive_get_current_fps(int* fps) {
-    if (!fps) return -1;
-    if (ensure_xu_available() != 0) return -1;
-    uint8_t val;
-    if (!g_ctx.xu_control->readCurrentFps(val)) return -1;
-    const int validFps[] = {0, 20, 30, 40, 50};
-    if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
-        *fps = validFps[val];
-    } else {
-        *fps = 0;
-    }
-    return 0;
 }
 
 const char* insight9_receive_get_hardware_type(void) {

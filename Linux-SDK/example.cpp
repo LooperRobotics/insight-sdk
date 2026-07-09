@@ -343,13 +343,6 @@ int main() {
     }
 
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
-
-    int fps = 0;
-    if (insight9_receive_get_current_fps(&fps) == 0) {
-        printf("Current FPS for gray camera: %d\n", fps);
-    } else {
-        printf("Failed to get current FPS for gray camera\n");
-    }
     
     pthread_t reconnect_thread;
     pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);

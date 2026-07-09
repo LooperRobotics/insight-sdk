@@ -172,14 +172,6 @@ void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
 
 /**
- * @brief Set the frame rate for a specific camera (stored in config, requires restart).
- * @param cam_id Camera ID.
- * @param fps Desired frame rate.
- * @return 0 on success, -1 on failure.
- */
-int insight9_receive_set_camera_fps(int cam_id, int fps);
-
-/**
  * @brief Set the currently active camera.
  * @param cam_id Camera ID (0: RGB, 1: stereo grayscale).
  * @return 0 on success, -1 on failure.
@@ -236,13 +228,6 @@ int insight9_receive_reset_camera_params(int cam_id);
  * @param params Pointer to camera_params
  */
 void insight9_receive_print_camera_params(const camera_params *params);
-
-/**
- * @brief Get the current frame rate.
- * @param fps Pointer to store the current frame rate.
- * @return 0 on success, -1 on failure.
- */
-int insight9_receive_get_current_fps(int* fps);
 
 /**
  * @brief Get the hardware type/model as a string.

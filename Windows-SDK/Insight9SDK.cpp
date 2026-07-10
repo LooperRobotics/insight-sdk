@@ -499,8 +499,6 @@ static void videoThreadFunc(int camId) {
                             customAllocated = true;
                             foundApp1 = true;
                             
-                            printf("[SDK] Camera %d: Removed APP1 segment, %zu -> %zu, ts=%llu\n",
-                                   camId, size, callbackSize, (unsigned long long)ts);
                             break;
                         }
                     }

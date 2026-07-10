@@ -342,6 +342,23 @@ int main() {
         printf("Failed to set camera parameters (invalid range or XU not available)\n");
     }
 
+    // Example: Read intrinsics/extrinsics of the three cameras
+    {
+        static const int calib_cams[] = {
+            INSIGHT9_CALIB_CAM_LEFT, INSIGHT9_CALIB_CAM_RIGHT, INSIGHT9_CALIB_CAM_RGB
+        };
+        static const char *calib_names[] = {"left", "right", "rgb"};
+        camera_calib calib;
+        for (int i = 0; i < 3; i++) {
+            if (insight9_receive_get_camera_calib(calib_cams[i], &calib) == 0) {
+                printf("Calibration for %s camera:\n", calib_names[i]);
+                insight9_receive_print_camera_calib(&calib);
+            } else {
+                printf("Failed to get calibration for %s camera\n", calib_names[i]);
+            }
+        }
+    }
+
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
 
     int fps = 0;

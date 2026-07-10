@@ -14,6 +14,7 @@ endif()
 
 # 查找依赖库
 find_package(Threads REQUIRED)
+find_package(OpenCV REQUIRED)
 
 # 添加编译选项
 add_compile_options(-Wall -Wextra -fPIC)
@@ -72,6 +73,11 @@ add_executable(example example.cpp)
 target_link_libraries(example PRIVATE
     insight9
     Threads::Threads
+    ${OpenCV_LIBS}
+)
+
+target_include_directories(example PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
 )
 
 # 设置 RPATH

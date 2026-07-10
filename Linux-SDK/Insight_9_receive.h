@@ -308,6 +308,38 @@ int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
 void insight9_receive_print_camera_calib(const camera_calib *calib);
 
 /**
+ * @brief Align a depth image (registered to the LEFT camera) onto the RGB image
+ *        plane, producing a depth map registered to (and the same size as) the
+ *        RGB image.
+ *
+ * The depth stream is the left grayscale camera's depth map, so each depth pixel
+ * is deprojected with the LEFT intrinsics into the left camera frame, transformed
+ * into the RGB frame, then reprojected with the RGB intrinsics. The RGB camera's
+ * extrinsic (parent=camera_camera_left, child=camera_camera_rgb) maps a point
+ * rgb->left, so its inverse is used for left->rgb. Both LEFT and RGB streams are
+ * rectified (p == k), so no lens distortion is applied. The result is a forward
+ * warp with z-buffering (nearest surface wins); RGB pixels with no corresponding
+ * depth sample remain 0 (invalid).
+ *
+ * @param depth       Input depth buffer (uint16, row-major), 1 unit = 1 mm.
+ * @param depth_w     Depth width  (valid rows only; exclude the metadata rows).
+ * @param depth_h     Depth height (valid rows only).
+ * @param left_calib  LEFT camera calibration (its intrinsics deproject depth).
+ * @param rgb_calib   RGB camera calibration (intrinsics + left->rgb extrinsic).
+ * @param aligned_out Output buffer (uint16, row-major), size rgb_w*rgb_h. The
+ *                    caller allocates it; the function clears it to 0 first.
+ * @param rgb_w       Output (RGB) width.  Should match rgb_calib->intrinsics.width.
+ * @param rgb_h       Output (RGB) height. Should match rgb_calib->intrinsics.height.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
+                                        int depth_w, int depth_h,
+                                        const camera_calib *left_calib,
+                                        const camera_calib *rgb_calib,
+                                        uint16_t *aligned_out,
+                                        int rgb_w, int rgb_h);
+
+/**
  * @brief Get the current frame rate.
  * @param fps Pointer to store the current frame rate.
  * @return 0 on success, -1 on failure.

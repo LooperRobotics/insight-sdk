@@ -227,6 +227,29 @@ Reset camera parameters to their default values (currently not fully implemented
 
 All set functions perform range validation on every parameter. If any value is out of the allowed range, the function returns -1 and no command is sent to the device.
 
+### 5.7 Camera Calibration (Intrinsics / Extrinsics) API
+c
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
+void insight9_receive_print_camera_calib(const camera_calib *calib);
+Read the factory calibration (intrinsics + extrinsics) of one camera in a single call.
+cam_idx: INSIGHT9_CALIB_CAM_LEFT (0, left grayscale), INSIGHT9_CALIB_CAM_RIGHT (1, right grayscale), INSIGHT9_CALIB_CAM_RGB (2, RGB).
+
+The camera_calib structure contains:
+- camera_intrinsics: aligned with ROS sensor_msgs/CameraInfo (frame_id, width/height, distortion_model, d[4], k[9], r[9], p[12], binning, ROI).
+- camera_extrinsics: one transform from the device /tf_static (parent/child frame ids, translation x/y/z in meters, quaternion x/y/z/w).
+
+The UVC gadget can only return 60 bytes per control request, so the 361-byte payload is transferred in 58-byte chunks (2-byte header: block index + total blocks, followed by 56 bytes of data). The SDK selects each block with SET_CUR and reassembles the payload transparently; the caller always receives the complete structure.
+
+Returns -1 if the device firmware does not expose the calibration selectors (0x14/0x15/0x16), the reported chunk length differs from 58, or the chunk headers are inconsistent (protocol mismatch).
+
+Example:
+```c
+camera_calib calib;
+if (insight9_receive_get_camera_calib(INSIGHT9_CALIB_CAM_LEFT, &calib) == 0) {
+    insight9_receive_print_camera_calib(&calib);
+}
+```
+
 ## 6. Usage Example
 ```c
 #include "Insight_9_receive.h"

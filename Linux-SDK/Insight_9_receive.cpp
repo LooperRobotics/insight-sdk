@@ -19,6 +19,8 @@
 #include <ctype.h>
 #include "UvcExtensionUnit.hpp"
 #include <atomic>
+#include <math.h>
+#include <vector>
 
 // ==================== Target Device VID/PID ====================
 #define VENDOR_ID  0x3652
@@ -1601,6 +1603,147 @@ void insight9_receive_print_camera_calib(const camera_calib *calib) {
     viewer::camera_calib xu_calib;
     memcpy(&xu_calib, calib, sizeof(xu_calib));
     viewer::printCalib(xu_calib);
+}
+
+// Rasterize one triangle into the aligned-depth output, interpolating the RGB-
+// frame depth across it with a nearest-surface z-buffer. Vertices are given as
+// projected RGB pixel coords (x,y, float) plus their RGB-frame depth z (mm).
+static inline void align_raster_triangle(uint16_t *out, int W, int H,
+                                         float x0, float y0, float z0,
+                                         float x1, float y1, float z1,
+                                         float x2, float y2, float z2) {
+    int minx = (int)floorf(fminf(x0, fminf(x1, x2)));
+    int maxx = (int)ceilf (fmaxf(x0, fmaxf(x1, x2)));
+    int miny = (int)floorf(fminf(y0, fminf(y1, y2)));
+    int maxy = (int)ceilf (fmaxf(y0, fmaxf(y1, y2)));
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > W - 1) maxx = W - 1;
+    if (maxy > H - 1) maxy = H - 1;
+    if (minx > maxx || miny > maxy) return;
+
+    float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (fabsf(area) < 1e-6f) return;          // degenerate
+    float inv_area = 1.0f / area;
+
+    for (int py = miny; py <= maxy; py++) {
+        for (int px = minx; px <= maxx; px++) {
+            float fx = px + 0.5f, fy = py + 0.5f;
+            // Barycentric weights via edge cross-products (same winding as area).
+            float w0 = (x1 - fx) * (y2 - fy) - (x2 - fx) * (y1 - fy);
+            float w1 = (x2 - fx) * (y0 - fy) - (x0 - fx) * (y2 - fy);
+            float w2 = (x0 - fx) * (y1 - fy) - (x1 - fx) * (y0 - fy);
+            bool inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) ||
+                          (w0 <= 0 && w1 <= 0 && w2 <= 0);
+            if (!inside) continue;
+
+            float z = (w0 * z0 + w1 * z1 + w2 * z2) * inv_area;
+            if (z <= 0.0f) continue;
+            uint16_t zq = (z > 65535.0f) ? 65535 : (uint16_t)(z + 0.5f);
+            uint16_t *dst = &out[(size_t)py * W + px];
+            if (*dst == 0 || zq < *dst) *dst = zq;
+        }
+    }
+}
+
+int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
+                                        int depth_w, int depth_h,
+                                        const camera_calib *left_calib,
+                                        const camera_calib *rgb_calib,
+                                        uint16_t *aligned_out,
+                                        int rgb_w, int rgb_h) {
+    if (!depth || !left_calib || !rgb_calib || !aligned_out ||
+        depth_w <= 0 || depth_h <= 0 || rgb_w <= 0 || rgb_h <= 0) {
+        return -1;
+    }
+
+    // Start with all-invalid (0) output.
+    memset(aligned_out, 0, (size_t)rgb_w * rgb_h * sizeof(uint16_t));
+
+    // Intrinsics (row-major k = [fx 0 cx; 0 fy cy; 0 0 1]). Streams are
+    // rectified (p == k), so no distortion is applied.
+    const double dfx = left_calib->intrinsics.k[0];
+    const double dfy = left_calib->intrinsics.k[4];
+    const double dcx = left_calib->intrinsics.k[2];
+    const double dcy = left_calib->intrinsics.k[5];
+    const double rfx = rgb_calib->intrinsics.k[0];
+    const double rfy = rgb_calib->intrinsics.k[4];
+    const double rcx = rgb_calib->intrinsics.k[2];
+    const double rcy = rgb_calib->intrinsics.k[5];
+    if (dfx == 0.0 || dfy == 0.0) return -1;
+
+    // RGB extrinsic: parent=camera_camera_left, child=camera_camera_rgb. In ROS
+    // convention (t, q) maps a point rgb->left: p_left = R*p_rgb + t. We need
+    // left->rgb, i.e. the inverse: p_rgb = R^T * (p_left - t).
+    const double *q = rgb_calib->extrinsics.rotation;     // x, y, z, w
+    const double *t = rgb_calib->extrinsics.translation;  // meters
+    const double qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+    const double R00 = 1 - 2*(qy*qy + qz*qz);
+    const double R01 = 2*(qx*qy - qz*qw);
+    const double R02 = 2*(qx*qz + qy*qw);
+    const double R10 = 2*(qx*qy + qz*qw);
+    const double R11 = 1 - 2*(qx*qx + qz*qz);
+    const double R12 = 2*(qy*qz - qx*qw);
+    const double R20 = 2*(qx*qz - qy*qw);
+    const double R21 = 2*(qy*qz + qx*qw);
+    const double R22 = 1 - 2*(qx*qx + qy*qy);
+    const double tx = t[0] * 1000.0, ty = t[1] * 1000.0, tz = t[2] * 1000.0;
+
+    // Pass 1: project every depth pixel to RGB pixel coords + RGB-frame depth.
+    // The depth grid is treated as a mesh; these are its vertices.
+    const size_t n = (size_t)depth_w * depth_h;
+    std::vector<float>   VX(n), VY(n), VZ(n);
+    std::vector<uint8_t> OK(n, 0);
+    for (int v = 0; v < depth_h; v++) {
+        const uint16_t *row = depth + (size_t)v * depth_w;
+        for (int u = 0; u < depth_w; u++) {
+            size_t i = (size_t)v * depth_w + u;
+            uint16_t d = row[u];
+            if (d == 0) continue;              // no measurement
+
+            // Deproject to the LEFT frame (mm), then left -> rgb: R^T*(p - t).
+            double z = (double)d;
+            double x = (u - dcx) * z / dfx;
+            double y = (v - dcy) * z / dfy;
+            double ax = x - tx, ay = y - ty, az = z - tz;
+            double xr = R00*ax + R10*ay + R20*az;
+            double yr = R01*ax + R11*ay + R21*az;
+            double zr = R02*ax + R12*ay + R22*az;
+            if (zr <= 0.0) continue;           // behind the RGB camera
+
+            VX[i] = (float)(rfx * xr / zr + rcx);
+            VY[i] = (float)(rfy * yr / zr + rcy);
+            VZ[i] = (float)zr;
+            OK[i] = 1;
+        }
+    }
+
+    // Pass 2: rasterize the mesh. Each 2x2 cell -> two triangles. Triangles that
+    // straddle a depth discontinuity (an object edge) are dropped to avoid
+    // "rubber sheet" stretching between foreground and background.
+    const float EDGE_REL = 0.05f;              // max 5% depth jump within a triangle
+    auto emit = [&](size_t a, size_t b, size_t c) {
+        if (!OK[a] || !OK[b] || !OK[c]) return;
+        float za = VZ[a], zb = VZ[b], zc = VZ[c];
+        float zmin = fminf(za, fminf(zb, zc));
+        float zmax = fmaxf(za, fmaxf(zb, zc));
+        if (zmin <= 0.0f || (zmax - zmin) > EDGE_REL * zmin) return;
+        align_raster_triangle(aligned_out, rgb_w, rgb_h,
+                              VX[a], VY[a], za,
+                              VX[b], VY[b], zb,
+                              VX[c], VY[c], zc);
+    };
+    for (int v = 0; v + 1 < depth_h; v++) {
+        for (int u = 0; u + 1 < depth_w; u++) {
+            size_t i00 = (size_t)v * depth_w + u;
+            size_t i10 = i00 + 1;
+            size_t i01 = i00 + depth_w;
+            size_t i11 = i01 + 1;
+            emit(i00, i10, i11);
+            emit(i00, i11, i01);
+        }
+    }
+    return 0;
 }
 
 int insight9_receive_get_current_fps(int* fps) {

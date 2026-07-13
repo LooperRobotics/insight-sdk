@@ -56,6 +56,20 @@ extern "C" {
 #define DEPTH_HEIGHT 642
 #define DEPTH_FORMAT PixelFormat::Z16
 
+// ==================== Reconnect Backoff / Retry Limits ====================
+// Rationale: repeatedly opening / S_FMT-ing a device that is in a bad state
+// (e.g. a composite UVC+NCM gadget that is warm-restarting) generates a USB
+// transaction storm that can wedge the whole xhci controller. We therefore
+// back off exponentially between reconnect attempts and cap the number of
+// consecutive failures so a dead device cannot keep hammering the bus forever.
+#define RECONNECT_BACKOFF_BASE_MS 1000   // first retry delay
+#define RECONNECT_BACKOFF_MAX_MS  30000  // delay ceiling (exponential, capped)
+// Max consecutive failed reconnect attempts before a thread stops actively
+// reconnecting and idles at the ceiling interval (set to 0 to retry forever).
+// After the limit is hit the thread no longer generates fast USB traffic, but
+// still wakes periodically so a recovered device can be picked back up.
+#define RECONNECT_MAX_ATTEMPTS    30
+
 static bool g_com_initialized_by_sdk = false;
 
 #ifndef NOMINMAX
@@ -1005,6 +1019,25 @@ void insight9_receive_print_camera_params(const camera_params *params) {
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(viewer::camera_params));
     viewer::printParams(xu_params);
+}
+
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib) {
+    if (!g_ctx.xu || !calib) return -1;
+    if (cam_idx < 0 || cam_idx >= viewer::kCalibCamCount) return -1;
+    
+    viewer::camera_calib xu_calib;
+    if (!g_ctx.xu->readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib)) {
+        return -1;
+    }
+    memcpy(calib, &xu_calib, sizeof(camera_calib));
+    return 0;
+}
+
+void insight9_receive_print_camera_calib(const camera_calib *calib) {
+    if (!calib) return;
+    viewer::camera_calib xu_calib;
+    memcpy(&xu_calib, calib, sizeof(viewer::camera_calib));
+    viewer::printCalib(xu_calib);
 }
 
 int insight9_receive_get_current_fps(int* fps) {

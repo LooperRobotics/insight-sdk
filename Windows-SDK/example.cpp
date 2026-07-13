@@ -288,7 +288,7 @@ int main() {
         LONGLONG now = GetTickCount64();
         LONGLONG last = last_image_time;
         if (last != 0 && (now - last) > 5000) {
-            insight9_receive_all_stop();
+            insight9_receive_stop();
             insight9_receive_cleanup();
 
             insight9_config_t config_reinit;
@@ -322,7 +322,7 @@ int main() {
         }
     }
 
-    insight9_receive_all_stop();
+    insight9_receive_stop();
     insight9_receive_cleanup();
     DeleteCriticalSection(&g_stats_lock);
     printf("Program exited.\n");

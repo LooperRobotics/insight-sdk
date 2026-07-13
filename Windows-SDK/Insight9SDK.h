@@ -76,6 +76,13 @@ typedef struct {
 } camera_calib;
 #pragma pack(pop)
 
+/* Camera index for insight9_receive_get_camera_calib(). */
+enum {
+    INSIGHT9_CALIB_CAM_LEFT  = 0,   /* Left grayscale  */
+    INSIGHT9_CALIB_CAM_RIGHT = 1,   /* Right grayscale */
+    INSIGHT9_CALIB_CAM_RGB   = 2,   /* RGB             */
+};
+
 enum class PixelFormat {
     Unknown,
     MJPEG,

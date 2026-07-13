@@ -24,6 +24,56 @@ typedef struct {
     uint8_t decimation;         // Decimation, 1~255
     uint8_t hardware_model;     // Hardware model, 0..3
 } camera_params;
+
+
+/**
+ * Camera intrinsics, fields aligned with ROS sensor_msgs/CameraInfo.
+ */
+typedef struct {
+    uint32_t sec;               // Calibration timestamp (seconds)
+    uint32_t nsec;              // Calibration timestamp (nanoseconds)
+
+    char frame_id[32];          // Camera frame id
+
+    uint32_t height;            // Calibration image height
+    uint32_t width;             // Calibration image width
+
+    char distortion_model[32];  // e.g. "plumb_bob", "equidistant"
+
+    float d[4];                 // Distortion coefficients
+    float k[9];                 // 3x3 intrinsic matrix, row-major
+    float r[9];                 // 3x3 rectification matrix, row-major
+    float p[12];                // 3x4 projection matrix, row-major
+
+    uint32_t binning_x;
+    uint32_t binning_y;
+
+    uint32_t roi_x_offset;
+    uint32_t roi_y_offset;
+    uint32_t roi_height;
+    uint32_t roi_width;
+
+    uint8_t roi_do_rectify;
+} camera_intrinsics;
+
+/**
+ * Camera extrinsics, one transform from the device /tf_static.
+ */
+typedef struct {
+    char parent_frame_id[32];   // Reference frame
+    char child_frame_id[32];    // This camera frame
+
+    double translation[3];      // x, y, z (m)
+    double rotation[4];         // Quaternion x, y, z, w
+} camera_extrinsics;
+
+/**
+ * Full calibration of one camera: intrinsics + extrinsics.
+ */
+typedef struct {
+    camera_intrinsics intrinsics;
+    camera_extrinsics extrinsics;
+} camera_calib;
 #pragma pack(pop)
 
 enum class PixelFormat {
@@ -173,6 +223,14 @@ void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
 
 /**
+ * @brief Set the frame rate for a specific camera (stored in config, requires restart).
+ * @param cam_id Camera ID.
+ * @param fps Desired frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_set_camera_fps(int cam_id, int fps);
+
+/**
  * @brief Set the currently active camera.
  * @param cam_id Camera ID (0: RGB, 1: stereo grayscale).
  * @return 0 on success, -1 on failure.
@@ -229,6 +287,20 @@ int insight9_receive_reset_camera_params(int cam_id);
  * @param params Pointer to camera_params
  */
 void insight9_receive_print_camera_params(const camera_params *params);
+
+/**
+ * @brief Read the intrinsics and extrinsics of the specified camera.
+ * @param cam_idx Camera index: INSIGHT9_CALIB_CAM_LEFT / RIGHT / RGB.
+ * @param calib   Output parameter that receives the calibration data.
+ * @return 0 on success, -1 on failure (e.g. firmware without calibration support).
+ */
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
+
+/**
+ * @brief Print camera calibration data to stdout.
+ * @param calib Pointer to camera_calib.
+ */
+void insight9_receive_print_camera_calib(const camera_calib *calib);
 
 /**
  * @brief Get the current frame rate.

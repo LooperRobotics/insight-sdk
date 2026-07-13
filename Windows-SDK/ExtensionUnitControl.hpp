@@ -91,6 +91,14 @@ inline constexpr uint8_t kActiveCameraSelector = 7;
 inline constexpr uint8_t kCameraCalibSelectorBase = 0x14;
 inline constexpr uint8_t kCurrentFpsSelector = 0x17;
 
+// The UVC gadget can only return 60 bytes per control request, so the
+// calibration payload is transferred in chunks:
+//   GET_CUR -> [0]=block index, [1]=total blocks, [2..57]=payload data
+//   SET_CUR with byte 0 = block index selects the block to read next.
+inline constexpr uint16_t kCalibChunkHdr = 2;
+inline constexpr uint16_t kCalibChunkData = 56;
+inline constexpr uint16_t kCalibChunkSize = kCalibChunkHdr + kCalibChunkData; // 58
+
 class ExtensionUnitControl {
 public:
     ExtensionUnitControl();
@@ -111,6 +119,8 @@ public:
     bool writeCameraParams(uint8_t camId, const camera_params& params) const;
     bool readCurrentFps(uint8_t& fpsIndex) const;
 
+    // Read intrinsics + extrinsics of one camera in a single GET_CUR.
+    // camIdx: kCalibCamLeft / kCalibCamRight / kCalibCamRgb.
     bool readCameraCalib(uint8_t camIdx, camera_calib& calib) const;
 
 private:
@@ -124,5 +134,6 @@ private:
 };
 
 void printParams(const camera_params& params);
+void printCalib(const camera_calib& calib);
 
 }  // namespace viewer

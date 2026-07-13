@@ -40,7 +40,7 @@ extern "C" {
 #include "ExtensionUnitControl.hpp"
 
 // ==================== Target Device VID/PID ====================
-#define VENDOR_ID  0x1d6b
+#define VENDOR_ID  0x3652
 #define PRODUCT_ID 0x0104
 
 // ==================== Camera Configuration ====================

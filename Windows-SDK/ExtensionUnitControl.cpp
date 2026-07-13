@@ -135,6 +135,61 @@ bool ExtensionUnitControl::writeCurrentCameraParams(const camera_params& params)
     return query(kCameraParamsSelector, KSPROPERTY_TYPE_SET, &copy, sizeof(copy));
 }
 
+// 在 printParams 函数之后添加：
+
+bool ExtensionUnitControl::readCameraCalib(uint8_t camIdx, camera_calib& calib) const {
+    if (!isOpen()) return false;
+    if (camIdx >= kCalibCamCount) {
+        fprintf(stderr, "[XU] invalid calib camera index %u (expected 0-%u)\n",
+                static_cast<unsigned>(camIdx), kCalibCamCount - 1);
+        return false;
+    }
+    const uint8_t selector = kCameraCalibSelectorBase + camIdx; // 0x14/0x15/0x16
+
+    constexpr size_t kTotal = sizeof(camera_calib);
+    constexpr uint8_t kBlocks =
+        static_cast<uint8_t>((kTotal + kCalibChunkData - 1) / kCalibChunkData);
+
+    uint8_t assembled[kTotal];
+    uint8_t chunk[kCalibChunkSize];
+    for (uint8_t blk = 0; blk < kBlocks; ++blk) {
+        memset(chunk, 0, sizeof(chunk));
+        chunk[0] = blk;
+        // SET_CUR to select the block
+        if (!query(selector, KSPROPERTY_TYPE_SET, chunk, sizeof(chunk))) {
+            fprintf(stderr, "[XU] SET_CUR calib block %u selector 0x%02x failed\n",
+                    static_cast<unsigned>(blk), selector);
+            return false;
+        }
+        // GET_CUR to read the block
+        if (!query(selector, KSPROPERTY_TYPE_GET, chunk, sizeof(chunk))) {
+            fprintf(stderr, "[XU] GET_CUR calib block %u selector 0x%02x failed\n",
+                    static_cast<unsigned>(blk), selector);
+            return false;
+        }
+        if (chunk[0] != blk) {
+            fprintf(stderr, "[XU] calib selector 0x%02x block out of sync: got %u, expected %u\n",
+                    selector, static_cast<unsigned>(chunk[0]), static_cast<unsigned>(blk));
+            return false;
+        }
+        if (chunk[1] != kBlocks) {
+            fprintf(stderr, "[XU] calib selector 0x%02x total blocks mismatch: device=%u, sdk=%u\n",
+                    selector, static_cast<unsigned>(chunk[1]), static_cast<unsigned>(kBlocks));
+            return false;
+        }
+        const size_t off = static_cast<size_t>(blk) * kCalibChunkData;
+        const size_t n = (kTotal - off < kCalibChunkData) ? (kTotal - off) : kCalibChunkData;
+        memcpy(assembled + off, chunk + kCalibChunkHdr, n);
+    }
+    memcpy(&calib, assembled, sizeof(calib));
+    // Ensure strings are terminated
+    calib.intrinsics.frame_id[sizeof(calib.intrinsics.frame_id) - 1] = '\0';
+    calib.intrinsics.distortion_model[sizeof(calib.intrinsics.distortion_model) - 1] = '\0';
+    calib.extrinsics.parent_frame_id[sizeof(calib.extrinsics.parent_frame_id) - 1] = '\0';
+    calib.extrinsics.child_frame_id[sizeof(calib.extrinsics.child_frame_id) - 1] = '\0';
+    return true;
+}
+
 bool ExtensionUnitControl::readCameraParams(uint8_t camId, camera_params& params) const {
     if (!setActiveCamera(camId)) {
         printf("[XU] Failed to set active camera to %u for reading params\n", static_cast<unsigned>(camId));
@@ -320,5 +375,25 @@ void printParams(const camera_params& params) {
                 static_cast<unsigned>(params.decimation),
                 static_cast<unsigned>(params.hardware_model));
 }
+
+void printCalib(const camera_calib& calib) {
+    const auto& in = calib.intrinsics;
+    const auto& ex = calib.extrinsics;
+    printf("[XU] intrinsics frame_id=%s %ux%u model=%s\n",
+           in.frame_id, in.width, in.height, in.distortion_model);
+    printf("[XU]   d=[%.6f %.6f %.6f %.6f]\n", in.d[0], in.d[1], in.d[2], in.d[3]);
+    printf("[XU]   k=[%.4f %.4f %.4f; %.4f %.4f %.4f; %.4f %.4f %.4f]\n",
+           in.k[0], in.k[1], in.k[2], in.k[3], in.k[4], in.k[5], in.k[6], in.k[7], in.k[8]);
+    printf("[XU]   r=[%.4f %.4f %.4f; %.4f %.4f %.4f; %.4f %.4f %.4f]\n",
+           in.r[0], in.r[1], in.r[2], in.r[3], in.r[4], in.r[5], in.r[6], in.r[7], in.r[8]);
+    printf("[XU]   p=[%.4f %.4f %.4f %.4f; %.4f %.4f %.4f %.4f; %.4f %.4f %.4f %.4f]\n",
+           in.p[0], in.p[1], in.p[2], in.p[3], in.p[4], in.p[5],
+           in.p[6], in.p[7], in.p[8], in.p[9], in.p[10], in.p[11]);
+    printf("[XU] extrinsics %s -> %s t=[%.6f %.6f %.6f] q(xyzw)=[%.6f %.6f %.6f %.6f]\n",
+           ex.parent_frame_id, ex.child_frame_id,
+           ex.translation[0], ex.translation[1], ex.translation[2],
+           ex.rotation[0], ex.rotation[1], ex.rotation[2], ex.rotation[3]);
+}
+
 
 }  // namespace viewer

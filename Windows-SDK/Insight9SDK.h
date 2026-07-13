@@ -24,6 +24,56 @@ typedef struct {
     uint8_t decimation;         // Decimation, 1~255
     uint8_t hardware_model;     // Hardware model, 0..3
 } camera_params;
+
+
+/**
+ * Camera intrinsics, fields aligned with ROS sensor_msgs/CameraInfo.
+ */
+typedef struct {
+    uint32_t sec;               // Calibration timestamp (seconds)
+    uint32_t nsec;              // Calibration timestamp (nanoseconds)
+
+    char frame_id[32];          // Camera frame id
+
+    uint32_t height;            // Calibration image height
+    uint32_t width;             // Calibration image width
+
+    char distortion_model[32];  // e.g. "plumb_bob", "equidistant"
+
+    float d[4];                 // Distortion coefficients
+    float k[9];                 // 3x3 intrinsic matrix, row-major
+    float r[9];                 // 3x3 rectification matrix, row-major
+    float p[12];                // 3x4 projection matrix, row-major
+
+    uint32_t binning_x;
+    uint32_t binning_y;
+
+    uint32_t roi_x_offset;
+    uint32_t roi_y_offset;
+    uint32_t roi_height;
+    uint32_t roi_width;
+
+    uint8_t roi_do_rectify;
+} camera_intrinsics;
+
+/**
+ * Camera extrinsics, one transform from the device /tf_static.
+ */
+typedef struct {
+    char parent_frame_id[32];   // Reference frame
+    char child_frame_id[32];    // This camera frame
+
+    double translation[3];      // x, y, z (m)
+    double rotation[4];         // Quaternion x, y, z, w
+} camera_extrinsics;
+
+/**
+ * Full calibration of one camera: intrinsics + extrinsics.
+ */
+typedef struct {
+    camera_intrinsics intrinsics;
+    camera_extrinsics extrinsics;
+} camera_calib;
 #pragma pack(pop)
 
 enum class PixelFormat {
@@ -237,6 +287,52 @@ int insight9_receive_reset_camera_params(int cam_id);
  * @param params Pointer to camera_params
  */
 void insight9_receive_print_camera_params(const camera_params *params);
+
+/**
+ * @brief Read the intrinsics and extrinsics of the specified camera.
+ * @param cam_idx Camera index: INSIGHT9_CALIB_CAM_LEFT / RIGHT / RGB.
+ * @param calib   Output parameter that receives the calibration data.
+ * @return 0 on success, -1 on failure (e.g. firmware without calibration support).
+ */
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
+
+/**
+ * @brief Print camera calibration data to stdout.
+ * @param calib Pointer to camera_calib.
+ */
+void insight9_receive_print_camera_calib(const camera_calib *calib);
+
+/**
+ * @brief Align a depth image (registered to the LEFT camera) onto the RGB image
+ *        plane, producing a depth map registered to (and the same size as) the
+ *        RGB image.
+ *
+ * The depth stream is the left grayscale camera's depth map, so each depth pixel
+ * is deprojected with the LEFT intrinsics into the left camera frame, transformed
+ * into the RGB frame, then reprojected with the RGB intrinsics. The RGB camera's
+ * extrinsic (parent=camera_camera_left, child=camera_camera_rgb) maps a point
+ * rgb->left, so its inverse is used for left->rgb. Both LEFT and RGB streams are
+ * rectified (p == k), so no lens distortion is applied. The result is a forward
+ * warp with z-buffering (nearest surface wins); RGB pixels with no corresponding
+ * depth sample remain 0 (invalid).
+ *
+ * @param depth       Input depth buffer (uint16, row-major), 1 unit = 1 mm.
+ * @param depth_w     Depth width  (valid rows only; exclude the metadata rows).
+ * @param depth_h     Depth height (valid rows only).
+ * @param left_calib  LEFT camera calibration (its intrinsics deproject depth).
+ * @param rgb_calib   RGB camera calibration (intrinsics + left->rgb extrinsic).
+ * @param aligned_out Output buffer (uint16, row-major), size rgb_w*rgb_h. The
+ *                    caller allocates it; the function clears it to 0 first.
+ * @param rgb_w       Output (RGB) width.  Should match rgb_calib->intrinsics.width.
+ * @param rgb_h       Output (RGB) height. Should match rgb_calib->intrinsics.height.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
+                                        int depth_w, int depth_h,
+                                        const camera_calib *left_calib,
+                                        const camera_calib *rgb_calib,
+                                        uint16_t *aligned_out,
+                                        int rgb_w, int rgb_h);
 
 /**
  * @brief Get the current frame rate.

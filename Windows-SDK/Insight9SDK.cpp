@@ -22,6 +22,9 @@
 #include <cmath>
 #include <vector>
 #include <cfloat>
+#include <cmath>
+#include <vector>
+#include <cfloat>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -40,7 +43,7 @@ extern "C" {
 #include "ExtensionUnitControl.hpp"
 
 // ==================== Target Device VID/PID ====================
-#define VENDOR_ID  0x1d6b
+#define VENDOR_ID  0x3652
 #define PRODUCT_ID 0x0104
 
 // ==================== Camera Configuration ====================
@@ -783,6 +786,10 @@ int insight9_receive_start() {
     return 0;
 }
 
+const char* insight9_receive_get_video_dev(int cam_id) {
+    return (cam_id >=0 && cam_id < CAM_NUM) ? g_ctx.videoPaths[cam_id].c_str() : nullptr;
+}
+
 int insight9_receive_start_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
@@ -939,9 +946,6 @@ void insight9_receive_cleanup() {
     fprintf(stderr, "[SDK] Cleanup complete\n");
 }
 
-const char* insight9_receive_get_video_dev(int cam_id) {
-    return (cam_id >=0 && cam_id < CAM_NUM) ? g_ctx.videoPaths[cam_id].c_str() : nullptr;
-}
 int insight9_receive_set_camera_fps(int cam_id, int fps) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM) return -1;
     
@@ -957,8 +961,7 @@ int insight9_receive_set_camera_fps(int cam_id, int fps) {
     }
     return 0;
 }
-const char* insight9_receive_get_metadata_dev(int) { return nullptr; }
-int insight9_receive_read_metadata_timestamp(int, uint64_t*) { return -1; }
+
 void insight9_receive_register_image_callback(image_callback cb, void *user) { g_ctx.imgCb = cb; g_ctx.imgUser = user; }
 void insight9_receive_register_imu_callback(imu_callback cb, void *user) { g_ctx.imuCb = cb; g_ctx.imuUser = user; }
 void insight9_receive_register_vio_callback(vio_callback cb, void *user) { g_ctx.vioCb = cb; g_ctx.vioUser = user; }
@@ -967,6 +970,7 @@ int insight9_receive_set_active_camera(int cam_id) {
     if (!g_ctx.xu) return -1;
     return g_ctx.xu->setActiveCamera((uint8_t)cam_id) ? 0 : -1;
 }
+
 int insight9_receive_get_active_camera(int *cam_id) {
     if (!g_ctx.xu || !cam_id) return -1;
     uint8_t val;
@@ -974,12 +978,14 @@ int insight9_receive_get_active_camera(int *cam_id) {
     *cam_id = val;
     return 0;
 }
+
 int insight9_receive_set_camera_params(const camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
     return g_ctx.xu->writeCurrentCameraParams(xuParams) ? 0 : -1;
 }
+
 int insight9_receive_get_camera_params(camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
@@ -987,12 +993,14 @@ int insight9_receive_get_camera_params(camera_params *params) {
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
+
 int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
     return g_ctx.xu->writeCameraParams((uint8_t)cam_id, xuParams) ? 0 : -1;
 }
+
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
@@ -1000,7 +1008,15 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
-int insight9_receive_reset_camera_params(int) { return -1; }
+
+
+int insight9_receive_reset_camera_params(int) { 
+   // Reading factory defaults from the device requires additional implementation. A simple approach is to read
+   // and save the current values during initialization, then write them back when a reset is needed.
+   fprintf(stderr, "[XU][ERR] reset_camera_params not implemented, use set_camera_params with saved defaults\n");
+   return -1;
+}
+
 void insight9_receive_print_camera_params(const camera_params *params) {
     if (!params) return;
     viewer::camera_params xu_params;

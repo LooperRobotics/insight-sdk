@@ -135,8 +135,6 @@ bool ExtensionUnitControl::writeCurrentCameraParams(const camera_params& params)
     return query(kCameraParamsSelector, KSPROPERTY_TYPE_SET, &copy, sizeof(copy));
 }
 
-// 在 printParams 函数之后添加：
-
 bool ExtensionUnitControl::readCameraCalib(uint8_t camIdx, camera_calib& calib) const {
     if (!isOpen()) return false;
     if (camIdx >= kCalibCamCount) {
@@ -394,6 +392,5 @@ void printCalib(const camera_calib& calib) {
            ex.translation[0], ex.translation[1], ex.translation[2],
            ex.rotation[0], ex.rotation[1], ex.rotation[2], ex.rotation[3]);
 }
-
 
 }  // namespace viewer

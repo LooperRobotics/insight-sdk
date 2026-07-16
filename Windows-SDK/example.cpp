@@ -214,9 +214,9 @@ void my_image_cb(int cam_id, uint8_t* data, size_t size,
         std::lock_guard<std::mutex> lk(g_raw_lock);
         raw_frame &rf = g_raw[cam_id];
         rf.data.assign(data, data + size);
-        rf.width = w;
-        rf.height = h;
-        rf.fmt = fmt;
+        rf.width = width;
+        rf.height = height;
+        rf.fmt = format;
         rf.has_new = true;
     }
     g_raw_cv.notify_all();

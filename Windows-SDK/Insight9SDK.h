@@ -74,56 +74,6 @@ typedef struct {
     camera_intrinsics intrinsics;
     camera_extrinsics extrinsics;
 } camera_calib;
-
-
-/**
- * Camera intrinsics, fields aligned with ROS sensor_msgs/CameraInfo.
- */
-typedef struct {
-    uint32_t sec;               // Calibration timestamp (seconds)
-    uint32_t nsec;              // Calibration timestamp (nanoseconds)
-
-    char frame_id[32];          // Camera frame id
-
-    uint32_t height;            // Calibration image height
-    uint32_t width;             // Calibration image width
-
-    char distortion_model[32];  // e.g. "plumb_bob", "equidistant"
-
-    float d[4];                 // Distortion coefficients
-    float k[9];                 // 3x3 intrinsic matrix, row-major
-    float r[9];                 // 3x3 rectification matrix, row-major
-    float p[12];                // 3x4 projection matrix, row-major
-
-    uint32_t binning_x;
-    uint32_t binning_y;
-
-    uint32_t roi_x_offset;
-    uint32_t roi_y_offset;
-    uint32_t roi_height;
-    uint32_t roi_width;
-
-    uint8_t roi_do_rectify;
-} camera_intrinsics;
-
-/**
- * Camera extrinsics, one transform from the device /tf_static.
- */
-typedef struct {
-    char parent_frame_id[32];   // Reference frame
-    char child_frame_id[32];    // This camera frame
-
-    double translation[3];      // x, y, z (m)
-    double rotation[4];         // Quaternion x, y, z, w
-} camera_extrinsics;
-
-/**
- * Full calibration of one camera: intrinsics + extrinsics.
- */
-typedef struct {
-    camera_intrinsics intrinsics;
-    camera_extrinsics extrinsics;
-} camera_calib;
 #pragma pack(pop)
 
 /* Camera index for insight9_receive_get_camera_calib(). */

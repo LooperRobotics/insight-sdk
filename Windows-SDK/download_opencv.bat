@@ -4,7 +4,7 @@ echo Downloading OpenCV for Windows...
 set OPENCV_VERSION=4.12.0
 set OPENCV_URL=https://github.com/opencv/opencv/releases/download/%OPENCV_VERSION%/opencv-%OPENCV_VERSION%-windows.exe
 set OPENCV_EXE=opencv-%OPENCV_VERSION%-windows.exe
-set OPENCV_DIR=third_party\opencv
+set OPENCV_DIR=third_party\
 
 if exist "%OPENCV_DIR%" (
     echo OpenCV already exists in project.

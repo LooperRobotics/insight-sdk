@@ -10,7 +10,6 @@
 
 #include "Insight9SDK.h"
 
-// 全局标志，用于响应 Ctrl+C
 static volatile BOOL keep_running = TRUE;
 static volatile LONGLONG last_image_time = 0;
 
@@ -22,7 +21,6 @@ BOOL WINAPI console_handler(DWORD dwCtrlType) {
     return FALSE;
 }
 
-// 统计结构体
 struct cam_stats {
     uint64_t cb_count;
     uint64_t last_ts;
@@ -58,8 +56,7 @@ static CRITICAL_SECTION g_stats_lock;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
 
-// 灰度摄像头的帧率切换状态
-static int gray_fps_state = 0;  // 0: 30fps, 1: 20fps
+static int gray_fps_state = 0;
 static const int GRAY_FPS_VALUES[] = {20,30};
 
 static double get_elapsed_seconds(LARGE_INTEGER start, LARGE_INTEGER end) {
@@ -100,8 +97,8 @@ static const char* image_format_to_string(unsigned int format) {
         case 0x47504A4D: return "MJPEG";  // 'MJPG'
         case 0x59455247: return "GREY";   // 'GREY'
         case 0x36315A:   return "Z16";    // 'Z16 '
-        case 0x32595559: return "YUYV";   // 'YUYV'  ← 修改这里，从 YUY2 改为 YUYV
-        case 0x49385956: return "Y8I";    // 'Y8I '  ← 添加 Y8I 支持
+        case 0x32595559: return "YUYV";   // 'YUYV'
+        case 0x49385956: return "Y8I";    // 'Y8I '
         default: return "UNKNOWN";
     }
 }
@@ -175,14 +172,12 @@ void print_device_capabilities() {
     printf("    Device Capabilities Information\n");
     printf("========================================\n");
 
-    // 方法1：直接获取指针访问所有数据
     const DeviceCapabilities_t* caps = insight9_receive_get_device_capabilities_ptr();
     if (!caps) {
         printf("Failed to get device capabilities (SDK not initialized?)\n");
         return;
     }
 
-    // 打印 RGB 能力
     printf("\n[RGB Camera - cam_id: 0]\n");
     printf("  Total capabilities: %zu\n", caps->rgb_capabilities.size());
     if (caps->rgb_default.valid) {
@@ -201,7 +196,6 @@ void print_device_capabilities() {
                (i == 0) ? " (default)" : "");
     }
 
-    // 打印 Gray 能力
     printf("\n[Gray Camera - cam_id: 1]\n");
     printf("  Total capabilities: %zu\n", caps->gray_capabilities.size());
     if (caps->gray_default.valid) {
@@ -220,7 +214,6 @@ void print_device_capabilities() {
                (i == 0) ? " (default)" : "");
     }
 
-    // 打印 Depth 能力
     printf("\n[Depth Camera - cam_id: 2]\n");
     printf("  Total capabilities: %zu\n", caps->depth_capabilities.size());
     if (caps->depth_default.valid) {
@@ -242,7 +235,6 @@ void print_device_capabilities() {
     printf("\n========================================\n");
 }
 
-// ==================== 新增：通过索引方式打印设备能力 ====================
 void print_device_capabilities_by_index() {
     printf("\n========================================\n");
     printf("    Device Capabilities (by index)\n");
@@ -252,7 +244,6 @@ void print_device_capabilities_by_index() {
     for (int cam_id = 0; cam_id < 3; ++cam_id) {
         printf("\n[%s Camera - cam_id: %d]\n", names[cam_id], cam_id);
         
-        // 获取能力数量
         int count = 0;
         if (insight9_receive_get_device_capability_count(cam_id, &count) != 0) {
             printf("  Failed to get capability count\n");
@@ -260,7 +251,6 @@ void print_device_capabilities_by_index() {
         }
         printf("  Total capabilities: %d\n", count);
         
-        // 获取默认能力
         DeviceCapability defaultCap;
         if (insight9_receive_get_device_default_capability(cam_id, &defaultCap) == 0) {
             printf("  Default: %dx%d@%d, format=%s\n", 
@@ -268,7 +258,6 @@ void print_device_capabilities_by_index() {
                    defaultCap.fps, pixel_format_to_string(defaultCap.format));
         }
         
-        // 遍历所有能力
         printf("  All supported formats:\n");
         for (int i = 0; i < count; ++i) {
             DeviceCapability cap;
@@ -283,7 +272,6 @@ void print_device_capabilities_by_index() {
     printf("\n========================================\n");
 }
 
-// ==================== 新增：选择最佳分辨率 ====================
 bool select_best_resolution(int cam_id, int target_width, int target_height, 
                             int target_fps, DeviceCapability* selected) {
     if (!selected) return false;
@@ -293,7 +281,6 @@ bool select_best_resolution(int cam_id, int target_width, int target_height,
         return false;
     }
     
-    // 寻找最匹配的分辨率
     int best_score = -1;
     DeviceCapability best_cap;
     best_cap.valid = false;
@@ -304,10 +291,9 @@ bool select_best_resolution(int cam_id, int target_width, int target_height,
             continue;
         }
         
-        // 计算匹配度得分（越小越好）
         int score = abs(cap.width - target_width) + 
                    abs(cap.height - target_height) + 
-                   abs(cap.fps - target_fps) * 2;  // fps 权重更高
+                   abs(cap.fps - target_fps) * 2;
         
         if (best_score == -1 || score < best_score) {
             best_score = score;
@@ -367,7 +353,6 @@ void my_vio_cb(float px, float py, float pz,
     LeaveCriticalSection(&g_stats_lock);
 }
 
-// 切换灰度摄像头帧率的函数
 void toggle_gray_camera_fps() {
     int new_fps = GRAY_FPS_VALUES[gray_fps_state];
     gray_fps_state = (gray_fps_state + 1) % 2;
@@ -376,11 +361,9 @@ void toggle_gray_camera_fps() {
     printf("Stopping composite camera (cam_id=1)...\n");
     printf("New FPS: %d\n", new_fps);
     
-    // 停止复合流摄像头（包含灰度和深度）
     insight9_receive_stop_camera(1);
     Sleep(5000);
     
-    // 设置新的帧率
     int ret = insight9_receive_set_camera_fps(1, new_fps);
     printf("insight9_receive_set_camera_fps returned: %d\n", ret);
     
@@ -396,7 +379,6 @@ void toggle_gray_camera_fps() {
 }
 
 int main() {
-    // 设置控制台 Ctrl+C 处理
     SetConsoleCtrlHandler(console_handler, TRUE);
     InitializeCriticalSection(&g_stats_lock);
 
@@ -409,13 +391,10 @@ int main() {
         return -1;
     }
     
-    // 方法1：直接打印所有能力
     print_device_capabilities();
     
-    // 方法2：通过索引方式打印
     print_device_capabilities_by_index();
     
-    // 方法3：选择最佳分辨率示例
     printf("\n========================================\n");
     printf("    Resolution Selection Demo\n");
     printf("========================================\n");
@@ -451,7 +430,6 @@ int main() {
         return -1;
     }
 
-    // // 获取当前活跃摄像头及其参数
     // if (insight9_receive_get_active_camera(&active_cam) == 0) {
     //     printf("Current active camera: %d\n", active_cam);
     //     if (insight9_receive_get_camera_params(&params) == 0) {
@@ -477,7 +455,6 @@ int main() {
     //     printf("Failed to get active camera\n");
     // }
 
-    // // 调整 RGB 摄像头参数
     // params.cam_id = 0;
     // params.brightness = 80.0f;
     // params.contrast = 1.2f;
@@ -525,9 +502,9 @@ int main() {
         }
     });
     while (keep_running) {
-        Sleep(1000);   // 每秒检查一次
+        Sleep(1000);
         LONGLONG now = GetTickCount64();
-        LONGLONG last = last_image_time;   // 直接读取（对齐，x64 下原子）
+        LONGLONG last = last_image_time;
         if (last != 0 && (now - last) > 5000) {
             insight9_receive_all_stop();
             insight9_receive_cleanup();
@@ -549,7 +526,6 @@ int main() {
             if (insight9_receive_init(&config_reinit) != 0) {
                 printf("[ReconnectWorker] SDK init failed\n");
             } else {
-                // 正确：传递两个参数
                 insight9_receive_register_image_callback(my_image_cb, NULL);
                 insight9_receive_register_imu_callback(my_imu_cb, NULL);
                 insight9_receive_register_vio_callback(my_vio_cb, NULL);

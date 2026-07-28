@@ -9,7 +9,6 @@
 
 #pragma comment(lib, "strmiids.lib")
 
-// 定义扩展单元GUID (与Linux端保持一致)
 #ifdef DEFINE_GUID
 #undef DEFINE_GUID
 #endif

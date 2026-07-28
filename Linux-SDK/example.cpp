@@ -293,7 +293,6 @@ int main() {
 
     int active_cam = -1;
     camera_params params = {0};
-    hid_init();
 
     if (insight9_receive_init_default() != 0) {
         fprintf(stderr, "SDK init failed\n");

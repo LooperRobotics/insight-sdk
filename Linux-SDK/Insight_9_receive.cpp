@@ -1458,11 +1458,8 @@ int insight9_receive_start(void) {
     for (int i = 0; i < CAM_NUM; i++) {
         pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
     }
-    for (int i = 0; i < HID_NUM; i++) {
-        if (g_ctx.hid_devs[i][0] != '\0') {
-            pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
-        }
-    }
+
+    hid_init();
 
     printf("[SDK] started\n");
     return 0;

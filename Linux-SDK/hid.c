@@ -12,6 +12,8 @@
 #include <poll.h>
 #include <assert.h>
 #include <ctype.h>
+#define GYRO_SCALE_FACTOR -0.000005883
+#define ACCEL_SCALE_FACTOR -0.002906901
 
 static void trim_newline(char *str) {
     size_t len = strlen(str);
@@ -83,6 +85,7 @@ struct __attribute__((packed)) imu_accel_report_t {
     int8_t   custom_data6;
     int8_t   custom_data7;
 };
+
 
 struct __attribute__((packed)) vio_hid_payload {
     uint64_t timestamp;
@@ -239,7 +242,7 @@ void *hid_thread(void *arg) {
     float last_gx = 0, last_gy = 0, last_gz = 0;
 
     printf("[HID%d] thread started, dev=%s\n", idx, g_ctx.hid_devs[idx]);
-
+    while (!g_ctx.running) {usleep(100 * 000);}
     while (g_ctx.running) {
         device = g_ctx.hid_devs[idx];
         if (fd < 0) {
@@ -298,9 +301,9 @@ void *hid_thread(void *arg) {
                     continue;
                 }
                 last_accel_ts = accel->timestamp;
-                last_ax = (float)accel->accel_x;
-                last_ay = (float)accel->accel_y;
-                last_az = (float)accel->accel_z;
+                last_ax = (float)accel->accel_x * ACCEL_SCALE_FACTOR;
+                last_ay = (float)accel->accel_y * ACCEL_SCALE_FACTOR;
+                last_az = (float)accel->accel_z * ACCEL_SCALE_FACTOR;
                 if (g_ctx.imu_cb) {
                     g_ctx.imu_cb(last_ax, last_ay, last_az,
                                  last_gx, last_gy, last_gz,
@@ -313,9 +316,9 @@ void *hid_thread(void *arg) {
                     continue;
                 }
                 last_gyro_ts = gyro->timestamp;
-                last_gx = (float)gyro->gyro_x;
-                last_gy = (float)gyro->gyro_y;
-                last_gz = (float)gyro->gyro_z;
+                last_gx = (float)gyro->gyro_x * GYRO_SCALE_FACTOR;
+                last_gy = (float)gyro->gyro_y * GYRO_SCALE_FACTOR;
+                last_gz = (float)gyro->gyro_z * GYRO_SCALE_FACTOR;
                 if (g_ctx.imu_cb) {
                     g_ctx.imu_cb(last_ax, last_ay, last_az,
                                  last_gx, last_gy, last_gz,
@@ -382,6 +385,13 @@ int hid_init(void)
         }
     }
     printf("[SDK] selected HID: IMU=%s VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
+
+    for (int i = 0; i < HID_NUM; i++) {
+        printf("[HID%d] starting thread for %s\n", i, g_ctx.hid_devs[i]);
+        if (g_ctx.hid_devs[i][0] != '\0') {
+            pthread_create(&g_ctx.hid_tids[i], NULL, hid_thread, (void*)(intptr_t)i);
+        }
+    }
 
     return 0;
 }

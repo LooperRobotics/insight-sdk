@@ -151,13 +151,13 @@ static const char *image_format_to_string(unsigned int format) {
 static const char* vio_status_to_string(VioStatus status) {
     switch (status) {
         case VioStatus::NOT_INITED:         return "NOT_INITED";
+        case VioStatus::RESTARTING:         return "RESTARTING";
+        case VioStatus::STOPPED:            return "STOPPED";
         case VioStatus::TRACKING:           return "TRACKING";
-        case VioStatus::TRACKING_LOST:      return "TRACKING_LOST";
-        case VioStatus::DATA_LOST:          return "DATA_LOST";
         case VioStatus::TRACKING_STATIC:    return "TRACKING_STATIC";
-        case VioStatus::RELOCALIZATION:     return "RELOCALIZATION";
-        case VioStatus::MOVING_ENVIRONMENT: return "MOVING_ENVIRONMENT";
-        default:                        return "UNKNOWN";
+        case VioStatus::TRACKINGLOST:       return "TRACKINGLOST";
+        case VioStatus::DATA_LOST:          return "DATA_LOST";
+        default:                            return "UNKNOWN";
     }
 }
 
@@ -373,6 +373,24 @@ static void process_raw_frame(int cam_id, const raw_frame &rf) {
         g_panel[PANEL_DEPTH] = depth_bgr;
         g_aligned_color = acolor;   // empty if calib/align unavailable
         g_aligned_mask = amask;
+    } else if (rf.fmt == V4L2_PIX_FMT_YUYV) {
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 2) return;
+        
+        cv::Mat bgr;
+        cv::Mat yuyv_mat(h, w, CV_8UC2, (void*)data);
+        cv::cvtColor(yuyv_mat, bgr, cv::COLOR_YUV2BGR_YUYV);
+        
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_RGB] = bgr;
+    } else if (rf.fmt == V4L2_PIX_FMT_NV12) {
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 3 / 2) return;
+        
+        cv::Mat bgr;
+        cv::Mat nv12_mat(h * 3 / 2, w, CV_8UC1, (void*)data);
+        cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
+        
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_RGB] = bgr;
     }
 }
 
@@ -414,7 +432,7 @@ void* reconnect_worker(void* arg) {
             config_reinit.rgb_config.pixel_format = V4L2_PIX_FMT_MJPEG;
             config_reinit.gray_config.width = 544;
             config_reinit.gray_config.height = 1281;
-            config_reinit.gray_config.fps = GRAY_FPS_VALUES[gray_fps_state];
+            config_reinit.gray_config.fps = 30;
             config_reinit.gray_config.pixel_format = V4L2_PIX_FMT_GREY;
             config_reinit.depth_config.width = 544;
             config_reinit.depth_config.height = 642;

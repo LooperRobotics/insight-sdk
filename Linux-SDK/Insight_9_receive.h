@@ -108,14 +108,14 @@ typedef struct {
 
 // VIO status enumeration, matching the device firmware
 enum class VioStatus : uint8_t {
-    NOT_INITED          = 0,
-    TRACKING            = 1,
-    TRACKING_LOST       = 2,
-    DATA_LOST           = 3,
-    TRACKING_STATIC     = 4,
-    RELOCALIZATION      = 5,
-    MOVING_ENVIRONMENT  = 6,
-    Unknown             = 0xFF
+    NOT_INITED      = 0,
+    RESTARTING      = 1,
+    STOPPED         = 2,
+    TRACKING        = 3,
+    TRACKING_STATIC = 4,
+    TRACKINGLOST    = 5,
+    DATA_LOST       = 6,
+    Unknown         = 0xFF
 };
 #ifdef __cplusplus
 extern "C" {

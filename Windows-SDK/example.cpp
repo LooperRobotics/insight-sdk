@@ -142,13 +142,13 @@ static const char* image_format_to_string(unsigned int format) {
 static const char* vio_status_to_string(VioStatus status) {
     switch (status) {
         case VioStatus::NOT_INITED:         return "NOT_INITED";
+        case VioStatus::RESTARTING:         return "RESTARTING";
+        case VioStatus::STOPPED:            return "STOPPED";
         case VioStatus::TRACKING:           return "TRACKING";
-        case VioStatus::TRACKING_LOST:      return "TRACKING_LOST";
-        case VioStatus::DATA_LOST:          return "DATA_LOST";
         case VioStatus::TRACKING_STATIC:    return "TRACKING_STATIC";
-        case VioStatus::RELOCALIZATION:     return "RELOCALIZATION";
-        case VioStatus::MOVING_ENVIRONMENT: return "MOVING_ENVIRONMENT";
-        default:                        return "UNKNOWN";
+        case VioStatus::TRACKINGLOST:       return "TRACKINGLOST";
+        case VioStatus::DATA_LOST:          return "DATA_LOST";
+        default:                            return "UNKNOWN";
     }
 }
 

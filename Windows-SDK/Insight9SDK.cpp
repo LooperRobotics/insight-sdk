@@ -715,12 +715,12 @@ int insight9_receive_init_default() {
     
     g_ctx.config.gray_config.width = SUB_WIDTH;
     g_ctx.config.gray_config.height = SUB_HEIGHT;
-    g_ctx.config.gray_config.fps = 20;
+    g_ctx.config.gray_config.fps = 30;
     g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
     
     g_ctx.config.depth_config.width = DEPTH_WIDTH;
     g_ctx.config.depth_config.height = DEPTH_HEIGHT;
-    g_ctx.config.depth_config.fps = 15;
+    g_ctx.config.depth_config.fps = 30;
     g_ctx.config.depth_config.pixel_format = DEPTH_FORMAT;
 
     avdevice_register_all();

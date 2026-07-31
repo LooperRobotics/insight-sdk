@@ -88,7 +88,9 @@ enum class PixelFormat {
     GREY,
     Z16,
     RGB8,
-    Y8I
+    Y8I,
+    YUYV,
+    NV12
 };
 
 typedef struct {
@@ -104,6 +106,17 @@ typedef struct {
     video_config_t depth_config;
 } insight9_config_t;
 
+// VIO status enumeration, matching the device firmware
+enum class VioStatus : uint8_t {
+    NOT_INITED          = 0,
+    TRACKING            = 1,
+    TRACKING_LOST       = 2,
+    DATA_LOST           = 3,
+    TRACKING_STATIC     = 4,
+    RELOCALIZATION      = 5,
+    MOVING_ENVIRONMENT  = 6,
+    Unknown             = 0xFF
+};
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -345,6 +358,13 @@ int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_get_current_fps(int* fps);
+
+/**
+ * @brief Get the VIO status.
+ * @param status Pointer to store the VIO status value.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_vio_status(int* status);
 
 /**
  * @brief Get the hardware type/model as a string. This requires reading the current camera parameters to determine the hardware_model field, which is then mapped to a string.

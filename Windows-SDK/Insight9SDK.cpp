@@ -1199,6 +1199,14 @@ int insight9_receive_get_current_fps(int* fps) {
     return 0;
 }
 
+int insight9_receive_get_vio_status(int* status) {
+    if (!g_ctx.xu || !status) return -1;
+    uint8_t val;
+    if (!g_ctx.xu->readVioStatus(val)) return -1;
+    *status = val;
+    return 0;
+}
+
 const char* insight9_receive_get_hardware_type() {
     static std::string result;
     camera_params params;

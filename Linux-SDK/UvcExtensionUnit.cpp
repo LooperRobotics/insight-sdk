@@ -196,6 +196,11 @@ bool UvcExtensionUnit::readCurrentFps(uint8_t& fpsIndex) const {
     return uvc_control_query(fd_, unitId_, kCurrentFpsSelector, UVC_GET_CUR, &fpsIndex, sizeof(fpsIndex)) == 0;
 }
 
+bool UvcExtensionUnit::readVioStatus(uint8_t& status) const {
+    if (!isOpen()) return false;
+    return uvc_control_query(fd_, unitId_, kVioManagerStatus, UVC_GET_CUR, &status, sizeof(status)) == 0;
+}
+
 void printParams(const camera_params& params) {
     std::printf(
         "[XU] cam=%u res=%u fps=%u exp_t=%.4f exp_g=%.4f ae=%u bright=%.4f contrast=%.4f "

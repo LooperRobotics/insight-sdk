@@ -66,8 +66,7 @@ static struct timespec g_hid_last_print;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
-static int gray_fps_state = 0;
-static const int GRAY_FPS_VALUES[] = {20, 30};
+static int vio_status_raw = -1;
 
 // ==================== Display / depth-to-RGB alignment ====================
 // Grid layout (single fixed window):
@@ -149,6 +148,19 @@ static const char *image_format_to_string(unsigned int format) {
     }
 }
 
+static const char* vio_status_to_string(VioStatus status) {
+    switch (status) {
+        case VioStatus::NOT_INITED:         return "NOT_INITED";
+        case VioStatus::TRACKING:           return "TRACKING";
+        case VioStatus::TRACKING_LOST:      return "TRACKING_LOST";
+        case VioStatus::DATA_LOST:          return "DATA_LOST";
+        case VioStatus::TRACKING_STATIC:    return "TRACKING_STATIC";
+        case VioStatus::RELOCALIZATION:     return "RELOCALIZATION";
+        case VioStatus::MOVING_ENVIRONMENT: return "MOVING_ENVIRONMENT";
+        default:                        return "UNKNOWN";
+    }
+}
+
 static void maybe_print_img_stats_locked(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -198,6 +210,13 @@ static void maybe_print_hid_stats_locked(void) {
            g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
            (unsigned long)g_vio_stats.last_ts);
     fflush(stdout);
+
+    if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
+        VioStatus vio_status = static_cast<VioStatus>(vio_status_raw);
+        printf("Current VIO status: %s (%d)\n", vio_status_to_string(vio_status), vio_status_raw);
+    } else {
+        printf("Failed to get VIO status\n");
+    }
 
     reset_hid_stats();
     g_hid_last_print = now;
@@ -444,6 +463,9 @@ int main() {
         return -1;
     }
 
+    printf("\n================ Extension Unit Control Test ================\n");
+    printf("\n---------------- camera params control ----------------\n");
+
     // Example: Get current active camera and its parameters
     if (insight9_receive_get_active_camera(&active_cam) == 0) {
         printf("Current active camera: %d\n", active_cam);
@@ -498,6 +520,15 @@ int main() {
     } else {
         printf("Failed to set camera parameters (invalid range or XU not available)\n");
     }
+    
+    printf("\n---------------- get looper info ----------------\n");
+    
+    int fps = 0;
+    if (insight9_receive_get_current_fps(&fps) == 0) {
+        printf("Current FPS for gray camera: %d\n", fps);
+    } else {
+        printf("Failed to get current FPS for gray camera\n");
+    }
 
     // Example: Read intrinsics/extrinsics of the three cameras
     {
@@ -527,17 +558,11 @@ int main() {
     }
 
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
-
-    int fps = 0;
-    if (insight9_receive_get_current_fps(&fps) == 0) {
-        printf("Current FPS for gray camera: %d\n", fps);
-    } else {
-        printf("Failed to get current FPS for gray camera\n");
-    }
     
     pthread_t reconnect_thread;
     pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);
 
+    printf("\n=================================================\n\n");
     printf("SDK running with all 3 cameras\n");
     printf("A fixed grid window will appear: L / R / raw-depth / RGB+aligned-depth.\n");
     printf("Press 'q' or ESC in the window, or Ctrl+C, to stop...\n");

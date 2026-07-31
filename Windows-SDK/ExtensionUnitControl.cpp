@@ -207,6 +207,10 @@ bool ExtensionUnitControl::writeCameraParams(uint8_t camId, const camera_params&
     return writeCurrentCameraParams(params);
 }
 
+bool ExtensionUnitControl::readVioStatus(uint8_t& val) const {
+    return query(kVioManagerStatus, KSPROPERTY_TYPE_GET, &val, sizeof(val));
+}
+
 bool ExtensionUnitControl::readCurrentFps(uint8_t& fpsIndex) const {
     return query(kCurrentFpsSelector, KSPROPERTY_TYPE_GET, &fpsIndex, sizeof(fpsIndex));
 }

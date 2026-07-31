@@ -59,6 +59,7 @@ static LARGE_INTEGER g_hid_last_print;
 static CRITICAL_SECTION g_stats_lock;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
+static int vio_status_raw = -1;
 
 // ==================== Display / depth-to-RGB alignment ====================
 // Grid layout (single fixed window):
@@ -138,6 +139,19 @@ static const char* image_format_to_string(unsigned int format) {
     }
 }
 
+static const char* vio_status_to_string(VioStatus status) {
+    switch (status) {
+        case VioStatus::NOT_INITED:         return "NOT_INITED";
+        case VioStatus::TRACKING:           return "TRACKING";
+        case VioStatus::TRACKING_LOST:      return "TRACKING_LOST";
+        case VioStatus::DATA_LOST:          return "DATA_LOST";
+        case VioStatus::TRACKING_STATIC:    return "TRACKING_STATIC";
+        case VioStatus::RELOCALIZATION:     return "RELOCALIZATION";
+        case VioStatus::MOVING_ENVIRONMENT: return "MOVING_ENVIRONMENT";
+        default:                        return "UNKNOWN";
+    }
+}
+
 static void maybe_print_img_stats_locked(void) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -180,6 +194,13 @@ static void maybe_print_hid_stats_locked(void) {
            g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
            (unsigned long long)g_vio_stats.last_ts);
     fflush(stdout);
+
+    if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
+        VioStatus vio_status = static_cast<VioStatus>(vio_status_raw);
+        printf("\nCurrent VIO status: %s (%d)\n\n", vio_status_to_string(vio_status), vio_status_raw);
+    } else {
+        printf("Failed to get VIO status\n");
+    }
 
     reset_hid_stats();
     g_hid_last_print = now;
@@ -373,8 +394,11 @@ int main() {
         return -1;
     }
 
+    printf("\n================ Extension Unit Control Test ================\n");
+    printf("\n---------------- camera params control ----------------\n");
+
     if (insight9_receive_get_active_camera(&active_cam) == 0) {
-        printf("Current active camera: %d\n", active_cam);
+        printf("\nCurrent active camera: %d\n", active_cam);
         if (insight9_receive_get_camera_params(&params) == 0) {
             printf("Camera parameters retrieved successfully\n");
             insight9_receive_print_camera_params(&params);
@@ -396,13 +420,6 @@ int main() {
         printf("Current active camera: %d\n", active_cam);
     } else {
         printf("Failed to get active camera\n");
-    }
-
-    int fps = 0;
-    if (insight9_receive_get_current_fps(&fps) == 0) {
-        printf("Current FPS for gray camera: %d\n", fps);
-    } else {
-        printf("Failed to get current FPS for gray camera\n");
     }
 
     params.cam_id = 0;
@@ -433,6 +450,15 @@ int main() {
         printf("Failed to set camera parameters (invalid range or XU not available)\n");
     }
 
+    printf("\n---------------- get looper info ----------------\n");
+
+    int fps = 0;
+    if (insight9_receive_get_current_fps(&fps) == 0) {
+        printf("\nCurrent FPS for gray camera: %d\n", fps);
+    } else {
+        printf("Failed to get current FPS for gray camera\n");
+    }
+
     // Example: Read intrinsics/extrinsics of the three cameras
     {
         static const int calib_cams[] = {
@@ -460,8 +486,6 @@ int main() {
         }
     }
 
-    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
-
     // Example: Read intrinsics/extrinsics of the three cameras
     {
         static const int calib_cams[] = {
@@ -479,9 +503,13 @@ int main() {
         }
     }
 
+    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
     InterlockedExchange64(&last_image_time, GetTickCount64());
+
+    printf("\n=================================================\n\n");
     printf("SDK started with all 3 cameras\n");
     printf("A fixed grid window will appear: L / R / raw-depth / RGB+aligned-depth.\n");
+    printf("Gray camera will toggle every 15 seconds\n");
     printf("Press 'q' or ESC in the window, or Ctrl+C, to stop...\n");
 
     // Fixed composite canvas layout.

@@ -90,6 +90,7 @@ inline constexpr uint8_t kCameraParamsSelector = 4;
 inline constexpr uint8_t kActiveCameraSelector = 7;
 inline constexpr uint8_t kCameraCalibSelectorBase = 0x14;
 inline constexpr uint8_t kCurrentFpsSelector = 0x17;
+inline constexpr uint8_t kVioManagerStatus = 0x18;
 
 // The UVC gadget can only return 60 bytes per control request, so the
 // calibration payload is transferred in chunks:
@@ -122,6 +123,7 @@ public:
     // Read intrinsics + extrinsics of one camera in a single GET_CUR.
     // camIdx: kCalibCamLeft / kCalibCamRight / kCalibCamRgb.
     bool readCameraCalib(uint8_t camIdx, camera_calib& calib) const;
+    bool readVioStatus(uint8_t& val) const;
 
 private:
     bool bindFilterByDevicePath(const std::string& devicePath);

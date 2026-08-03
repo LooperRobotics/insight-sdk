@@ -90,7 +90,8 @@ enum class PixelFormat {
     Z16,
     RGB8,
     Y8I,
-    YUYV
+    YUYV,
+    NV12
 };
 typedef struct {
     int width;
@@ -105,6 +106,16 @@ typedef struct {
     video_config_t depth_config;
 } insight9_config_t;
 
+enum class VioStatus : uint8_t {
+    NOT_INITED      = 0,
+    RESTARTING      = 1,
+    STOPPED         = 2,
+    TRACKING        = 3,
+    TRACKING_STATIC = 4,
+    TRACKINGLOST    = 5,
+    DATA_LOST       = 6,
+    Unknown         = 0xFF
+};
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -361,6 +372,13 @@ int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_get_current_fps(int* fps);
+
+/**
+ * @brief Get the VIO status.
+ * @param status Pointer to store the VIO status value.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_vio_status(int* status);
 
 /**
  * @brief Get the hardware type/model as a string.

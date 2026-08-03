@@ -720,7 +720,7 @@ int insight9_receive_init_default() {
     
     g_ctx.config.depth_config.width = DEPTH_WIDTH;
     g_ctx.config.depth_config.height = DEPTH_HEIGHT;
-    g_ctx.config.depth_config.fps = 15;
+    g_ctx.config.depth_config.fps = 30;
     g_ctx.config.depth_config.pixel_format = DEPTH_FORMAT;
 
     avdevice_register_all();
@@ -1196,6 +1196,14 @@ int insight9_receive_get_current_fps(int* fps) {
     } else {
         *fps = 0;
     }
+    return 0;
+}
+
+int insight9_receive_get_vio_status(int* status) {
+    if (!g_ctx.xu || !status) return -1;
+    uint8_t val;
+    if (!g_ctx.xu->readVioStatus(val)) return -1;
+    *status = val;
     return 0;
 }
 

@@ -84,8 +84,9 @@ inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
 inline constexpr uint8_t kXuUnitId = 4;
 inline constexpr uint8_t kCameraParamsSelector = 4;
 inline constexpr uint8_t kActiveCameraSelector = 7;
-inline constexpr uint8_t kCurrentFpsSelector = 0x17;
 inline constexpr uint8_t kCameraCalibSelectorBase = 0x14;
+inline constexpr uint8_t kCurrentFpsSelector = 0x17;
+inline constexpr uint8_t kVioManagerStatus = 0x18;
 
 // The UVC gadget can only return 60 bytes per control request, so the
 // calibration payload is transferred in chunks:
@@ -116,6 +117,7 @@ public:
     bool writeCameraParams(uint8_t camId, const camera_params& params) const;
     bool readCurrentFps(uint8_t& fpsIndex) const;
     bool readCameraCalib(uint8_t camIdx, camera_calib& calib) const;
+    bool readVioStatus(uint8_t& status) const;
 
 private:
     int fd_ = -1;

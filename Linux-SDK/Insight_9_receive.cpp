@@ -559,11 +559,11 @@ static int init_capture(struct cam_ctx *ctx) {
     
     int target_framerate = 30;
     int cam_id = ctx->cam_id;
-    if (ctx->format == MAIN_FORMAT) {
+    if (cam_id == 0) {
         target_framerate = g_ctx.config.rgb_config.fps;
-    } else if (ctx->format == SUB_FORMAT) {
+    } else if (cam_id == 1) {
         target_framerate = g_ctx.config.gray_config.fps;
-    } else if (ctx->format == DEPTH_FORMAT) {
+    } else if (cam_id == 2) {
         target_framerate = g_ctx.config.depth_config.fps;
     }
     set_framerate(ctx->fd, target_framerate);
@@ -877,6 +877,23 @@ static void *capture_thread(void *arg) {
                        (uint8_t*)ctx->buffers[buf.index].start + ctx->width * (ctx->height - 2) * 2,
                        sizeof(timestamp));
             }
+        } else if (ctx->format == V4L2_PIX_FMT_YUYV) {
+            size_t expected_size = ctx->width * ctx->height * 2;
+            if (buf.bytesused >= expected_size + 8) {
+                memcpy(&timestamp,
+                       (uint8_t*)ctx->buffers[buf.index].start + expected_size,
+                       sizeof(timestamp));
+            }
+            if (timestamp == 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                timestamp = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+            }
+        } 
+        else if (ctx->format == V4L2_PIX_FMT_NV12) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            timestamp = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         }
 
         // Filter 2: drop buffers without a usable embedded timestamp
@@ -1757,6 +1774,15 @@ int insight9_receive_get_current_fps(int* fps) {
     } else {
         *fps = 0;
     }
+    return 0;
+}
+
+int insight9_receive_get_vio_status(int* status) {
+    if (!status) return -1;
+    if (ensure_xu_available() != 0) return -1;
+    uint8_t val;
+    if (!g_ctx.xu_control->readVioStatus(val)) return -1;
+    *status = val;
     return 0;
 }
 

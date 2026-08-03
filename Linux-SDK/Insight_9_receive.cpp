@@ -1282,14 +1282,28 @@ int insight9_receive_init_default(void) {
 
     if (g_ctx.video_devs[0][0] != '\0') {
         g_ctx.xu_control = new viewer::UvcExtensionUnit();
-        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+        if (g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+            g_ctx.xu_ready = true;
+            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
+            
+            uint8_t fpsIndex = 0;
+            if (g_ctx.xu_control->readCurrentFps(fpsIndex)) {
+                const int validFps[] = {0, 20, 30, 40, 50};
+                if (fpsIndex >= 0 && fpsIndex < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+                    int currentFps = validFps[fpsIndex];
+                    if (currentFps > 0) {
+                        g_ctx.config.gray_config.fps = currentFps;
+                        printf("[SDK] Read current Gray FPS from device: %d (index: %d)\n", currentFps, fpsIndex);
+                    }
+                }
+            } else {
+                printf("[SDK] Failed to read current FPS, using default\n");
+            }
+        } else {
             fprintf(stderr, "[XU][WARN] cannot open extension unit, camera params will be unavailable\n");
             delete g_ctx.xu_control;
             g_ctx.xu_control = nullptr;
             g_ctx.xu_ready = false;
-        } else {
-            g_ctx.xu_ready = true;
-            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
         }
     } else {
         g_ctx.xu_control = nullptr;

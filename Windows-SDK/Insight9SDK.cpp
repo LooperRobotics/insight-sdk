@@ -715,7 +715,7 @@ int insight9_receive_init_default() {
     
     g_ctx.config.gray_config.width = SUB_WIDTH;
     g_ctx.config.gray_config.height = SUB_HEIGHT;
-    g_ctx.config.gray_config.fps = 20;
+    g_ctx.config.gray_config.fps = 30;
     g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
     
     g_ctx.config.depth_config.width = DEPTH_WIDTH;
@@ -763,9 +763,26 @@ int insight9_receive_init_default() {
     }
 
     g_ctx.xu = new viewer::ExtensionUnitControl();
-    if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open XU control\n");
-        delete g_ctx.xu; g_ctx.xu = nullptr;
+    if (g_ctx.xu->open(g_ctx.videoPaths[0])) {
+        printf("[SDK] XU control opened, reading current FPS...\n");
+        
+        uint8_t fpsIndex = 0;
+        if (g_ctx.xu->readCurrentFps(fpsIndex)) {
+            const int validFps[] = {0, 20, 30, 40, 50};
+            if (fpsIndex >= 0 && fpsIndex < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+                int currentFps = validFps[fpsIndex];
+                if (currentFps > 0) {
+                    g_ctx.config.gray_config.fps = currentFps;
+                    printf("[SDK] Read current Gray FPS from device: %d (index: %d)\n", currentFps, fpsIndex);
+                }
+            }
+        } else {
+            printf("[SDK] Failed to read current FPS, using default\n");
+        }
+    } else {
+        fprintf(stderr, "[SDK] Failed to open XU control, using default FPS\n");
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
     }
 
     g_ctx.initialized = true;

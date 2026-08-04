@@ -268,10 +268,16 @@ public:
         return true;
     }
     void close() {
-        if (fmtCtx_) avformat_close_input(&fmtCtx_);
-        if (packet_) av_packet_free(&packet_);
-        fmtCtx_ = nullptr;
-        packet_ = nullptr;
+        if (fmtCtx_) {
+            avformat_close_input(&fmtCtx_);
+            fmtCtx_ = nullptr;
+        }
+
+        if (packet_) {
+            av_packet_free(&packet_);
+            packet_ = nullptr;
+        }
+
         running_ = false;
     }
     bool start() {
@@ -448,7 +454,7 @@ private:
 
 int FFmpegVideoSource::interruptCallback(void* ctx) {
     FFmpegVideoSource* self = static_cast<FFmpegVideoSource*>(ctx);
-    return (self->runningPtr_ && !(*self->runningPtr_)) ? 1 : 0;
+    return self->running_ ? 0 : 1;
 }
 
 static void videoThreadFunc(int camId) {
@@ -715,7 +721,7 @@ int insight9_receive_init_default() {
     
     g_ctx.config.gray_config.width = SUB_WIDTH;
     g_ctx.config.gray_config.height = SUB_HEIGHT;
-    g_ctx.config.gray_config.fps = 20;
+    g_ctx.config.gray_config.fps = 30;
     g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
     
     g_ctx.config.depth_config.width = DEPTH_WIDTH;
@@ -763,9 +769,26 @@ int insight9_receive_init_default() {
     }
 
     g_ctx.xu = new viewer::ExtensionUnitControl();
-    if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open XU control\n");
-        delete g_ctx.xu; g_ctx.xu = nullptr;
+    if (g_ctx.xu->open(g_ctx.videoPaths[0])) {
+        printf("[SDK] XU control opened, reading current FPS...\n");
+        
+        uint8_t fpsIndex = 0;
+        if (g_ctx.xu->readCurrentFps(fpsIndex)) {
+            const int validFps[] = {0, 20, 30, 40, 50};
+            if (fpsIndex >= 0 && fpsIndex < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+                int currentFps = validFps[fpsIndex];
+                if (currentFps > 0) {
+                    g_ctx.config.gray_config.fps = currentFps;
+                    printf("[SDK] Read current Gray FPS from device: %d (index: %d)\n", currentFps, fpsIndex);
+                }
+            }
+        } else {
+            printf("[SDK] Failed to read current FPS, using default\n");
+        }
+    } else {
+        fprintf(stderr, "[SDK] Failed to open XU control, using default FPS\n");
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
     }
 
     g_ctx.initialized = true;
@@ -883,6 +906,28 @@ int insight9_receive_restart_camera(int cam_id) {
     }
     
     return insight9_receive_start_camera(cam_id);
+}
+
+int insight9_receive_switch_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM || fps <= 0) return -1;
+
+    printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
+
+    insight9_receive_stop_camera(cam_id);
+    Sleep(3000);
+
+    if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
+        fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
+        return -1;
+    }
+
+    int ret = insight9_receive_restart_camera(cam_id);
+    if (ret == 0) {
+        printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, fps);
+    } else {
+        fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
+    }
+    return ret;
 }
 
 int insight9_receive_is_camera_running(int cam_id) {

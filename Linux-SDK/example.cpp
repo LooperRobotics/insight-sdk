@@ -16,6 +16,7 @@
 #include <vector>
 
 static volatile int keep_running = 1;
+static pthread_mutex_t g_sdk_op_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void sigint_handler(int sig) {
     printf("\n[Signal] Received SIGINT, stopping...\n");
@@ -67,6 +68,9 @@ static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
 static int vio_status_raw = -1;
+
+static int gray_fps_state = 0;
+static const int GRAY_FPS_VALUES[] = {20, 30, 40, 50, 60};
 
 // ==================== Display / depth-to-RGB alignment ====================
 // Grid layout (single fixed window):
@@ -417,14 +421,20 @@ void* reconnect_worker(void* arg) {
         sleep(10);
         if (!keep_running) break;
         
+        pthread_mutex_lock(&g_sdk_op_lock);
         if (insight9_receive_is_camera_running(0) == 0 &&
             insight9_receive_is_camera_running(1) == 0 &&
             insight9_receive_is_camera_running(2) == 0) {
             printf("[ReconnectWorker] All cameras stopped, attempting reconnect...\n");
-            
+            int fps = 0;
+            if (insight9_receive_get_current_fps(&fps) == 0) {
+                printf("Current FPS for gray camera: %d\n", fps);
+            } else {
+                printf("Failed to get current FPS for gray camera\n");
+            }
             insight9_receive_stop();
             insight9_receive_cleanup();
-            
+           
             insight9_config_t config_reinit;
             config_reinit.rgb_config.width = 1088;
             config_reinit.rgb_config.height = 1920;
@@ -432,7 +442,7 @@ void* reconnect_worker(void* arg) {
             config_reinit.rgb_config.pixel_format = V4L2_PIX_FMT_MJPEG;
             config_reinit.gray_config.width = 544;
             config_reinit.gray_config.height = 1281;
-            config_reinit.gray_config.fps = 30;
+            config_reinit.gray_config.fps = fps;
             config_reinit.gray_config.pixel_format = V4L2_PIX_FMT_GREY;
             config_reinit.depth_config.width = 544;
             config_reinit.depth_config.height = 642;
@@ -454,9 +464,36 @@ void* reconnect_worker(void* arg) {
                 }
             }
         }
+        pthread_mutex_unlock(&g_sdk_op_lock);
     }
     insight9_receive_stop();
     insight9_receive_cleanup();
+    return NULL;
+}
+
+void toggle_gray_camera_fps() {
+    int new_fps = GRAY_FPS_VALUES[gray_fps_state];
+    printf("new_fps = %d | gray_fps_state = %d\n", new_fps, gray_fps_state);
+    gray_fps_state = (gray_fps_state + 1) % 5;
+
+    printf("\n========= Switching Gray Camera FPS =========\n");
+    printf("New FPS: %d\n", new_fps);
+
+    pthread_mutex_lock(&g_sdk_op_lock);
+    if (insight9_receive_switch_camera_fps(1, new_fps) == 0) {
+        printf("Gray camera switched to %d FPS\n", new_fps);
+    } else {
+        printf("Failed to switch gray camera FPS!\n");
+    }
+    pthread_mutex_unlock(&g_sdk_op_lock);
+}
+
+void* fps_switch_worker(void* arg) {
+    while (keep_running) {
+        sleep(10);
+        if (!keep_running) break;
+        toggle_gray_camera_fps();
+    }
     return NULL;
 }
 
@@ -579,6 +616,8 @@ int main() {
     
     pthread_t reconnect_thread;
     pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);
+    pthread_t fps_switch_thread;
+    pthread_create(&fps_switch_thread, NULL, fps_switch_worker, NULL);
 
     printf("\n=================================================\n\n");
     printf("SDK running with all 3 cameras\n");
@@ -658,6 +697,7 @@ int main() {
     cv::destroyAllWindows();
 
     pthread_join(reconnect_thread, NULL);
+    pthread_join(fps_switch_thread, NULL);
 
     insight9_receive_stop();
     insight9_receive_cleanup();

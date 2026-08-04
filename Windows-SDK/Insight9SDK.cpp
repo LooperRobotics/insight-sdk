@@ -268,10 +268,16 @@ public:
         return true;
     }
     void close() {
-        if (fmtCtx_) avformat_close_input(&fmtCtx_);
-        if (packet_) av_packet_free(&packet_);
-        fmtCtx_ = nullptr;
-        packet_ = nullptr;
+        if (fmtCtx_) {
+            avformat_close_input(&fmtCtx_);
+            fmtCtx_ = nullptr;
+        }
+
+        if (packet_) {
+            av_packet_free(&packet_);
+            packet_ = nullptr;
+        }
+
         running_ = false;
     }
     bool start() {
@@ -448,7 +454,7 @@ private:
 
 int FFmpegVideoSource::interruptCallback(void* ctx) {
     FFmpegVideoSource* self = static_cast<FFmpegVideoSource*>(ctx);
-    return (self->runningPtr_ && !(*self->runningPtr_)) ? 1 : 0;
+    return self->running_ ? 0 : 1;
 }
 
 static void videoThreadFunc(int camId) {
@@ -900,6 +906,28 @@ int insight9_receive_restart_camera(int cam_id) {
     }
     
     return insight9_receive_start_camera(cam_id);
+}
+
+int insight9_receive_switch_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM || fps <= 0) return -1;
+
+    printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
+
+    insight9_receive_stop_camera(cam_id);
+    Sleep(3000);
+
+    if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
+        fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
+        return -1;
+    }
+
+    int ret = insight9_receive_restart_camera(cam_id);
+    if (ret == 0) {
+        printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, fps);
+    } else {
+        fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
+    }
+    return ret;
 }
 
 int insight9_receive_is_camera_running(int cam_id) {

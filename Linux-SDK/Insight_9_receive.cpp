@@ -73,6 +73,10 @@ struct cam_ctx {
     int height;
     unsigned int format;
     uint64_t last_timestamp;        // Last embedded timestamp delivered, used to drop duplicates
+    // Guards fd/buffers/buffer_count against concurrent open/close between
+    // capture_thread()'s own self-heal path and the externally-driven
+    // stop_camera()/start_camera()/restart_camera() calls.
+    pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
 };
 
 // SDK global context
@@ -118,11 +122,13 @@ static int reconnect_backoff_ms(int attempt) {
     return (int)delay;
 }
 
-// Sleep up to total_ms, but wake every 200ms to re-check g_ctx.running so a
-// pending stop() / pthread_join() is not blocked by a long backoff delay.
-static void interruptible_sleep_ms(int total_ms) {
+// Sleep up to total_ms, but wake every 200ms to re-check g_ctx.running (and,
+// if given, a per-camera cam_running flag) so a pending stop_camera() /
+// pthread_join() is not blocked by a long backoff delay.
+static void interruptible_sleep_ms(int total_ms, std::atomic<bool> *extra_stop = nullptr) {
     int slept = 0;
     while (slept < total_ms && g_ctx.running) {
+        if (extra_stop && !extra_stop->load()) break;
         int chunk = (total_ms - slept) > 200 ? 200 : (total_ms - slept);
         usleep(chunk * 1000);
         slept += chunk;
@@ -134,7 +140,10 @@ static void interruptible_sleep_ms(int total_ms) {
 // RECONNECT_MAX_ATTEMPTS, then logs once to announce slow-retry mode and stays
 // silent afterwards so a permanently-dead device cannot spam the log or hammer
 // the USB bus. Reset *fails to 0 once the device reconnects successfully.
-static void reconnect_backoff_apply(const char *tag, int id, int *fails, const char *reason) {
+// extra_stop, when given, lets the sleep bail out early on a per-camera stop
+// request instead of only reacting to the global g_ctx.running.
+static void reconnect_backoff_apply(const char *tag, int id, int *fails, const char *reason,
+                                     std::atomic<bool> *extra_stop = nullptr) {
     (*fails)++;
     int delay = reconnect_backoff_ms(*fails);
     if (RECONNECT_MAX_ATTEMPTS <= 0 || *fails <= RECONNECT_MAX_ATTEMPTS) {
@@ -144,7 +153,7 @@ static void reconnect_backoff_apply(const char *tag, int id, int *fails, const c
         fprintf(stderr, "[%s%d][ERR] %s failed %d times, slowing to %ds retry to avoid USB storm\n",
                 tag, id, reason, RECONNECT_MAX_ATTEMPTS, RECONNECT_BACKOFF_MAX_MS / 1000);
     }
-    interruptible_sleep_ms(delay);
+    interruptible_sleep_ms(delay, extra_stop);
 }
 
 // ==================== Utilities: sysfs Reads, VID/PID Parsing, etc. ====================
@@ -557,16 +566,14 @@ static int init_capture(struct cam_ctx *ctx) {
     printf("[CAM%d] negotiated %dx%d fmt=0x%x\n",
            ctx->cam_id, ctx->width, ctx->height, ctx->format);
     
-    int target_framerate = 30;
     int cam_id = ctx->cam_id;
     if (cam_id == 0) {
-        target_framerate = g_ctx.config.rgb_config.fps;
+        set_framerate(ctx->fd, g_ctx.config.rgb_config.fps);
     } else if (cam_id == 1) {
-        target_framerate = g_ctx.config.gray_config.fps;
+        set_framerate(ctx->fd, g_ctx.config.gray_config.fps);
     } else if (cam_id == 2) {
-        target_framerate = g_ctx.config.depth_config.fps;
+        set_framerate(ctx->fd, g_ctx.config.depth_config.fps);
     }
-    set_framerate(ctx->fd, target_framerate);
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
@@ -648,6 +655,45 @@ static int stop_capture(int fd) {
         return -1;
     }
     return 0;
+}
+
+static void safe_cleanup_camera(struct cam_ctx *ctx) {
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->fd_lock);
+    if (ctx->fd < 0) {
+        pthread_mutex_unlock(&ctx->fd_lock);
+        return;
+    }
+
+    // 1. 停止视频流
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
+
+    // 2. 取消内存映射
+    if (ctx->buffers) {
+        for (int i = 0; i < ctx->buffer_count; i++) {
+            if (ctx->buffers[i].start && ctx->buffers[i].start != MAP_FAILED) {
+                munmap(ctx->buffers[i].start, ctx->buffers[i].length);
+            }
+        }
+        free(ctx->buffers);
+        ctx->buffers = NULL;
+    }
+    ctx->buffer_count = 0;
+
+    // 3. 强制驱动释放所有 reqbufs (关键点！)
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = 0;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    ioctl(ctx->fd, VIDIOC_REQBUFS, &req);
+
+    // 4. 关闭文件描述符
+    close(ctx->fd);
+    ctx->fd = -1;
+    ctx->last_timestamp = 0;
+    pthread_mutex_unlock(&ctx->fd_lock);
 }
 
 // ==================== Extension Unit Helpers ====================
@@ -760,11 +806,26 @@ static void *capture_thread(void *arg) {
     printf("[CAM%d] capture thread started, dev=%s\n", ctx->cam_id, g_ctx.video_devs[ctx->cam_id]);
 
     while (g_ctx.running) {
+        if (!g_ctx.cam_running[ctx->cam_id]) {
+            break;
+        }
         struct pollfd fds;
         fds.fd = ctx->fd;
         fds.events = POLLIN;
         const char *dev_path = g_ctx.video_devs[ctx->cam_id];
         if (ctx->fd < 0) {
+            pthread_mutex_lock(&ctx->fd_lock);
+            // Re-check inside the lock: stop_camera() may have run between
+            // the check above and acquiring the lock, or another thread may
+            // have already reopened it.
+            if (!g_ctx.cam_running[ctx->cam_id]) {
+                pthread_mutex_unlock(&ctx->fd_lock);
+                break;
+            }
+            if (ctx->fd >= 0) {
+                pthread_mutex_unlock(&ctx->fd_lock);
+                continue;
+            }
             printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
@@ -772,24 +833,31 @@ static void *capture_thread(void *arg) {
             printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
-                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "open failed");
+                pthread_mutex_unlock(&ctx->fd_lock);
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "open failed",
+                                         &g_ctx.cam_running[ctx->cam_id]);
                 continue;
             }
             if (init_capture(ctx) < 0) {
                 close(ctx->fd);
                 ctx->fd = -1;
-                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "init_capture failed");
+                pthread_mutex_unlock(&ctx->fd_lock);
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "init_capture failed",
+                                         &g_ctx.cam_running[ctx->cam_id]);
                 continue;
             }
             
             if (start_capture(ctx->fd) < 0) {
                 close(ctx->fd);
                 ctx->fd = -1;
-                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "failed to start stream");
+                pthread_mutex_unlock(&ctx->fd_lock);
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "failed to start stream",
+                                         &g_ctx.cam_running[ctx->cam_id]);
                 continue;
             }
             ctx->last_timestamp = 0;
             reconnect_fails = 0;   // reconnected successfully; reset backoff
+            pthread_mutex_unlock(&ctx->fd_lock);
             printf("[CAM%d] device reinitialized\n", ctx->cam_id);
             frame_count = 0;
         }
@@ -802,10 +870,12 @@ static void *capture_thread(void *arg) {
                 continue;
             }
             fprintf(stderr, "[CAM%d][ERR] poll: %s\n", ctx->cam_id, strerror(errno));
-            close(ctx->fd);
-            ctx->fd = -1;
+            safe_cleanup_camera(ctx);
             continue;
         } else if (ret == 0) {
+            if (!g_ctx.cam_running[ctx->cam_id]) {
+                break;
+            }
             // Timed out; continue the loop.
             continue;
         }
@@ -820,21 +890,33 @@ static void *capture_thread(void *arg) {
                 // poll reported data but DQBUF returned EAGAIN; this is rare, so retry directly.
                 continue;
             }
-            if (errno == ENODEV) {
-                fprintf(stderr, "[CAM%d][WARN] device removed, waiting for reconnect\n", ctx->cam_id);
-                close(ctx->fd);
-                ctx->fd = -1;
-                if (ctx->buffers) {
-                    for (int i = 0; i < ctx->buffer_count; i++) {
-                        if (ctx->buffers[i].start)
-                            munmap(ctx->buffers[i].start, ctx->buffers[i].length);
-                    }
-                    free(ctx->buffers);
-                    ctx->buffers = NULL;
-                }
-                ctx->buffer_count = 0;
+            if (errno == EBUSY || errno == ENODEV || errno == EBADF) {
+                fprintf(stderr, "[CAM%d][ERR] DQBUF fatal error (%s), cleaning up...\n", 
+                        ctx->cam_id, strerror(errno));
+                // 调用规范清理，防止驱动状态残余
+                safe_cleanup_camera(ctx);
+                // 使用指数退避等待硬件/USB总线恢复；如果这是一次主动 stop_camera()
+                // 触发的关闭，cam_running 会是 false，退避等待会立刻被打断，
+                // 循环顶部的检查会让线程干净退出，而不是抢着自己重新打开设备。
+                reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "DQBUF reset",
+                                         &g_ctx.cam_running[ctx->cam_id]);
                 continue;
             }
+            // if (errno == ENODEV) {
+            //     fprintf(stderr, "[CAM%d][WARN] device removed, waiting for reconnect\n", ctx->cam_id);
+            //     close(ctx->fd);
+            //     ctx->fd = -1;
+            //     if (ctx->buffers) {
+            //         for (int i = 0; i < ctx->buffer_count; i++) {
+            //             if (ctx->buffers[i].start)
+            //                 munmap(ctx->buffers[i].start, ctx->buffers[i].length);
+            //         }
+            //         free(ctx->buffers);
+            //         ctx->buffers = NULL;
+            //     }
+            //     ctx->buffer_count = 0;
+            //     continue;
+            // }
             fprintf(stderr, "[CAM%d][ERR] VIDIOC_DQBUF: %s\n", ctx->cam_id, strerror(errno));
             continue;
         }
@@ -843,8 +925,7 @@ static void *capture_thread(void *arg) {
         if (buf.flags & V4L2_BUF_FLAG_ERROR) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-                close(ctx->fd);
-                ctx->fd = -1;
+                safe_cleanup_camera(ctx);
             }
             continue;
         }
@@ -901,8 +982,7 @@ static void *capture_thread(void *arg) {
         if (timestamp == 0) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-                close(ctx->fd);
-                ctx->fd = -1;
+                safe_cleanup_camera(ctx);
             }
             continue;
         }
@@ -912,8 +992,7 @@ static void *capture_thread(void *arg) {
         if (timestamp == ctx->last_timestamp) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-                close(ctx->fd);
-                ctx->fd = -1;
+                safe_cleanup_camera(ctx);
             }
             continue;
         }
@@ -934,21 +1013,61 @@ static void *capture_thread(void *arg) {
 
         if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
             fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-            close(ctx->fd);
-            ctx->fd = -1;
+            safe_cleanup_camera(ctx);
+        }
+
+        if (!g_ctx.cam_running[ctx->cam_id]) {
+            break;
         }
     }
 
-    if (ctx->fd >= 0) {
-        stop_capture(ctx->fd);
-        close(ctx->fd);
-        ctx->fd = -1;
-    }
+    // Same cleanup as the mid-loop error paths, just done once on exit;
+    // routing through safe_cleanup_camera() keeps it lock-protected and
+    // avoids duplicating the close/munmap/REQBUFS(0) sequence here.
+    safe_cleanup_camera(ctx);
 
     // free_buffer_array(&ctx->buffers, &ctx->buffer_count);
 
     printf("[CAM%d] capture thread exited\n", ctx->cam_id);
     return NULL;
+}
+
+int switch_camera_fps(int cam_id, int new_fps) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
+
+    printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, new_fps);
+
+    // Step 1: 发送停止信号并等待采线程安全退出
+    g_ctx.cam_running[cam_id] = false;
+    if (ctx->tid) {
+        pthread_join(ctx->tid, NULL);
+        ctx->tid = 0;
+    }
+
+    // 说明：capture_thread 在退出前已经自动调用了 safe_cleanup_camera(ctx)
+    // 此时 ctx->fd 保证已被关闭 (-1)，资源已释放。
+
+    // Step 2: 更新目标 FPS 配置
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.fps = new_fps;
+    } else if (cam_id == 1) {
+        g_ctx.config.gray_config.fps = new_fps;
+    } else if (cam_id == 2) {
+        g_ctx.config.depth_config.fps = new_fps;
+    }
+
+    // Step 3: 重新拉起采集线程
+    // 新线程启动后，由于 ctx->fd == -1，它会自动执行 open -> init_capture -> start_capture 完整链路
+    g_ctx.cam_running[cam_id] = true;
+    if (pthread_create(&ctx->tid, NULL, capture_thread, ctx) != 0) {
+        fprintf(stderr, "[SDK][ERR] Failed to recreate capture thread for cam %d\n", cam_id);
+        g_ctx.cam_running[cam_id] = false;
+        return -1;
+    }
+
+    printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, new_fps);
+    return 0;
 }
 
 // ==================== HID Device Reading ====================
@@ -1143,17 +1262,17 @@ int insight9_receive_init(const insight9_config_t* config) {
         g_ctx.cams[i].cam_id = i;
         g_ctx.cams[i].fd = -1;
         if (i == 0) {
-            g_ctx.cams[i].width = config->depth_config.width;
-            g_ctx.cams[i].height = config->depth_config.height;
-            g_ctx.cams[i].format = config->depth_config.pixel_format;
+            g_ctx.cams[i].width = config->rgb_config.width;
+            g_ctx.cams[i].height = config->rgb_config.height;
+            g_ctx.cams[i].format = config->rgb_config.pixel_format;
         } else if (i == 1) {
             g_ctx.cams[i].width = config->gray_config.width;
             g_ctx.cams[i].height = config->gray_config.height;
             g_ctx.cams[i].format = config->gray_config.pixel_format;
         } else if (i == 2) {
-            g_ctx.cams[i].width = config->rgb_config.width;
-            g_ctx.cams[i].height = config->rgb_config.height;
-            g_ctx.cams[i].format = config->rgb_config.pixel_format;
+            g_ctx.cams[i].width = config->depth_config.width;
+            g_ctx.cams[i].height = config->depth_config.height;
+            g_ctx.cams[i].format = config->depth_config.pixel_format;
         }
     }
 
@@ -1199,7 +1318,7 @@ int insight9_receive_init_default(void) {
     g_ctx.config.gray_config.width = SUB_WIDTH;
     g_ctx.config.gray_config.height = SUB_HEIGHT;
     g_ctx.config.gray_config.fps = 30;
-    g_ctx.config.gray_config.pixel_format = V4L2_PIX_FMT_Y8I;
+    g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
     
     g_ctx.config.depth_config.width = DEPTH_WIDTH;
     g_ctx.config.depth_config.height = DEPTH_HEIGHT;
@@ -1351,41 +1470,52 @@ int insight9_receive_start_camera(int cam_id) {
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
     
     if (ctx->fd < 0) {
-        refresh_video_device_path(cam_id);
-        const char *dev_path = g_ctx.video_devs[cam_id];
-        ctx->fd = open(dev_path, O_RDWR);
-        if (ctx->fd < 0) {
-            fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
-            return -1;
-        }
-        
-        if (cam_id == 0) {
-            ctx->width = g_ctx.config.depth_config.width;
-            ctx->height = g_ctx.config.depth_config.height;
-            ctx->format = g_ctx.config.depth_config.pixel_format;
-        } else if (cam_id == 1) {
-            ctx->width = g_ctx.config.gray_config.width;
-            ctx->height = g_ctx.config.gray_config.height;
-            ctx->format = g_ctx.config.gray_config.pixel_format;
+        pthread_mutex_lock(&ctx->fd_lock);
+        if (ctx->fd >= 0) {
+            // Someone else (e.g. capture_thread's own reopen path) already
+            // got there first; nothing left for us to do here.
+            pthread_mutex_unlock(&ctx->fd_lock);
         } else {
-            ctx->width = g_ctx.config.rgb_config.width;
-            ctx->height = g_ctx.config.rgb_config.height;
-            ctx->format = g_ctx.config.rgb_config.pixel_format;
+            refresh_video_device_path(cam_id);
+            const char *dev_path = g_ctx.video_devs[cam_id];
+            ctx->fd = open(dev_path, O_RDWR);
+            if (ctx->fd < 0) {
+                fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
+                pthread_mutex_unlock(&ctx->fd_lock);
+                return -1;
+            }
+
+            if (cam_id == 0) {
+                ctx->width = g_ctx.config.rgb_config.width;
+                ctx->height = g_ctx.config.rgb_config.height;
+                ctx->format = g_ctx.config.rgb_config.pixel_format;
+            } else if (cam_id == 1) {
+                ctx->width = g_ctx.config.gray_config.width;
+                ctx->height = g_ctx.config.gray_config.height;
+                ctx->format = g_ctx.config.gray_config.pixel_format;
+            } else {
+                ctx->width = g_ctx.config.depth_config.width;
+                ctx->height = g_ctx.config.depth_config.height;
+                ctx->format = g_ctx.config.depth_config.pixel_format;
+            }
+
+            if (init_capture(ctx) < 0) {
+                close(ctx->fd);
+                ctx->fd = -1;
+                pthread_mutex_unlock(&ctx->fd_lock);
+                return -1;
+            }
+
+            if (start_capture(ctx->fd) < 0) {
+                close(ctx->fd);
+                ctx->fd = -1;
+                pthread_mutex_unlock(&ctx->fd_lock);
+                return -1;
+            }
+
+            ctx->last_timestamp = 0;
+            pthread_mutex_unlock(&ctx->fd_lock);
         }
-        
-        if (init_capture(ctx) < 0) {
-            close(ctx->fd);
-            ctx->fd = -1;
-            return -1;
-        }
-        
-        if (start_capture(ctx->fd) < 0) {
-            close(ctx->fd);
-            ctx->fd = -1;
-            return -1;
-        }
-        
-        ctx->last_timestamp = 0;
     }
 
     g_ctx.cam_running[cam_id] = true;
@@ -1417,20 +1547,7 @@ void insight9_receive_stop_camera(int cam_id) {
     g_ctx.cam_running[cam_id] = false;
     
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
-    if (ctx->fd >= 0) {
-        stop_capture(ctx->fd);
-        if (ctx->buffers) {
-            for (int j = 0; j < ctx->buffer_count; j++) {
-                if (ctx->buffers[j].start)
-                    munmap(ctx->buffers[j].start, ctx->buffers[j].length);
-            }
-            free(ctx->buffers);
-            ctx->buffers = NULL;
-        }
-        close(ctx->fd);
-        ctx->fd = -1;
-        ctx->buffer_count = 0;
-    }
+    safe_cleanup_camera(ctx);
     
     if (g_ctx.video_tids[cam_id]) {
         pthread_join(g_ctx.video_tids[cam_id], NULL);
@@ -1439,6 +1556,30 @@ void insight9_receive_stop_camera(int cam_id) {
     
     printf("[CAM%d] stopped\n", cam_id);
 }
+// void insight9_receive_stop(void) {
+//     if (!g_ctx.running) return;
+//     g_ctx.running = false;
+
+//     printf("[SDK] Stopping all cameras...\n");
+
+//     for (int i = 0; i < CAM_NUM; i++) {
+//         g_ctx.cam_running[i] = false;
+//         if (g_ctx.video_tids[i]) {
+//             pthread_join(g_ctx.video_tids[i], NULL);
+//             g_ctx.video_tids[i] = 0;
+//         }
+//         safe_cleanup_camera(&g_ctx.cams[i]);
+//     }
+
+//     for (int i = 0; i < HID_NUM; i++) {
+//         if (g_ctx.hid_tids[i]) {
+//             pthread_join(g_ctx.hid_tids[i], NULL);
+//             g_ctx.hid_tids[i] = 0;
+//         }
+//     }
+
+//     printf("[SDK] stopped\n");
+// }
 
 int insight9_receive_restart_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
@@ -1447,6 +1588,61 @@ int insight9_receive_restart_camera(int cam_id) {
     insight9_receive_stop_camera(cam_id);
     usleep(100000);
     return insight9_receive_start_camera(cam_id);
+}
+
+// int insight9_receive_switch_camera_fps(int cam_id, int fps) {
+//     if (!g_ctx.initialized) return -1;
+//     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+//     if (fps <= 0) return -1;
+
+//     printf("[SDK] Switching camera %d to %d fps...\n", cam_id, fps);
+
+//     unsigned int current_format = g_ctx.cams[cam_id].format;
+//     insight9_receive_stop_camera(cam_id);
+//     sleep(3);
+
+//     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
+//         fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
+//         return -1;
+//     }
+//     g_ctx.cams[cam_id].format = current_format;
+
+//     int ret = insight9_receive_restart_camera(cam_id);
+//     if (ret == 0) {
+//         printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, fps);
+//     } else {
+//         fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
+//     }
+//     return ret;
+// }
+int insight9_receive_switch_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (fps <= 0) return -1;
+
+    printf("[SDK] Switching camera %d to %d fps...\n", cam_id, fps);
+
+    // 1. 停止相机（使用安全清理）
+    insight9_receive_stop_camera(cam_id);
+    
+    // 2. 等待设备完全释放
+    usleep(200000);  // 200ms
+    
+    // 3. 更新配置中的FPS
+    if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
+        fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
+        return -1;
+    }
+    
+    // 4. 重新启动相机
+    int ret = insight9_receive_restart_camera(cam_id);
+    if (ret == 0) {
+        printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, fps);
+    } else {
+        fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
+    }
+    
+    return ret;
 }
 
 int insight9_receive_is_camera_running(int cam_id) {
@@ -1462,16 +1658,13 @@ void insight9_receive_stop(void) {
 
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cam_running[i] = false;
-        struct cam_ctx *ctx = &g_ctx.cams[i];
-        if (ctx->fd >= 0) {
-            stop_capture(ctx->fd);
-            close(ctx->fd);
-            ctx->fd = -1;
-        }
+        // 等待线程退出
         if (g_ctx.video_tids[i]) {
             pthread_join(g_ctx.video_tids[i], NULL);
             g_ctx.video_tids[i] = 0;
         }
+        // 使用安全清理
+        safe_cleanup_camera(&g_ctx.cams[i]);
     }
 
     for (int i = 0; i < HID_NUM; i++) {

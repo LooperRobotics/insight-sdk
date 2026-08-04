@@ -16,6 +16,7 @@
 
 static volatile BOOL keep_running = TRUE;
 static volatile LONGLONG last_image_time = 0;
+static CRITICAL_SECTION g_sdk_op_lock;
 
 BOOL WINAPI console_handler(DWORD dwCtrlType) {
     if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_BREAK_EVENT) {
@@ -60,6 +61,9 @@ static CRITICAL_SECTION g_stats_lock;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
 static int vio_status_raw = -1;
+
+static int gray_fps_state = 0;
+static const int GRAY_FPS_VALUES[] = {20,30,40,50,60};
 
 // ==================== Display / depth-to-RGB alignment ====================
 // Grid layout (single fixed window):
@@ -370,10 +374,43 @@ static void camera_worker(int cam_id) {
     }
 }
 
+void reconnect_worker() {
+    while (keep_running) {
+        Sleep(1000);
+        if (!keep_running) break;
+
+        LONGLONG now = GetTickCount64();
+        LONGLONG last = last_image_time;
+        if (last != 0 && (now - last) > 5000) {
+            EnterCriticalSection(&g_sdk_op_lock);
+            printf("[Reconnect] No image received for 5 seconds, attempting reconnect...\n");
+            ... // stop+cleanup+sleep(1000)+init+start，跟原来完全一样
+            LeaveCriticalSection(&g_sdk_op_lock);
+        }
+    }
+}
+
+void toggle_gray_camera_fps() {
+    int new_fps = GRAY_FPS_VALUES[gray_fps_state];
+    printf("new_fps = %d | gray_fps_state = %d\n", new_fps, gray_fps_state);
+    gray_fps_state = (gray_fps_state + 1) % 5;
+
+    printf("\n========= Switching Gray Camera FPS =========\n");
+    printf("New FPS: %d\n", new_fps);
+
+    EnterCriticalSection(&g_sdk_op_lock);
+    if (insight9_receive_switch_camera_fps(1, new_fps) == 0) {
+        printf("Gray camera switched to %d FPS\n", new_fps);
+    } else {
+        printf("Failed to switch gray camera FPS!\n");
+    }
+    LeaveCriticalSection(&g_sdk_op_lock);
+}
+
 int main() {
     SetConsoleCtrlHandler(console_handler, TRUE);
     InitializeCriticalSection(&g_stats_lock);
-
+    InitializeCriticalSection(&g_sdk_op_lock);
     int active_cam = -1;
     camera_params params = {0};
 
@@ -506,6 +543,17 @@ int main() {
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
     InterlockedExchange64(&last_image_time, GetTickCount64());
 
+    std::thread reconnect_thread(reconnect_worker);
+    std::thread fps_switch_thread([]() {
+        while (keep_running) {
+            Sleep(10000);
+            
+            if (keep_running) {
+                toggle_gray_camera_fps();
+            }
+        }
+    });
+
     printf("\n=================================================\n\n");
     printf("SDK started with all 3 cameras\n");
     printf("A fixed grid window will appear: L / R / raw-depth / RGB+aligned-depth.\n");
@@ -595,7 +643,7 @@ int main() {
             config_reinit.rgb_config.pixel_format = PixelFormat::MJPEG;
             config_reinit.gray_config.width = 544;
             config_reinit.gray_config.height = 1281;
-            config_reinit.gray_config.fps = 30;
+            config_reinit.gray_config.fps = GRAY_FPS_VALUES[gray_fps_state];
             config_reinit.gray_config.pixel_format = PixelFormat::GREY;
             config_reinit.depth_config.width = 544;
             config_reinit.depth_config.height = 642;
@@ -631,6 +679,8 @@ int main() {
         if (workers[cam].joinable()) workers[cam].join();
     }
     cv::destroyAllWindows();
+    if (fps_switch_thread.joinable()) fps_switch_thread.join();
+    if (reconnect_thread.joinable()) reconnect_thread.join();
 
     insight9_receive_stop();
     insight9_receive_cleanup();

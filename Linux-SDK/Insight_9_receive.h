@@ -207,6 +207,18 @@ void insight9_receive_stop_camera(int cam_id);
 int insight9_receive_restart_camera(int cam_id);
 
 /**
+ * @brief Switch a specific camera to a new frame rate and apply it immediately.
+ *        Convenience wrapper that updates the target fps (as
+ *        insight9_receive_set_camera_fps() does) and then stops/reopens
+ *        just that one camera (as insight9_receive_restart_camera() does)
+ *        so the new value actually takes effect.
+ * @param cam_id Camera ID.
+ * @param fps    Desired frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_switch_camera_fps(int cam_id, int fps);
+
+/**
  * @brief Check if a camera is currently running.
  * @param cam_id Camera ID.
  * @return 1 if running, 0 otherwise.

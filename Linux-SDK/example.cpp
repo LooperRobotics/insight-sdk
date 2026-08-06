@@ -94,7 +94,7 @@ static void ensure_hid_stats_initialized_locked(void) {
 static const char *image_format_to_string(unsigned int format) {
     switch (format) {
         case V4L2_PIX_FMT_MJPEG:
-            return "RGB";
+            return "MJPEG";
         case V4L2_PIX_FMT_YUYV:
             return "yuyv";
         case V4L2_PIX_FMT_GREY:

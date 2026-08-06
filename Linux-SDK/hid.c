@@ -12,8 +12,12 @@
 #include <poll.h>
 #include <assert.h>
 #include <ctype.h>
-#define GYRO_SCALE_FACTOR -0.000005883
-#define ACCEL_SCALE_FACTOR -0.002906901
+
+#define GYRO_SCALE_FACTOR -610.464183381
+#define ACCEL_SCALE_FACTOR -0.366459184
+
+#define GYRO_SCALE_LOOPERHUB 0.00106526
+#define ACCEL_SCALE_LOOPERHUB 0.0035913
 
 static void trim_newline(char *str) {
     size_t len = strlen(str);
@@ -301,9 +305,9 @@ void *hid_thread(void *arg) {
                     continue;
                 }
                 last_accel_ts = accel->timestamp;
-                last_ax = (float)accel->accel_x * ACCEL_SCALE_FACTOR;
-                last_ay = (float)accel->accel_y * ACCEL_SCALE_FACTOR;
-                last_az = (float)accel->accel_z * ACCEL_SCALE_FACTOR;
+                last_ax = (float)accel->accel_x / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
+                last_ay = (float)accel->accel_y / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
+                last_az = (float)accel->accel_z / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
                 if (g_ctx.imu_cb) {
                     g_ctx.imu_cb(last_ax, last_ay, last_az,
                                  last_gx, last_gy, last_gz,
@@ -316,9 +320,9 @@ void *hid_thread(void *arg) {
                     continue;
                 }
                 last_gyro_ts = gyro->timestamp;
-                last_gx = (float)gyro->gyro_x * GYRO_SCALE_FACTOR;
-                last_gy = (float)gyro->gyro_y * GYRO_SCALE_FACTOR;
-                last_gz = (float)gyro->gyro_z * GYRO_SCALE_FACTOR;
+                last_gx = (float)gyro->gyro_x / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
+                last_gy = (float)gyro->gyro_y / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
+                last_gz = (float)gyro->gyro_z / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
                 if (g_ctx.imu_cb) {
                     g_ctx.imu_cb(last_ax, last_ay, last_az,
                                  last_gx, last_gy, last_gz,

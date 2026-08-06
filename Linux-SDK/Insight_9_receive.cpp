@@ -538,9 +538,10 @@ static int init_capture(struct cam_ctx *ctx) {
         fmt.fmt.pix.field = V4L2_FIELD_NONE;
     }
 
-    printf("[CAM%d] setting format %dx%d fmt=0x%x\n",
-           ctx->cam_id, ctx->width, ctx->height, ctx->format);
-
+    if (ctx->cam_id == 2) {
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        printf("set cam3 format mjpeg");
+    }
     if (ioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
         fprintf(stderr, "[CAM%d][ERR] VIDIOC_S_FMT failed: %s\n", ctx->cam_id, strerror(errno));
         if (!use_default_format) {
@@ -556,6 +557,11 @@ static int init_capture(struct cam_ctx *ctx) {
             return -1;
         }
     }
+
+    printf("[CAM%d] Format: %dx%d, FourCC: %c%c%c%c\n",
+        ctx->cam_id, ctx->width, ctx->height, 
+        ctx->format & 0xFF, (ctx->format >> 8) & 0xFF, 
+        (ctx->format >> 16) & 0xFF, (ctx->format >> 24) & 0xFF);
 
     struct v4l2_format actual_fmt;
     memset(&actual_fmt, 0, sizeof(actual_fmt));

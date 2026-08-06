@@ -27,7 +27,7 @@ struct camera_params {
 #pragma pack(pop)
 
 inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
-inline constexpr uint8_t kXuUnitId = 4;
+inline constexpr uint8_t kXuUnitId = 3;
 inline constexpr uint8_t kCameraParamsSelector = 4;
 inline constexpr uint8_t kActiveCameraSelector = 7;
 inline constexpr uint8_t kIntrinsicsSelector = 0x14;

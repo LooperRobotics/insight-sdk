@@ -1,6 +1,7 @@
 #include "Insight_9_receive.h"
 #include "hid.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -9,13 +10,19 @@
 #include <unistd.h>
 #include <signal.h>
 #include <linux/videodev2.h>
+#include <opencv2/opencv.hpp>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <vector>
 
 static volatile int keep_running = 1;
+static pthread_mutex_t g_sdk_op_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void sigint_handler(int sig) {
     printf("\n[Signal] Received SIGINT, stopping...\n");
     keep_running = 0;
-    insight9_receive_all_stop();
+    insight9_receive_stop();
 }
 
 struct cam_stats {
@@ -61,8 +68,46 @@ static struct timespec g_hid_last_print;
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_img_stats_inited = 0;
 static int g_hid_stats_inited = 0;
+static int vio_status_raw = -1;
+
 static int gray_fps_state = 0;
-static const int GRAY_FPS_VALUES[] = {20, 30};
+static const int GRAY_FPS_VALUES[] = {20, 30, 40, 50, 60};
+
+// ==================== Display / depth-to-RGB alignment ====================
+// Grid layout (single fixed window):
+//   top-left = left eye, bottom-left = right eye,
+//   top-right = raw depth, bottom-right = RGB with aligned depth overlaid.
+enum { PANEL_LEFT = 0, PANEL_RIGHT = 1, PANEL_DEPTH = 2, PANEL_RGB = 3, PANEL_COUNT = 4 };
+static const int CELL_W = 544;            // sensor panel width
+static const int CELL_H = 640;            // sensor panel height (one stereo eye / valid depth rows)
+static const int RGB_W  = 544;            // RGB shown at half of its 1088x1920 native size
+static const int RGB_H  = 960;
+static const double DISPLAY_SCALE = 0.6;  // shrink the composite so the window fits the screen
+
+// Producer/consumer staging: the capture callback only copies raw bytes here so
+// it returns immediately (never throttling the SDK's per-camera capture thread).
+struct raw_frame {
+    std::vector<uint8_t> data;
+    int width = 0;
+    int height = 0;
+    unsigned int fmt = 0;
+    bool has_new = false;
+};
+static std::mutex g_raw_lock;
+static std::condition_variable g_raw_cv;
+static raw_frame g_raw[3];
+
+// Decoded panels + colorized aligned depth, written by worker threads and read
+// by the display thread. g_panel_lock guards this handoff.
+static std::mutex g_panel_lock;
+static cv::Mat g_panel[PANEL_COUNT];
+static cv::Mat g_aligned_color;   // aligned depth, colorized (RGB-sized, BGR)
+static cv::Mat g_aligned_mask;    // valid-pixel mask for the overlay (RGB-sized, 8U)
+
+// Calibration for depth->RGB alignment, read once at startup.
+static bool g_calib_ready = false;
+static camera_calib g_left_calib;
+static camera_calib g_rgb_calib;
 
 static void reset_img_stats(void) {
     for (int i = 0; i < 3; i++) {
@@ -105,6 +150,19 @@ static const char *image_format_to_string(unsigned int format) {
             return "Y8I";
         default:
             return "UNKNOWN";
+    }
+}
+
+static const char* vio_status_to_string(VioStatus status) {
+    switch (status) {
+        case VioStatus::NOT_INITED:         return "NOT_INITED";
+        case VioStatus::RESTARTING:         return "RESTARTING";
+        case VioStatus::STOPPED:            return "STOPPED";
+        case VioStatus::TRACKING:           return "TRACKING";
+        case VioStatus::TRACKING_STATIC:    return "TRACKING_STATIC";
+        case VioStatus::TRACKINGLOST:       return "TRACKINGLOST";
+        case VioStatus::DATA_LOST:          return "DATA_LOST";
+        default:                            return "UNKNOWN";
     }
 }
 
@@ -159,6 +217,13 @@ static void maybe_print_hid_stats_locked(void) {
            (unsigned long)g_vio_stats.last_ts);
     fflush(stdout);
 
+    if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
+        VioStatus vio_status = static_cast<VioStatus>(vio_status_raw);
+        printf("Current VIO status: %s (%d)\n", vio_status_to_string(vio_status), vio_status_raw);
+    } else {
+        printf("Failed to get VIO status\n");
+    }
+
     reset_hid_stats();
     g_hid_last_print = now;
 }
@@ -185,6 +250,18 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
 
     maybe_print_img_stats_locked();
     pthread_mutex_unlock(&g_stats_lock);
+
+    // Cheap hand-off to the per-camera worker: just copy the raw bytes.
+    {
+        std::lock_guard<std::mutex> lk(g_raw_lock);
+        raw_frame &rf = g_raw[cam_id];
+        rf.data.assign(data, data + size);
+        rf.width = w;
+        rf.height = h;
+        rf.fmt = fmt;
+        rf.has_new = true;
+    }
+    g_raw_cv.notify_all();
 }
 
 void my_imu_cb(float ax, float ay, float az,
@@ -220,23 +297,124 @@ void my_vio_cb(float px, float py, float pz,
     pthread_mutex_unlock(&g_stats_lock);
 }
 
-void toggle_gray_camera_fps() {
-    int new_fps = GRAY_FPS_VALUES[gray_fps_state];
-    gray_fps_state = (gray_fps_state + 1) % 2;
-    
-    printf("\n========= Switching Gray Camera FPS =========\n");
-    printf("New FPS: %d\n", new_fps);
+// Decode one raw frame into BGR panel(s); for depth, also align it to RGB and
+// build the colorized overlay. Runs on a per-camera worker thread.
+static void process_raw_frame(int cam_id, const raw_frame &rf) {
+    const uint8_t *data = rf.data.data();
+    size_t size = rf.data.size();
+    int w = rf.width, h = rf.height;
 
-    insight9_receive_stop_camera(1);
-    usleep(500000);
-    
-    int ret = insight9_receive_set_camera_fps(1, new_fps);
-    printf("insight9_receive_set_camera_fps returned: %d\n", ret);
-    
-    if (insight9_receive_restart_camera(1) == 0) {
-        printf("Gray camera restarted successfully at %d FPS\n", new_fps);
-    } else {
-        printf("Failed to restart gray camera!\n");
+    if (rf.fmt == V4L2_PIX_FMT_MJPEG) {
+        // cam0 RGB. Reject truncated frames: require SOI (FFD8)...EOI (FFD9).
+        bool valid_jpeg = size >= 4 &&
+                          data[0] == 0xFF && data[1] == 0xD8 &&
+                          data[size - 2] == 0xFF && data[size - 1] == 0xD9;
+        if (!valid_jpeg) return;
+
+        // Strip the firmware's non-standard 16-byte APP1 "TS__" segment after
+        // the SOI (its bogus length otherwise desyncs libjpeg -> garbled color).
+        std::vector<uint8_t> buf;
+        if (size > 18 && data[2] == 0xFF && data[3] == 0xE1 &&
+            memcmp(data + 6, "TS__", 4) == 0) {
+            buf.reserve(size - 16);
+            buf.insert(buf.end(), data, data + 2);
+            buf.insert(buf.end(), data + 18, data + size);
+        } else {
+            buf.assign(data, data + size);
+        }
+
+        cv::Mat rgb = cv::imdecode(buf, cv::IMREAD_COLOR);
+        if (!rgb.empty()) {
+            std::lock_guard<std::mutex> lk(g_panel_lock);
+            g_panel[PANEL_RGB] = rgb;
+        }
+    } else if (rf.fmt == V4L2_PIX_FMT_GREY) {
+        // cam1 stereo grayscale: two eyes stacked vertically (final row = timestamps).
+        if (w > 0 && h > 0 && size >= (size_t)w * h) {
+            int eye_h = (h - 1) / 2;
+            cv::Mat full(h, w, CV_8UC1, (void *)data);
+            cv::Mat left_bgr, right_bgr;
+            cv::cvtColor(full.rowRange(0, eye_h), left_bgr, cv::COLOR_GRAY2BGR);
+            cv::cvtColor(full.rowRange(eye_h, 2 * eye_h), right_bgr, cv::COLOR_GRAY2BGR);
+            std::lock_guard<std::mutex> lk(g_panel_lock);
+            g_panel[PANEL_LEFT] = left_bgr;
+            g_panel[PANEL_RIGHT] = right_bgr;
+        }
+    } else if (rf.fmt == V4L2_PIX_FMT_Z16) {
+        // cam2 depth: 16-bit; last 2 rows are metadata.
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 2) return;
+        int valid_h = h - 2;
+
+        // Raw depth colormap for the top-right panel.
+        cv::Mat depth(valid_h, w, CV_16UC1, (void *)data);
+        cv::Mat depth8, depth_bgr;
+        cv::normalize(depth, depth8, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+        cv::applyColorMap(depth8, depth_bgr, cv::COLORMAP_JET);
+
+        // Align the depth onto the RGB image plane and colorize it for overlay.
+        cv::Mat acolor, amask;
+        if (g_calib_ready) {
+            int rgb_w = (int)g_rgb_calib.intrinsics.width;
+            int rgb_h = (int)g_rgb_calib.intrinsics.height;
+            if (rgb_w > 0 && rgb_h > 0) {
+                std::vector<uint16_t> aligned((size_t)rgb_w * rgb_h);
+                if (insight9_receive_align_depth_to_rgb(
+                        (const uint16_t *)data, w, valid_h,
+                        &g_left_calib, &g_rgb_calib,
+                        aligned.data(), rgb_w, rgb_h) == 0) {
+                    cv::Mat a16(rgb_h, rgb_w, CV_16UC1, aligned.data());
+                    amask = a16 > 0;
+                    double dmin = 0, dmax = 0;
+                    cv::minMaxLoc(a16, &dmin, &dmax, nullptr, nullptr, amask);
+                    cv::Mat a8;
+                    double scale = (dmax > dmin) ? 255.0 / (dmax - dmin) : 1.0;
+                    a16.convertTo(a8, CV_8UC1, scale, -dmin * scale);
+                    cv::applyColorMap(a8, acolor, cv::COLORMAP_JET);
+                    acolor.setTo(cv::Scalar(0, 0, 0), ~amask);
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_DEPTH] = depth_bgr;
+        g_aligned_color = acolor;   // empty if calib/align unavailable
+        g_aligned_mask = amask;
+    } else if (rf.fmt == V4L2_PIX_FMT_YUYV) {
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 2) return;
+        
+        cv::Mat bgr;
+        cv::Mat yuyv_mat(h, w, CV_8UC2, (void*)data);
+        cv::cvtColor(yuyv_mat, bgr, cv::COLOR_YUV2BGR_YUYV);
+        
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_RGB] = bgr;
+    } else if (rf.fmt == V4L2_PIX_FMT_NV12) {
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 3 / 2) return;
+        
+        cv::Mat bgr;
+        cv::Mat nv12_mat(h * 3 / 2, w, CV_8UC1, (void*)data);
+        cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
+        
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_RGB] = bgr;
+    }
+}
+
+// One dedicated worker thread per camera: waits for its latest raw frame and
+// decodes independently, so a slow stream never delays the others.
+static void camera_worker(int cam_id) {
+    while (keep_running) {
+        raw_frame local;
+        {
+            std::unique_lock<std::mutex> lk(g_raw_lock);
+            g_raw_cv.wait(lk, [cam_id] {
+                return !keep_running || g_raw[cam_id].has_new;
+            });
+            if (!keep_running) break;
+            std::swap(local, g_raw[cam_id]);
+            g_raw[cam_id].has_new = false;
+        }
+        process_raw_frame(cam_id, local);
     }
 }
 
@@ -245,14 +423,20 @@ void* reconnect_worker(void* arg) {
         sleep(10);
         if (!keep_running) break;
         
+        pthread_mutex_lock(&g_sdk_op_lock);
         if (insight9_receive_is_camera_running(0) == 0 &&
             insight9_receive_is_camera_running(1) == 0 &&
             insight9_receive_is_camera_running(2) == 0) {
             printf("[ReconnectWorker] All cameras stopped, attempting reconnect...\n");
-            
-            insight9_receive_all_stop();
+            int fps = 0;
+            if (insight9_receive_get_current_fps(&fps) == 0) {
+                printf("Current FPS for gray camera: %d\n", fps);
+            } else {
+                printf("Failed to get current FPS for gray camera\n");
+            }
+            insight9_receive_stop();
             insight9_receive_cleanup();
-            
+           
             insight9_config_t config_reinit;
             config_reinit.rgb_config.width = 1088;
             config_reinit.rgb_config.height = 1920;
@@ -260,7 +444,7 @@ void* reconnect_worker(void* arg) {
             config_reinit.rgb_config.pixel_format = V4L2_PIX_FMT_MJPEG;
             config_reinit.gray_config.width = 544;
             config_reinit.gray_config.height = 1281;
-            config_reinit.gray_config.fps = GRAY_FPS_VALUES[gray_fps_state];
+            config_reinit.gray_config.fps = fps;
             config_reinit.gray_config.pixel_format = V4L2_PIX_FMT_GREY;
             config_reinit.depth_config.width = 544;
             config_reinit.depth_config.height = 642;
@@ -282,9 +466,36 @@ void* reconnect_worker(void* arg) {
                 }
             }
         }
+        pthread_mutex_unlock(&g_sdk_op_lock);
     }
-    insight9_receive_all_stop();
+    insight9_receive_stop();
     insight9_receive_cleanup();
+    return NULL;
+}
+
+void toggle_gray_camera_fps() {
+    int new_fps = GRAY_FPS_VALUES[gray_fps_state];
+    printf("new_fps = %d | gray_fps_state = %d\n", new_fps, gray_fps_state);
+    gray_fps_state = (gray_fps_state + 1) % 5;
+
+    printf("\n========= Switching Gray Camera FPS =========\n");
+    printf("New FPS: %d\n", new_fps);
+
+    pthread_mutex_lock(&g_sdk_op_lock);
+    if (insight9_receive_switch_camera_fps(1, new_fps) == 0) {
+        printf("Gray camera switched to %d FPS\n", new_fps);
+    } else {
+        printf("Failed to switch gray camera FPS!\n");
+    }
+    pthread_mutex_unlock(&g_sdk_op_lock);
+}
+
+void* fps_switch_worker(void* arg) {
+    while (keep_running) {
+        sleep(10);
+        if (!keep_running) break;
+        toggle_gray_camera_fps();
+    }
     return NULL;
 }
 
@@ -342,7 +553,7 @@ int main() {
     // pthread_join(fps_thread, NULL);
     pthread_join(reconnect_thread, NULL);
 
-    insight9_receive_all_stop();
+    insight9_receive_stop();
     insight9_receive_cleanup();
     printf("Program exited.\n");
     return 0;

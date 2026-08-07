@@ -11,12 +11,20 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <regex>
+#include <map>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <vector>
+#include <cfloat>
+#include <cmath>
+#include <vector>
+#include <cfloat>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -32,34 +40,15 @@ extern "C" {
 #pragma comment(lib, "swscale.lib")
 #pragma comment(lib, "ole32.lib")
 
-// ========== 复用 Windows Viewer 中的类（略作调整�?==========
-// 这里直接引入 viewer 中的类，但为�?SDK 独立，将关键类复制并重命�?
-#include "ExtensionUnitControl.hpp"   // 已提�?Windows �?
-// 注意：ExtensionUnitControl.hpp �?camera_params 定义相同，需要避免冲突，可以重命名或者使用同一�?
+#include "ExtensionUnitControl.hpp"
 
-// FFmpegVideoSource 需要适配回调（不内置回调，改为在 SDK 层调用）
-// 简化：不重�?FFmpegVideoSource 内部回调，而是 SDK 单独轮询并调用回�?
-
-// 以下�?Windows SDK 内部实现结构（与 Linux 类似但使�?Windows API�?
-
-#define VENDOR_ID  0x1d6b
+// ==================== Target Device VID/PID ====================
+#define VENDOR_ID  0x3652
 #define PRODUCT_ID 0x0104
+
+// ==================== Camera Configuration ====================
 #define CAM_NUM 3
 #define HID_NUM 2
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
-// 视频格式定义
-enum class PixelFormat {
-    Unknown,
-    MJPEG,
-    GREY,
-    Z16,
-    RGB8,
-    Y8I
-};
 #define MAIN_WIDTH   1088
 #define MAIN_HEIGHT  1920
 #define MAIN_FORMAT  PixelFormat::MJPEG
@@ -70,42 +59,54 @@ enum class PixelFormat {
 #define DEPTH_HEIGHT 642
 #define DEPTH_FORMAT PixelFormat::Z16
 
+// ==================== Reconnect Backoff / Retry Limits ====================
+// Rationale: repeatedly opening / S_FMT-ing a device that is in a bad state
+// (e.g. a composite UVC+NCM gadget that is warm-restarting) generates a USB
+// transaction storm that can wedge the whole xhci controller. We therefore
+// back off exponentially between reconnect attempts and cap the number of
+// consecutive failures so a dead device cannot keep hammering the bus forever.
+#define RECONNECT_BACKOFF_BASE_MS 1000   // first retry delay
+#define RECONNECT_BACKOFF_MAX_MS  30000  // delay ceiling (exponential, capped)
+// Max consecutive failed reconnect attempts before a thread stops actively
+// reconnecting and idles at the ceiling interval (set to 0 to retry forever).
+// After the limit is hit the thread no longer generates fast USB traffic, but
+// still wakes periodically so a recovered device can be picked back up.
+#define RECONNECT_MAX_ATTEMPTS    30
+
+static bool g_com_initialized_by_sdk = false;
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 class FFmpegVideoSource;
 class HidDevice;
 
-// 全局上下�?
 struct sdk_ctx_t {
-    // 视频�?
+    insight9_config_t config;
     FFmpegVideoSource* videos[CAM_NUM];
-    // HID
     HidDevice* hidDevs[HID_NUM];
-    // 扩展单元
     viewer::ExtensionUnitControl *xu;
-    // 线程
     std::thread videoThreads[CAM_NUM];
     std::thread hidThreads[HID_NUM];
     std::atomic<bool> running;
-    // 回调
+    std::atomic<bool> cam_running[CAM_NUM];
     image_callback imgCb = nullptr;
     void* imgUser = nullptr;
     imu_callback imuCb = nullptr;
     void* imuUser = nullptr;
     vio_callback vioCb = nullptr;
     void* vioUser = nullptr;
-    // 设备路径缓存
     std::string videoPaths[CAM_NUM];
     std::string hidPaths[HID_NUM];
-    // 同步
     std::mutex imgMutex;
     std::mutex imuMutex;
     std::mutex vioMutex;
-    // 初始化标�?
     bool initialized = false;
     uint64_t last_img_timestamp[CAM_NUM] = {0};
 } g_ctx;
 
 std::string getDirectShowDeviceName(const std::string& devicePath) {
-    // 枚举所有 DirectShow 视频设备，找到匹配的
     ICreateDevEnum* pDevEnum = nullptr;
     IEnumMoniker* pEnum = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER, 
@@ -126,14 +127,12 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
             VARIANT var;
             VariantInit(&var);
             
-            // 获取设备路径
             hr = pPropBag->Read(L"DevicePath", &var, 0);
             if (SUCCEEDED(hr) && var.vt == VT_BSTR) {
                 std::wstring wpath = var.bstrVal;
                 std::string path(wpath.begin(), wpath.end());
                 
                 if (path == devicePath) {
-                    // 找到匹配的设备，获取友好名称
                     VariantClear(&var);
                     VariantInit(&var);
                     hr = pPropBag->Read(L"FriendlyName", &var, 0);
@@ -160,7 +159,6 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
     return "";
 }
 
-// 辅助函数：通过 VID/PID 枚举 DirectShow 视频设备路径
 static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     std::vector<std::string> paths;
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -188,13 +186,15 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
                     std::string lower = path;
                     for (char& c : lower) c = tolower(c);
                     
-                    // 必须同时包含 VID 和 PID
                     if (lower.find(vidStr) != std::string::npos && 
                         lower.find(pidStr) != std::string::npos) {
-                        // 还要确保是需要的接口号
-                        if (lower.find("mi_04") != std::string::npos ||  // RGB
-                            lower.find("mi_06") != std::string::npos ||  // GREY
-                            lower.find("mi_08") != std::string::npos) {  // Depth
+                        
+                        std::regex mi_pattern(R"(mi_(\d+))", std::regex::icase);
+                        std::smatch match;
+                        if (std::regex_search(lower, match, mi_pattern)) {
+                            paths.push_back(path);
+                        }
+                        else {
                             paths.push_back(path);
                         }
                     }
@@ -208,27 +208,46 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     }
     pDevEnum->Release();
     if (SUCCEEDED(hr)) CoUninitialize();
-    // 按设备编号排序（简单按字符串）
-    std::sort(paths.begin(), paths.end());
+    std::sort(paths.begin(), paths.end(), [](const std::string& a, const std::string& b) {
+        std::regex pattern(R"(mi_(\d+))", std::regex::icase);
+        std::smatch match_a, match_b;
+        
+        int num_a = 999, num_b = 999;
+        if (std::regex_search(a, match_a, pattern)) {
+            num_a = std::stoi(match_a[1].str());
+        }
+        if (std::regex_search(b, match_b, pattern)) {
+            num_b = std::stoi(match_b[1].str());
+        }
+        return num_a < num_b;
+    });
+    
     return paths;
 }
 
-// 通过 VID/PID 枚举 HID 设备（指定接口）
-static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid, int interfaceNum) {
+static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid) {
     std::vector<std::string> paths;
     struct hid_device_info *devs, *cur;
     devs = hid_enumerate(vid, pid);
+    
+    std::map<int, std::string> interfaceMap;
     for (cur = devs; cur; cur = cur->next) {
-        if (cur->interface_number == interfaceNum) {
-            paths.push_back(cur->path);
+        if (cur->interface_number >= 0) {
+            printf("[HID] Interface %d: %s\n", cur->interface_number, cur->path);
+            interfaceMap[cur->interface_number] = cur->path;
         }
     }
     hid_free_enumeration(devs);
+    
+    for (std::map<int, std::string>::iterator it = interfaceMap.begin(); 
+         it != interfaceMap.end(); ++it) {
+        paths.push_back(it->second);
+    }
+    
     return paths;
 }
 
 void refreshVideoDevicePath(int camId) {
-    // 重新枚举 UVC 设备
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
     if (camId < (int)uvcPaths.size()) {
         g_ctx.videoPaths[camId] = uvcPaths[camId];
@@ -236,7 +255,6 @@ void refreshVideoDevicePath(int camId) {
     }
 }
 
-// ========== FFmpegVideoSource 简化实现（只取流，不解码，直接输出原始数据�?==========
 class FFmpegVideoSource {
 public:
     bool open(const std::string& devicePath, int deviceIndex, int width, int height, PixelFormat fmt, int fps) {
@@ -247,13 +265,19 @@ public:
         height_ = height;
         format_ = fmt;
         fps_ = fps;
-        return true; // 实际打开�?start �?
+        return true;
     }
     void close() {
-        if (fmtCtx_) avformat_close_input(&fmtCtx_);
-        if (packet_) av_packet_free(&packet_);
-        fmtCtx_ = nullptr;
-        packet_ = nullptr;
+        if (fmtCtx_) {
+            avformat_close_input(&fmtCtx_);
+            fmtCtx_ = nullptr;
+        }
+
+        if (packet_) {
+            av_packet_free(&packet_);
+            packet_ = nullptr;
+        }
+
         running_ = false;
     }
     bool start() {
@@ -265,7 +289,6 @@ public:
             return false;
         }
         
-        // 从设备路径获取 DirectShow 设备名称
         std::string deviceName = getDirectShowDeviceName(devicePath_);
         if (deviceName.empty()) {
             // fprintf(stderr, "[FFmpegVideoSource] Cannot find DirectShow device name for path: %s\n", devicePath_.c_str());
@@ -280,9 +303,10 @@ public:
         char fpsStr[16];
         snprintf(sizeStr, sizeof(sizeStr), "%dx%d", width_, height_);
         snprintf(fpsStr, sizeof(fpsStr), "%d", fps_);
+        printf("[FFmpegVideoSource] Video option %dx%d %dfps\n", width_, height_, fps_);
         av_dict_set(&opts, "video_size", sizeStr, 0);
         av_dict_set(&opts, "framerate", fpsStr, 0);
-        av_dict_set(&opts, "rtbufsize", "50M", 0);
+        av_dict_set(&opts, "rtbufsize", "100M", 0);
         
         const AVInputFormat* ifmt = av_find_input_format("dshow");
         fmtCtx_ = avformat_alloc_context();
@@ -349,7 +373,6 @@ public:
             return false;
         }
 
-        // 拷贝数据到新分配的内存
         uint8_t* copy = new uint8_t[packet_->size];
         memcpy(copy, packet_->data, packet_->size);
         data = copy;
@@ -358,7 +381,6 @@ public:
         height = height_;
         fmt = format_;
 
-        // 提取时间戳（从拷贝后的数据中）
         ts = 0;
         tsRight = 0;
         if (format_ == PixelFormat::MJPEG) {
@@ -405,7 +427,6 @@ private:
     std::atomic<bool>* runningPtr_ = nullptr;
 };
 
-// ========== HidDevice 简单封�?==========
 class HidDevice {
 public:
     bool open(const std::string& path) {
@@ -433,24 +454,21 @@ private:
 
 int FFmpegVideoSource::interruptCallback(void* ctx) {
     FFmpegVideoSource* self = static_cast<FFmpegVideoSource*>(ctx);
-    // 如果 running_ 被设为 false，返回 1 表示中断操作
-    return (self->runningPtr_ && !(*self->runningPtr_)) ? 1 : 0;
+    return self->running_ ? 0 : 1;
 }
 
-// 视频线程入口
 static void videoThreadFunc(int camId) {
     auto* src = g_ctx.videos[camId];
     if (!src) return;
 
     uint64_t& last_ts = g_ctx.last_img_timestamp[camId];
     
-    // 状态变量
     bool need_reconnect = false;
     auto last_reconnect_attempt = std::chrono::steady_clock::now();
     auto last_success_time = std::chrono::steady_clock::now();
     bool first_frame_received = false;
 
-    while (g_ctx.running) {
+    while (g_ctx.cam_running[camId]) {
         uint8_t* data = nullptr;
         size_t size = 0;
         int w = 0, h = 0;
@@ -458,10 +476,9 @@ static void videoThreadFunc(int camId) {
         uint64_t ts = 0, tsRight = 0;
 
         if (!src->pollFrame(data, size, w, h, fmt, ts, tsRight)) {
-            if (!g_ctx.running) break;
+            if (!g_ctx.cam_running[camId]) break;
             
             auto now = std::chrono::steady_clock::now();
-            // 如果已经收到过第一帧，但超过3秒没有新数据，触发重连
             if (first_frame_received && (now - last_success_time > std::chrono::seconds(3))) {
                 need_reconnect = true;
             }
@@ -469,74 +486,79 @@ static void videoThreadFunc(int camId) {
             continue;
         }
 
-        // 收到数据
         if (!first_frame_received) {
             first_frame_received = true;
             printf("[SDK] Camera %d received first frame\n", camId);
         }
         last_success_time = std::chrono::steady_clock::now();
 
-        // 有效性过滤
-        bool shouldCallCallback = true;
-        if (data == nullptr || size == 0) shouldCallCallback = false;
-        else if (ts == 0) shouldCallCallback = false;
-        else if (ts == last_ts) shouldCallCallback = false;
-        else last_ts = ts;
-
-        // 准备回调使用的缓冲区（默认使用原始数据）
         uint8_t* callbackData = data;
         size_t callbackSize = size;
-        bool customAllocated = false;   // 是否分配了新的缓冲区
+        bool customAllocated = false;
+        uint64_t finalTs = ts;
+        uint64_t finalTsRight = tsRight;
 
-        // MJPEG 格式：尝试移除 APP1 段
-        if (shouldCallCallback && fmt == PixelFormat::MJPEG && size >= 4) {
-            if (data[0] == 0xFF && data[1] == 0xD8 && size > 4) {
-                size_t pos = 2;
-                while (pos + 1 < size) {
-                    if (data[pos] == 0xFF && data[pos+1] == 0xE1) {
-                        if (pos + 3 < size) {
-                            uint16_t segLen = (data[pos+2] << 8) | data[pos+3];
-                            size_t appTotal = 2 + segLen;   // marker(2) + length(2) + data
-                            if (pos + appTotal <= size) {
-                                // 新缓冲区：SOI (0xFF 0xD8) + APP1 之后的数据
-                                uint8_t* remaining = data + pos + appTotal;
-                                size_t remainingSize = size - (pos + appTotal);
-                                uint8_t* newBuf = new uint8_t[2 + remainingSize];
-                                newBuf[0] = 0xFF;
-                                newBuf[1] = 0xD8;
-                                memcpy(newBuf + 2, remaining, remainingSize);
-                                callbackData = newBuf;
-                                callbackSize = 2 + remainingSize;
-                                customAllocated = true;
-                                break;
+        if (fmt == PixelFormat::MJPEG && size >= 4 && data[0] == 0xFF && data[1] == 0xD8) {
+            size_t pos = 2;
+            bool foundApp1 = false;
+            
+            while (pos + 3 < size) {
+                if (data[pos] == 0xFF && data[pos+1] == 0xE1) {
+                    uint16_t segLen = (data[pos+2] << 8) | data[pos+3];
+                    size_t appTotal = 2 + segLen;
+                    
+                    if (pos + appTotal <= size) {
+                        if (appTotal >= 2 + 4 + sizeof(uint64_t) &&
+                            data[pos + 4] == 'T' && data[pos + 5] == 'S' &&
+                            data[pos + 6] == '_' && data[pos + 7] == '_') {
+                            
+                            size_t remainingSize = size - (pos + appTotal);
+                            uint8_t* newBuf = new uint8_t[2 + remainingSize];
+                            newBuf[0] = 0xFF;
+                            newBuf[1] = 0xD8;
+                            if (remainingSize > 0) {
+                                memcpy(newBuf + 2, data + pos + appTotal, remainingSize);
                             }
+                            
+                            callbackData = newBuf;
+                            callbackSize = 2 + remainingSize;
+                            customAllocated = true;
+                            foundApp1 = true;
+                            
+                            break;
                         }
-                        break;
                     }
+                    pos += appTotal;
+                } else {
                     pos++;
                 }
             }
         }
 
-        // 调用回调（如果有效）
+        bool shouldCallCallback = true;
+        if (callbackData == nullptr || callbackSize == 0) shouldCallCallback = false;
+        else if (finalTs == 0) shouldCallCallback = false;
+        else if (finalTs == last_ts) shouldCallCallback = false;
+        else last_ts = finalTs;
+
         if (shouldCallCallback && g_ctx.imgCb) {
             unsigned int v4l2Fmt = 0;
             if (fmt == PixelFormat::MJPEG) v4l2Fmt = 0x47504A4D;
             else if (fmt == PixelFormat::GREY) v4l2Fmt = 0x59455247;
             else if (fmt == PixelFormat::Z16) v4l2Fmt = 0x36315A;
             else if (fmt == PixelFormat::Y8I) v4l2Fmt = 0x49385956;
-            g_ctx.imgCb(camId, callbackData, callbackSize, w, h, v4l2Fmt, ts, tsRight, g_ctx.imgUser);
+            
+            g_ctx.imgCb(camId, callbackData, callbackSize, w, h, v4l2Fmt, 
+                       finalTs, finalTsRight, g_ctx.imgUser);
         }
 
-        // 释放内存：原始 data 始终需要释放；如果分配了新缓冲区，也要释放
         if (customAllocated) {
-            delete[] callbackData;   // 新缓冲区
+            delete[] callbackData;
         }
-        delete[] data;               // 原始缓冲区
+        delete[] data;
     }
 }
 
-// HID 线程入口
 static void hidThreadFunc(int idx) {
     auto* dev = g_ctx.hidDevs[idx];
     if (!dev) return;
@@ -545,7 +567,6 @@ static void hidThreadFunc(int idx) {
         size_t len = sizeof(buf);
         if (dev->read(buf, len)) {
             if (idx == 0 && g_ctx.imuCb) {
-                // 解析 IMU 报告 (6 floats + uint64)
                 if (len >= 32) {
                     float ax, ay, az, gx, gy, gz;
                     uint64_t ts;
@@ -559,7 +580,6 @@ static void hidThreadFunc(int idx) {
                     g_ctx.imuCb(ax, ay, az, gx, gy, gz, ts, g_ctx.imuUser);
                 }
             } else if (idx == 1 && g_ctx.vioCb) {
-                // 解析 VIO 报告 (timestamp + 3pos + 4quat + seq)
                 if (len >= 32) {
                     uint64_t ts; float px, py, pz, qx, qy, qz, qw;
                     memcpy(&ts, buf, 8);
@@ -579,46 +599,70 @@ static void hidThreadFunc(int idx) {
     }
 }
 
-// SDK API 实现
-int insight9_receive_init() {
-    if (g_ctx.initialized) return -1;
+int insight9_receive_init(const insight9_config_t* config) {
+    if (g_ctx.initialized) {
+        fprintf(stderr, "[SDK] Already initialized\n");
+        return -1;
+    }
 
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE) {
-        fprintf(stderr, "[SDK] CoInitializeEx failed, hr=0x%08lx\n", hr);
+    if (!config) {
+        fprintf(stderr, "[SDK] Config is NULL, using default\n");
+        return insight9_receive_init_default();
+    }
+
+    if (config->rgb_config.width <= 0 || config->rgb_config.height <= 0 ||
+        config->gray_config.width <= 0 || config->gray_config.height <= 0 ||
+        config->depth_config.width <= 0 || config->depth_config.height <= 0) {
+        fprintf(stderr, "[SDK] Invalid resolution in config\n");
+        return -1;
     }
 
     memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.running = false;
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+    }
+    g_ctx.config = *config;
+
     avdevice_register_all();
     hid_init();
 
-    // 查找 UVC 设备
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
     if (uvcPaths.size() < 3) {
         fprintf(stderr, "[SDK] Need at least 3 UVC devices, found %zu\n", uvcPaths.size());
         return -1;
     }
-    // 按顺序取前三个作为 RGB、Gray、Depth（实际可根据设备描述匹配）
+    
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE) {
+        fprintf(stderr, "[SDK] CoInitializeEx failed, hr=0x%08lx\n", hr);
+        CoUninitialize();
+        return -1;
+    }
+    g_com_initialized_by_sdk = SUCCEEDED(hr) || hr == S_FALSE;
+    fprintf(stderr, "[SDK] COM initialized by SDK (hr=0x%08lx)\n", hr);
+
     for (int i = 0; i < CAM_NUM; ++i) {
         g_ctx.videoPaths[i] = uvcPaths[i];
         g_ctx.videos[i] = new FFmpegVideoSource();
-        int w = (i==0)? MAIN_WIDTH : (i==1)? SUB_WIDTH : DEPTH_WIDTH;
-        int h = (i==0)? MAIN_HEIGHT : (i==1)? SUB_HEIGHT : DEPTH_HEIGHT;
-        PixelFormat fmt = (i==0)? MAIN_FORMAT : (i==1)? SUB_FORMAT : DEPTH_FORMAT;
-        if (!g_ctx.videos[i]->open(uvcPaths[i], i, w, h, fmt, 30)) {
+        int w = (i==0)? config->rgb_config.width : (i==1)? config->gray_config.width : config->depth_config.width;
+        int h = (i==0)? config->rgb_config.height : (i==1)? config->gray_config.height : config->depth_config.height;
+        PixelFormat fmt = (i==0)? config->rgb_config.pixel_format : (i==1)? config->gray_config.pixel_format : config->depth_config.pixel_format;
+        int fps = (i==0)? config->rgb_config.fps : (i==1)? config->gray_config.fps : config->depth_config.fps;
+        if (!g_ctx.videos[i]->open(uvcPaths[i], i, w, h, fmt, fps)) {
             fprintf(stderr, "[SDK] Failed to open video device %d: %s\n", i, uvcPaths[i].c_str());
             return -1;
         }
     }
-    // 查找 HID 设备 (IMU接口0, VIO接口1)
-    auto imuPaths = findHidDevices(VENDOR_ID, PRODUCT_ID, 0);
-    auto vioPaths = findHidDevices(VENDOR_ID, PRODUCT_ID, 1);
-    if (imuPaths.empty() || vioPaths.empty()) {
-        fprintf(stderr, "[SDK] IMU or VIO device not found\n");
+    auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
+    if (hidPaths.size() < 2) {
+        fprintf(stderr, "[SDK] IMU or VIO device not found (found %zu HID devices)\n", hidPaths.size());
         return -1;
     }
-    g_ctx.hidPaths[0] = imuPaths[0];
-    g_ctx.hidPaths[1] = vioPaths[0];
+    g_ctx.hidPaths[0] = hidPaths[0];
+    g_ctx.hidPaths[1] = hidPaths[1];
+    printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
+    printf("[HID] VIO device (interface %d): %s\n", 1, g_ctx.hidPaths[1].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
     g_ctx.hidDevs[1] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
@@ -630,11 +674,121 @@ int insight9_receive_init() {
         return -1;
     }
 
-    // 初始化扩展单元（使用第一个视频设备）
     g_ctx.xu = new viewer::ExtensionUnitControl();
     if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open XU control\n");
         delete g_ctx.xu; g_ctx.xu = nullptr;
+    }
+
+    g_ctx.initialized = true;
+    printf("[SDK] Initialized successfully with config:\n");
+    printf("  RGB: %dx%d@%d, fourcc=0x%08x\n", 
+           config->rgb_config.width, config->rgb_config.height,
+           config->rgb_config.fps, config->rgb_config.pixel_format);
+    printf("  Gray: %dx%d@%d, fourcc=0x%08x\n",
+           config->gray_config.width, config->gray_config.height,
+           config->gray_config.fps, config->gray_config.pixel_format);
+    printf("  Depth: %dx%d@%d, fourcc=0x%08x\n",
+           config->depth_config.width, config->depth_config.height,
+           config->depth_config.fps, config->depth_config.pixel_format);
+    
+    return 0;
+}
+
+int insight9_receive_init_default() {
+    if (g_ctx.initialized) {
+        fprintf(stderr, "[SDK] Already initialized\n");
+        return -1;
+    }
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE) {
+        fprintf(stderr, "[SDK] CoInitializeEx failed, hr=0x%08lx\n", hr);
+        return -1;
+    }
+    g_com_initialized_by_sdk = SUCCEEDED(hr) || hr == S_FALSE;
+    fprintf(stderr, "[SDK] COM initialized by SDK (hr=0x%08lx)\n", hr);
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+    }
+
+    g_ctx.config.rgb_config.width = MAIN_WIDTH;
+    g_ctx.config.rgb_config.height = MAIN_HEIGHT;
+    g_ctx.config.rgb_config.fps = 30;
+    g_ctx.config.rgb_config.pixel_format = MAIN_FORMAT;
+    
+    g_ctx.config.gray_config.width = SUB_WIDTH;
+    g_ctx.config.gray_config.height = SUB_HEIGHT;
+    g_ctx.config.gray_config.fps = 30;
+    g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
+    
+    g_ctx.config.depth_config.width = DEPTH_WIDTH;
+    g_ctx.config.depth_config.height = DEPTH_HEIGHT;
+    g_ctx.config.depth_config.fps = 30;
+    g_ctx.config.depth_config.pixel_format = DEPTH_FORMAT;
+
+    avdevice_register_all();
+    hid_init();
+
+    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+    if (uvcPaths.size() < 3) {
+        fprintf(stderr, "[SDK] Need at least 3 UVC devices, found %zu\n", uvcPaths.size());
+        return -1;
+    }
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.videoPaths[i] = uvcPaths[i];
+        g_ctx.videos[i] = new FFmpegVideoSource();
+        int w = (i==0)? MAIN_WIDTH : (i==1)? SUB_WIDTH : DEPTH_WIDTH;
+        int h = (i==0)? MAIN_HEIGHT : (i==1)? SUB_HEIGHT : DEPTH_HEIGHT;
+        PixelFormat fmt = (i==0)? MAIN_FORMAT : (i==1)? SUB_FORMAT : DEPTH_FORMAT;
+        if (!g_ctx.videos[i]->open(uvcPaths[i], i, w, h, fmt, 30)) {
+            fprintf(stderr, "[SDK] Failed to open video device %d: %s\n", i, uvcPaths[i].c_str());
+            return -1;
+        }
+    }
+    auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
+    if (hidPaths.size() < 2) {
+        fprintf(stderr, "[SDK] IMU or VIO device not found (found %zu HID devices)\n", hidPaths.size());
+        return -1;
+    }
+    g_ctx.hidPaths[0] = hidPaths[0];
+    g_ctx.hidPaths[1] = hidPaths[1];
+    printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
+    printf("[HID] VIO device (interface %d): %s\n", 1, g_ctx.hidPaths[1].c_str());
+    g_ctx.hidDevs[0] = new HidDevice();
+    g_ctx.hidDevs[1] = new HidDevice();
+    if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
+        fprintf(stderr, "[SDK] Failed to open IMU HID\n");
+        return -1;
+    }
+    if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
+        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+        return -1;
+    }
+
+    g_ctx.xu = new viewer::ExtensionUnitControl();
+    if (g_ctx.xu->open(g_ctx.videoPaths[0])) {
+        printf("[SDK] XU control opened, reading current FPS...\n");
+        
+        uint8_t fpsIndex = 0;
+        if (g_ctx.xu->readCurrentFps(fpsIndex)) {
+            const int validFps[] = {0, 20, 30, 40, 50};
+            if (fpsIndex >= 0 && fpsIndex < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+                int currentFps = validFps[fpsIndex];
+                if (currentFps > 0) {
+                    g_ctx.config.gray_config.fps = currentFps;
+                    printf("[SDK] Read current Gray FPS from device: %d (index: %d)\n", currentFps, fpsIndex);
+                }
+            }
+        } else {
+            printf("[SDK] Failed to read current FPS, using default\n");
+        }
+    } else {
+        fprintf(stderr, "[SDK] Failed to open XU control, using default FPS\n");
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
     }
 
     g_ctx.initialized = true;
@@ -644,22 +798,149 @@ int insight9_receive_init() {
 int insight9_receive_start() {
     if (!g_ctx.initialized || g_ctx.running) return -1;
     g_ctx.running = true;
+    
     for (int i = 0; i < CAM_NUM; ++i) {
-        if (g_ctx.videos[i]) {
-            g_ctx.videos[i]->start();
-            g_ctx.videoThreads[i] = std::thread(videoThreadFunc, i);
-        }
+        insight9_receive_start_camera(i);
     }
+    
     for (int i = 0; i < HID_NUM; ++i) {
         g_ctx.hidThreads[i] = std::thread(hidThreadFunc, i);
     }
     return 0;
 }
 
+const char* insight9_receive_get_video_dev(int cam_id) {
+    return (cam_id >=0 && cam_id < CAM_NUM) ? g_ctx.videoPaths[cam_id].c_str() : nullptr;
+}
+
+int insight9_receive_start_camera(int cam_id) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (g_ctx.cam_running[cam_id]) return 0;
+    
+    if (!g_ctx.videos[cam_id]) {
+        auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+        if (cam_id >= (int)uvcPaths.size()) return -1;
+        
+        g_ctx.videoPaths[cam_id] = uvcPaths[cam_id];
+        g_ctx.videos[cam_id] = new FFmpegVideoSource();
+        
+        int w = (cam_id==0)? g_ctx.config.rgb_config.width : 
+                (cam_id==1)? g_ctx.config.gray_config.width : 
+                            g_ctx.config.depth_config.width;
+        int h = (cam_id==0)? g_ctx.config.rgb_config.height : 
+                (cam_id==1)? g_ctx.config.gray_config.height : 
+                            g_ctx.config.depth_config.height;
+        PixelFormat fmt = (cam_id==0)? g_ctx.config.rgb_config.pixel_format : 
+                           (cam_id==1)? g_ctx.config.gray_config.pixel_format : 
+                                        g_ctx.config.depth_config.pixel_format;
+        int fps = (cam_id==0)? g_ctx.config.rgb_config.fps : 
+                   (cam_id==1)? g_ctx.config.gray_config.fps : 
+                                g_ctx.config.depth_config.fps;
+        
+        if (!g_ctx.videos[cam_id]->open(uvcPaths[cam_id], cam_id, w, h, fmt, fps)) {
+            delete g_ctx.videos[cam_id];
+            g_ctx.videos[cam_id] = nullptr;
+            return -1;
+        }
+    }
+    
+    g_ctx.cam_running[cam_id] = true;
+    g_ctx.videos[cam_id]->start();
+    
+    if (g_ctx.videoThreads[cam_id].joinable()) {
+        g_ctx.videoThreads[cam_id].join();
+    }
+    g_ctx.videoThreads[cam_id] = std::thread(videoThreadFunc, cam_id);
+    
+    return 0;
+}
+
+void insight9_receive_stop_camera(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return;
+    
+    g_ctx.cam_running[cam_id] = false;
+    
+    if (g_ctx.videos[cam_id]) {
+        g_ctx.videos[cam_id]->stop();
+    }
+    
+    if (g_ctx.videoThreads[cam_id].joinable()) {
+        g_ctx.videoThreads[cam_id].join();
+    }
+}
+
+int insight9_receive_restart_camera(int cam_id) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    
+    insight9_receive_stop_camera(cam_id);
+    
+    delete g_ctx.videos[cam_id];
+    g_ctx.videos[cam_id] = nullptr;
+    
+    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+    if (cam_id >= (int)uvcPaths.size()) {
+        fprintf(stderr, "[SDK] Camera %d not found during restart\n", cam_id);
+        return -1;
+    }
+
+    int w = (cam_id==0)? g_ctx.config.rgb_config.width : 
+            (cam_id==1)? g_ctx.config.gray_config.width : 
+                        g_ctx.config.depth_config.width;
+    int h = (cam_id==0)? g_ctx.config.rgb_config.height : 
+            (cam_id==1)? g_ctx.config.gray_config.height : 
+                        g_ctx.config.depth_config.height;
+    PixelFormat fmt = (cam_id==0)? g_ctx.config.rgb_config.pixel_format : 
+                       (cam_id==1)? g_ctx.config.gray_config.pixel_format : 
+                                    g_ctx.config.depth_config.pixel_format;
+    int fps = (cam_id==0)? g_ctx.config.rgb_config.fps : 
+               (cam_id==1)? g_ctx.config.gray_config.fps : 
+                            g_ctx.config.depth_config.fps;
+    
+    g_ctx.videos[cam_id] = new FFmpegVideoSource();
+    if (!g_ctx.videos[cam_id]->open(uvcPaths[cam_id], cam_id, w, h, fmt, fps)) {
+        delete g_ctx.videos[cam_id];
+        g_ctx.videos[cam_id] = nullptr;
+        return -1;
+    }
+    
+    return insight9_receive_start_camera(cam_id);
+}
+
+int insight9_receive_switch_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM || fps <= 0) return -1;
+
+    printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
+
+    insight9_receive_stop_camera(cam_id);
+    Sleep(3000);
+
+    if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
+        fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
+        return -1;
+    }
+
+    int ret = insight9_receive_restart_camera(cam_id);
+    if (ret == 0) {
+        printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, fps);
+    } else {
+        fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
+    }
+    return ret;
+}
+
+int insight9_receive_is_camera_running(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
+    return g_ctx.cam_running[cam_id] ? 1 : 0;
+}
+
 void insight9_receive_stop() {
     if (!g_ctx.running) return;
     g_ctx.running = false;
-     for (int i = 0; i < CAM_NUM; ++i) {
+    
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
         if (g_ctx.videos[i]) g_ctx.videos[i]->stop();
     }
     for (int i = 0; i < CAM_NUM; ++i) {
@@ -672,26 +953,60 @@ void insight9_receive_stop() {
 
 void insight9_receive_cleanup() {
     insight9_receive_stop();
+
+    fprintf(stderr, "[SDK] Cleaning up resources...\n");
     for (int i = 0; i < CAM_NUM; ++i) {
-        delete g_ctx.videos[i]; g_ctx.videos[i] = nullptr;
+        if (g_ctx.videos[i]) {
+            g_ctx.videos[i]->stop();
+            delete g_ctx.videos[i];
+            g_ctx.videos[i] = nullptr;
+        }
     }
     for (int i = 0; i < HID_NUM; ++i) {
-        if (g_ctx.hidDevs[i]) g_ctx.hidDevs[i]->close();
-        delete g_ctx.hidDevs[i];
+        if (g_ctx.hidDevs[i]) {
+            g_ctx.hidDevs[i]->close();
+            delete g_ctx.hidDevs[i];
+            g_ctx.hidDevs[i] = nullptr;
+        }
     }
-    delete g_ctx.xu;
+    if (g_ctx.xu) {
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
+    }
+    
     g_ctx.initialized = false;
+    g_ctx.running = false;
+    for (int i = 0; i < CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+    }
+    
     hid_exit();
-
-    CoUninitialize();
+    
+    if (g_com_initialized_by_sdk) {
+        fprintf(stderr, "[SDK] Uninitializing COM...\n");
+        CoUninitialize();
+        g_com_initialized_by_sdk = false;
+    }
+    
+    fprintf(stderr, "[SDK] Cleanup complete\n");
 }
 
-// 其余 API 实现（大部分转发�?g_ctx.xu 或返回默认值）
-const char* insight9_receive_get_video_dev(int cam_id) {
-    return (cam_id >=0 && cam_id < CAM_NUM) ? g_ctx.videoPaths[cam_id].c_str() : nullptr;
+int insight9_receive_set_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.fps = fps;
+        printf("[SDK] Set RGB FPS to %d\n", fps);
+    } else if (cam_id == 1) {
+        g_ctx.config.gray_config.fps = fps;
+        printf("[SDK] Set Gray FPS to %d\n", fps);
+    } else if (cam_id == 2) {
+        g_ctx.config.depth_config.fps = fps;
+        printf("[SDK] Set Depth FPS to %d\n", fps);
+    }
+    return 0;
 }
-const char* insight9_receive_get_metadata_dev(int) { return nullptr; }
-int insight9_receive_read_metadata_timestamp(int, uint64_t*) { return -1; }
+
 void insight9_receive_register_image_callback(image_callback cb, void *user) { g_ctx.imgCb = cb; g_ctx.imgUser = user; }
 void insight9_receive_register_imu_callback(imu_callback cb, void *user) { g_ctx.imuCb = cb; g_ctx.imuUser = user; }
 void insight9_receive_register_vio_callback(vio_callback cb, void *user) { g_ctx.vioCb = cb; g_ctx.vioUser = user; }
@@ -700,6 +1015,7 @@ int insight9_receive_set_active_camera(int cam_id) {
     if (!g_ctx.xu) return -1;
     return g_ctx.xu->setActiveCamera((uint8_t)cam_id) ? 0 : -1;
 }
+
 int insight9_receive_get_active_camera(int *cam_id) {
     if (!g_ctx.xu || !cam_id) return -1;
     uint8_t val;
@@ -707,12 +1023,14 @@ int insight9_receive_get_active_camera(int *cam_id) {
     *cam_id = val;
     return 0;
 }
+
 int insight9_receive_set_camera_params(const camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
     return g_ctx.xu->writeCurrentCameraParams(xuParams) ? 0 : -1;
 }
+
 int insight9_receive_get_camera_params(camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
@@ -720,12 +1038,14 @@ int insight9_receive_get_camera_params(camera_params *params) {
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
+
 int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
     return g_ctx.xu->writeCameraParams((uint8_t)cam_id, xuParams) ? 0 : -1;
 }
+
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
     viewer::camera_params xuParams;
@@ -733,12 +1053,209 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
-int insight9_receive_reset_camera_params(int) { return -1; }
-void insight9_receive_print_camera_params(const camera_params *p) { /* 打印 */ }
+
+
+int insight9_receive_reset_camera_params(int) { 
+   // Reading factory defaults from the device requires additional implementation. A simple approach is to read
+   // and save the current values during initialization, then write them back when a reset is needed.
+   fprintf(stderr, "[XU][ERR] reset_camera_params not implemented, use set_camera_params with saved defaults\n");
+   return -1;
+}
+
+void insight9_receive_print_camera_params(const camera_params *params) {
+    if (!params) return;
+    viewer::camera_params xu_params;
+    memcpy(&xu_params, params, sizeof(viewer::camera_params));
+    viewer::printParams(xu_params);
+}
+
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib) {
+    if (!g_ctx.xu || !calib) return -1;
+    if (cam_idx < 0 || cam_idx >= viewer::kCalibCamCount) return -1;
+    
+    viewer::camera_calib xu_calib;
+    if (!g_ctx.xu->readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib)) {
+        return -1;
+    }
+    memcpy(calib, &xu_calib, sizeof(camera_calib));
+    return 0;
+}
+
+void insight9_receive_print_camera_calib(const camera_calib *calib) {
+    if (!calib) return;
+    viewer::camera_calib xu_calib;
+    memcpy(&xu_calib, calib, sizeof(viewer::camera_calib));
+    viewer::printCalib(xu_calib);
+}
+
+// ==================== Depth Alignment Functions ====================
+
+// Rasterize one triangle into the aligned-depth output, interpolating the RGB-
+// frame depth across it with a nearest-surface z-buffer. Vertices are given as
+// projected RGB pixel coords (x,y, float) plus their RGB-frame depth z (mm).
+static inline void align_raster_triangle(uint16_t *out, int W, int H,
+                                         float x0, float y0, float z0,
+                                         float x1, float y1, float z1,
+                                         float x2, float y2, float z2) {
+    int minx = (int)floorf(fminf(x0, fminf(x1, x2)));
+    int maxx = (int)ceilf(fmaxf(x0, fmaxf(x1, x2)));
+    int miny = (int)floorf(fminf(y0, fminf(y1, y2)));
+    int maxy = (int)ceilf(fmaxf(y0, fmaxf(y1, y2)));
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx > W - 1) maxx = W - 1;
+    if (maxy > H - 1) maxy = H - 1;
+    if (minx > maxx || miny > maxy) return;
+
+    float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (fabsf(area) < 1e-6f) return;          // degenerate
+    float inv_area = 1.0f / area;
+
+    for (int py = miny; py <= maxy; py++) {
+        for (int px = minx; px <= maxx; px++) {
+            float fx = px + 0.5f, fy = py + 0.5f;
+            // Barycentric weights via edge cross-products (same winding as area).
+            float w0 = (x1 - fx) * (y2 - fy) - (x2 - fx) * (y1 - fy);
+            float w1 = (x2 - fx) * (y0 - fy) - (x0 - fx) * (y2 - fy);
+            float w2 = (x0 - fx) * (y1 - fy) - (x1 - fx) * (y0 - fy);
+            bool inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) ||
+                          (w0 <= 0 && w1 <= 0 && w2 <= 0);
+            if (!inside) continue;
+
+            float z = (w0 * z0 + w1 * z1 + w2 * z2) * inv_area;
+            if (z <= 0.0f) continue;
+            uint16_t zq = (z > 65535.0f) ? 65535 : (uint16_t)(z + 0.5f);
+            uint16_t *dst = &out[(size_t)py * W + px];
+            if (*dst == 0 || zq < *dst) *dst = zq;
+        }
+    }
+}
+
+int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
+                                        int depth_w, int depth_h,
+                                        const camera_calib *left_calib,
+                                        const camera_calib *rgb_calib,
+                                        uint16_t *aligned_out,
+                                        int rgb_w, int rgb_h) {
+    if (!depth || !left_calib || !rgb_calib || !aligned_out ||
+        depth_w <= 0 || depth_h <= 0 || rgb_w <= 0 || rgb_h <= 0) {
+        return -1;
+    }
+
+    // Start with all-invalid (0) output.
+    memset(aligned_out, 0, (size_t)rgb_w * rgb_h * sizeof(uint16_t));
+
+    // Intrinsics (row-major k = [fx 0 cx; 0 fy cy; 0 0 1]). Streams are
+    // rectified (p == k), so no distortion is applied.
+    const double dfx = left_calib->intrinsics.k[0];
+    const double dfy = left_calib->intrinsics.k[4];
+    const double dcx = left_calib->intrinsics.k[2];
+    const double dcy = left_calib->intrinsics.k[5];
+    const double rfx = rgb_calib->intrinsics.k[0];
+    const double rfy = rgb_calib->intrinsics.k[4];
+    const double rcx = rgb_calib->intrinsics.k[2];
+    const double rcy = rgb_calib->intrinsics.k[5];
+    if (dfx == 0.0 || dfy == 0.0) return -1;
+
+    // RGB extrinsic: parent=camera_camera_left, child=camera_camera_rgb. In ROS
+    // convention (t, q) maps a point rgb->left: p_left = R*p_rgb + t. We need
+    // left->rgb, i.e. the inverse: p_rgb = R^T * (p_left - t).
+    const double *q = rgb_calib->extrinsics.rotation;     // x, y, z, w
+    const double *t = rgb_calib->extrinsics.translation;  // meters
+    const double qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+    const double R00 = 1 - 2*(qy*qy + qz*qz);
+    const double R01 = 2*(qx*qy - qz*qw);
+    const double R02 = 2*(qx*qz + qy*qw);
+    const double R10 = 2*(qx*qy + qz*qw);
+    const double R11 = 1 - 2*(qx*qx + qz*qz);
+    const double R12 = 2*(qy*qz - qx*qw);
+    const double R20 = 2*(qx*qz - qy*qw);
+    const double R21 = 2*(qy*qz + qx*qw);
+    const double R22 = 1 - 2*(qx*qx + qy*qy);
+    const double tx = t[0] * 1000.0, ty = t[1] * 1000.0, tz = t[2] * 1000.0;
+
+    // Pass 1: project every depth pixel to RGB pixel coords + RGB-frame depth.
+    // The depth grid is treated as a mesh; these are its vertices.
+    const size_t n = (size_t)depth_w * depth_h;
+    std::vector<float>   VX(n), VY(n), VZ(n);
+    std::vector<uint8_t> OK(n, 0);
+    for (int v = 0; v < depth_h; v++) {
+        const uint16_t *row = depth + (size_t)v * depth_w;
+        for (int u = 0; u < depth_w; u++) {
+            size_t i = (size_t)v * depth_w + u;
+            uint16_t d = row[u];
+            if (d == 0) continue;              // no measurement
+
+            // Deproject to the LEFT frame (mm), then left -> rgb: R^T*(p - t).
+            double z = (double)d;
+            double x = (u - dcx) * z / dfx;
+            double y = (v - dcy) * z / dfy;
+            double ax = x - tx, ay = y - ty, az = z - tz;
+            double xr = R00*ax + R10*ay + R20*az;
+            double yr = R01*ax + R11*ay + R21*az;
+            double zr = R02*ax + R12*ay + R22*az;
+            if (zr <= 0.0) continue;           // behind the RGB camera
+
+            VX[i] = (float)(rfx * xr / zr + rcx);
+            VY[i] = (float)(rfy * yr / zr + rcy);
+            VZ[i] = (float)zr;
+            OK[i] = 1;
+        }
+    }
+
+    // Pass 2: rasterize the mesh. Each 2x2 cell -> two triangles. Triangles that
+    // straddle a depth discontinuity (an object edge) are dropped to avoid
+    // "rubber sheet" stretching between foreground and background.
+    const float EDGE_REL = 0.05f;              // max 5% depth jump within a triangle
+    auto emit = [&](size_t a, size_t b, size_t c) {
+        if (!OK[a] || !OK[b] || !OK[c]) return;
+        float za = VZ[a], zb = VZ[b], zc = VZ[c];
+        float zmin = fminf(za, fminf(zb, zc));
+        float zmax = fmaxf(za, fmaxf(zb, zc));
+        if (zmin <= 0.0f || (zmax - zmin) > EDGE_REL * zmin) return;
+        align_raster_triangle(aligned_out, rgb_w, rgb_h,
+                              VX[a], VY[a], za,
+                              VX[b], VY[b], zb,
+                              VX[c], VY[c], zc);
+    };
+    for (int v = 0; v + 1 < depth_h; v++) {
+        for (int u = 0; u + 1 < depth_w; u++) {
+            size_t i00 = (size_t)v * depth_w + u;
+            size_t i10 = i00 + 1;
+            size_t i01 = i00 + depth_w;
+            size_t i11 = i01 + 1;
+            emit(i00, i10, i11);
+            emit(i00, i11, i01);
+        }
+    }
+    return 0;
+}
+
+int insight9_receive_get_current_fps(int* fps) {
+    if (!g_ctx.xu || !fps) return -1;
+    uint8_t val;
+    if (!g_ctx.xu->readCurrentFps(val)) return -1;
+    const int validFps[] = {0, 20, 30, 40, 50};
+    if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+        *fps = validFps[val];
+    } else {
+        *fps = 0;
+    }
+    return 0;
+}
+
+int insight9_receive_get_vio_status(int* status) {
+    if (!g_ctx.xu || !status) return -1;
+    uint8_t val;
+    if (!g_ctx.xu->readVioStatus(val)) return -1;
+    *status = val;
+    return 0;
+}
+
 const char* insight9_receive_get_hardware_type() {
     static std::string result;
     camera_params params;
-    params.hardware_model = 0xFF; // 默认未知
+    params.hardware_model = 0xFF;
     if (insight9_receive_get_camera_params(&params) == 0) {
         const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
         if (params.hardware_model < 4) {

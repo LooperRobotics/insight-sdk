@@ -3,6 +3,68 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <pthread.h>
+#include <atomic>
+#include "UvcExtensionUnit.hpp"
+
+
+// ==================== Target Device VID/PID ====================
+#define VENDOR_ID  0x3652
+#define PRODUCT_ID 0x0b5c
+
+// ==================== Camera Configuration ====================
+#define CAM_NUM 3
+#define HID_NUM 2
+#define MAIN_WIDTH   1088
+#define MAIN_HEIGHT  1920
+#define MAIN_FORMAT  V4L2_PIX_FMT_MJPEG
+#define SUB_WIDTH    544
+#define SUB_HEIGHT   1281
+#define SUB_FORMAT   V4L2_PIX_FMT_GREY
+#define DEPTH_WIDTH  544
+#define DEPTH_HEIGHT 642
+#define DEPTH_FORMAT V4L2_PIX_FMT_Z16
+#define FRAME_RATE 30
+#define BUFFER_COUNT 8
+#define MAX_PATH 1024
+#define METADATA_SIZE 258
+
+struct buffer {
+    void *start;
+    size_t length;
+};
+
+struct uvc_frame_info {
+    unsigned int width;
+    unsigned int height;
+    unsigned int intervals[8];
+};
+
+struct uvc_format_info {
+    unsigned int fcc;
+    int frames_num;
+    struct uvc_frame_info *frames;
+};
+
+struct cam_ctx {
+    int fd;
+    struct buffer *buffers;
+    int meta_fd;
+    struct buffer *meta_buffers;
+    int meta_buffer_count;
+    int buffer_count;
+    pthread_t tid;
+    int cam_id;
+    int width;
+    int height;
+    int fps;
+    unsigned int format;
+    int format_num;
+    struct uvc_format_info *formats_info;
+    uint64_t last_timestamp;
+    pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
+};
+
 
 #pragma pack(push, 1)
 typedef struct {
@@ -23,7 +85,63 @@ typedef struct {
     uint8_t decimation;         // Decimation (1~255)
     uint8_t hardware_model;     // Hardware model
 } camera_params;
+
+/**
+ * Camera intrinsics, fields aligned with ROS sensor_msgs/CameraInfo.
+ */
+typedef struct {
+    uint32_t sec;               // Calibration timestamp (seconds)
+    uint32_t nsec;              // Calibration timestamp (nanoseconds)
+
+    char frame_id[32];          // Camera frame id
+
+    uint32_t height;            // Calibration image height
+    uint32_t width;             // Calibration image width
+
+    char distortion_model[32];  // e.g. "plumb_bob", "equidistant"
+
+    float d[4];                 // Distortion coefficients
+    float k[9];                 // 3x3 intrinsic matrix, row-major
+    float r[9];                 // 3x3 rectification matrix, row-major
+    float p[12];                // 3x4 projection matrix, row-major
+
+    uint32_t binning_x;
+    uint32_t binning_y;
+
+    uint32_t roi_x_offset;
+    uint32_t roi_y_offset;
+    uint32_t roi_height;
+    uint32_t roi_width;
+
+    uint8_t roi_do_rectify;
+} camera_intrinsics;
+
+/**
+ * Camera extrinsics, one transform from the device /tf_static.
+ */
+typedef struct {
+    char parent_frame_id[32];   // Reference frame
+    char child_frame_id[32];    // This camera frame
+
+    double translation[3];      // x, y, z (m)
+    double rotation[4];         // Quaternion x, y, z, w
+} camera_extrinsics;
+
+/**
+ * Full calibration of one camera: intrinsics + extrinsics.
+ */
+typedef struct {
+    camera_intrinsics intrinsics;
+    camera_extrinsics extrinsics;
+} camera_calib;
 #pragma pack(pop)
+
+/* Camera index for insight9_receive_get_camera_calib(). */
+enum {
+    INSIGHT9_CALIB_CAM_LEFT  = 0,   /* Left grayscale  */
+    INSIGHT9_CALIB_CAM_RIGHT = 1,   /* Right grayscale */
+    INSIGHT9_CALIB_CAM_RGB   = 2,   /* RGB             */
+};
 
 enum class PixelFormat {
     Unknown,
@@ -31,7 +149,9 @@ enum class PixelFormat {
     GREY,
     Z16,
     RGB8,
-    Y8I
+    Y8I,
+    YUYV,
+    NV12
 };
 
 typedef struct {
@@ -47,6 +167,17 @@ typedef struct {
     video_config_t depth_config;
 } insight9_config_t;
 
+// VIO status enumeration, matching the device firmware
+enum class VioStatus : uint8_t {
+    NOT_INITED      = 0,
+    RESTARTING      = 1,
+    STOPPED         = 2,
+    TRACKING        = 3,
+    TRACKING_STATIC = 4,
+    TRACKINGLOST    = 5,
+    DATA_LOST       = 6,
+    Unknown         = 0xFF
+};
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -90,6 +221,38 @@ typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint64_t timestamp, void *userdata);
 
+
+typedef struct {
+    // Cameras
+    struct cam_ctx cams[CAM_NUM];
+    char metadata_devs[CAM_NUM][MAX_PATH];
+    char metadata_usb_paths[CAM_NUM][MAX_PATH];
+    char video_devs[CAM_NUM][MAX_PATH];   // Dynamically resolved video device paths
+    char video_usb_paths[CAM_NUM][MAX_PATH]; // Matching USB root paths, used for rediscovery after reconnect
+    // HID devices (only two are used: 0=IMU, 1=VIO)
+    char hid_devs[HID_NUM][MAX_PATH];           // Dynamically resolved hidraw device paths
+    char hid_usb_paths[HID_NUM][MAX_PATH];   // Matching HID USB root paths, used for rediscovery after reconnect
+    pthread_t hid_tids[HID_NUM];
+    // Callbacks
+    image_callback img_cb;
+    void *img_userdata;
+    imu_callback imu_cb;
+    void *imu_userdata;
+    vio_callback vio_cb;
+    void *vio_userdata;
+    // Running flag
+    std::atomic<bool> running;
+    insight9_config_t config;
+    std::atomic<bool> cam_running[CAM_NUM];
+    pthread_t video_tids[CAM_NUM];
+    struct timespec last_frame_time[CAM_NUM];
+    bool first_frame_received[CAM_NUM];
+    // Initialization flag
+    int initialized;
+    viewer::UvcExtensionUnit *xu_control;
+    std::atomic<bool> xu_ready;
+} sdk_ctx_t;
+
 /**
  * @brief Initialize the SDK with custom configuration.
  * @param config Configuration structure containing resolution, fps, and pixel format for each camera.
@@ -127,21 +290,6 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
 const char *insight9_receive_get_video_dev(int cam_id);
 
 /**
- * @brief Get the metadata device path for the specified camera.
- * @param cam_id Camera index (0..2).
- * @return Device path string, or NULL on failure.
- */
-const char *insight9_receive_get_metadata_dev(int cam_id);
-
-/**
- * @brief Read metadata timestamp from the metadata device.
- * @param cam_id Camera index.
- * @param timestamp Output parameter for the timestamp.
- * @return 0 on success, -1 on failure.
- */
-int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
-
-/**
  * @brief Start a specific camera.
  * @param cam_id Camera ID (0: RGB, 1: Grayscale, 2: Depth).
  * @return 0 on success, -1 on failure.
@@ -171,7 +319,7 @@ int insight9_receive_is_camera_running(int cam_id);
 /**
  * @brief Stop all capture threads.
  */
-void insight9_receive_all_stop(void);
+void insight9_receive_stop(void);
 
 /**
  * @brief Release all resources. Must be called after stopping.
@@ -262,10 +410,72 @@ int insight9_receive_reset_camera_params(int cam_id);
 void insight9_receive_print_camera_params(const camera_params *params);
 
 /**
- * @brief Get the hardware type/model as a string.
+ * @brief Read the intrinsics and extrinsics of the specified camera.
+ * @param cam_idx Camera index: INSIGHT9_CALIB_CAM_LEFT / RIGHT / RGB.
+ * @param calib   Output parameter that receives the calibration data.
+ * @return 0 on success, -1 on failure (e.g. firmware without calibration support).
+ */
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
+
+/**
+ * @brief Print camera calibration data to stdout.
+ * @param calib Pointer to camera_calib.
+ */
+void insight9_receive_print_camera_calib(const camera_calib *calib);
+
+/**
+ * @brief Align a depth image (registered to the LEFT camera) onto the RGB image
+ *        plane, producing a depth map registered to (and the same size as) the
+ *        RGB image.
+ *
+ * The depth stream is the left grayscale camera's depth map, so each depth pixel
+ * is deprojected with the LEFT intrinsics into the left camera frame, transformed
+ * into the RGB frame, then reprojected with the RGB intrinsics. The RGB camera's
+ * extrinsic (parent=camera_camera_left, child=camera_camera_rgb) maps a point
+ * rgb->left, so its inverse is used for left->rgb. Both LEFT and RGB streams are
+ * rectified (p == k), so no lens distortion is applied. The result is a forward
+ * warp with z-buffering (nearest surface wins); RGB pixels with no corresponding
+ * depth sample remain 0 (invalid).
+ *
+ * @param depth       Input depth buffer (uint16, row-major), 1 unit = 1 mm.
+ * @param depth_w     Depth width  (valid rows only; exclude the metadata rows).
+ * @param depth_h     Depth height (valid rows only).
+ * @param left_calib  LEFT camera calibration (its intrinsics deproject depth).
+ * @param rgb_calib   RGB camera calibration (intrinsics + left->rgb extrinsic).
+ * @param aligned_out Output buffer (uint16, row-major), size rgb_w*rgb_h. The
+ *                    caller allocates it; the function clears it to 0 first.
+ * @param rgb_w       Output (RGB) width.  Should match rgb_calib->intrinsics.width.
+ * @param rgb_h       Output (RGB) height. Should match rgb_calib->intrinsics.height.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
+                                        int depth_w, int depth_h,
+                                        const camera_calib *left_calib,
+                                        const camera_calib *rgb_calib,
+                                        uint16_t *aligned_out,
+                                        int rgb_w, int rgb_h);
+
+/**
+ * @brief Get the current frame rate.
+ * @param fps Pointer to store the current frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_current_fps(int* fps);
+
+/**
+ * @brief Get the VIO status.
+ * @param status Pointer to store the VIO status value.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_vio_status(int* status);
+
+/**
+ * @brief Get the hardware type/model as a string. This requires reading the current camera parameters to determine the hardware_model field, which is then mapped to a string.
  * @return Hardware type/model string, or "unknown" on failure.
  */
 const char* insight9_receive_get_hardware_type(void);
+
+int insight9_receive_switch_camera_fps(int cam_id, int fps);
 
 #ifdef __cplusplus
 }

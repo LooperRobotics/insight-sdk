@@ -19,6 +19,8 @@
 #define GYRO_SCALE_LOOPERHUB 0.00106526
 #define ACCEL_SCALE_LOOPERHUB 0.0035913
 
+extern sdk_ctx_t g_ctx;
+
 static void trim_newline(char *str) {
     size_t len = strlen(str);
     if (len > 0 && str[len - 1] == '\n')

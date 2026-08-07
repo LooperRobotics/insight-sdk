@@ -321,20 +321,6 @@ int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
 void insight9_receive_print_camera_calib(const camera_calib *calib);
 
 /**
- * @brief Read the intrinsics and extrinsics of the specified camera.
- * @param cam_idx Camera index: INSIGHT9_CALIB_CAM_LEFT / RIGHT / RGB.
- * @param calib   Output parameter that receives the calibration data.
- * @return 0 on success, -1 on failure (e.g. firmware without calibration support).
- */
-int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
-
-/**
- * @brief Print camera calibration data to stdout.
- * @param calib Pointer to camera_calib.
- */
-void insight9_receive_print_camera_calib(const camera_calib *calib);
-
-/**
  * @brief Align a depth image (registered to the LEFT camera) onto the RGB image
  *        plane, producing a depth map registered to (and the same size as) the
  *        RGB image.

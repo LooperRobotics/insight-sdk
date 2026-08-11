@@ -1285,7 +1285,6 @@ static void *capture_thread(void *arg) {
         }
 
         uint64_t timestamp = read_latest_metadata_timestamp(ctx);
-        uint64_t right_timestamp = 0;
         if (ctx->meta_fd < 0) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
@@ -1328,7 +1327,6 @@ static void *capture_thread(void *arg) {
                          ctx->width, ctx->height,
                          ctx->format,
                          timestamp,
-                         right_timestamp,
                          g_ctx.img_userdata);
         }
 

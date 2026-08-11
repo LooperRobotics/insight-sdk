@@ -234,7 +234,7 @@ static void update_hid_stats(struct hid_stats *s, uint64_t ts) {
 }
 
 void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
-                 unsigned int fmt, uint64_t ts, uint64_t ts_right, void *user) {
+                 unsigned int fmt, uint64_t ts, void *user) {
     if (cam_id < 0 || cam_id >= 3) return;
 
     pthread_mutex_lock(&g_stats_lock);

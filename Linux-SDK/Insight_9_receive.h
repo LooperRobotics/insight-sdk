@@ -130,13 +130,11 @@ extern "C" {
  * @param height    Image height.
  * @param format    V4L2 pixel format, such as V4L2_PIX_FMT_MJPEG or V4L2_PIX_FMT_GREY.
  * @param timestamp Image timestamp in microseconds, provided by the device or system time.
- * @param right_timestamp Right image timestamp in microseconds; valid only for the stereo grayscale camera.
  * @param userdata  User pointer passed when the callback is registered.
  */
 typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
                                int width, int height, unsigned int format,
-                               uint64_t timestamp, uint64_t right_timestamp,
-                               void *userdata);
+                               uint64_t timestamp, void *userdata);
 
 /**
  * @brief IMU data callback.

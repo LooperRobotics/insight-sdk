@@ -21,7 +21,14 @@ static int uvc_control_query(int fd, __u8 unit, __u8 selector,
     xq.query = query;
     xq.size = size;
     xq.data = static_cast<__u8*>(data);
-    return ioctl(fd, UVCIOC_CTRL_QUERY, &xq);
+    int ret = ioctl(fd, UVCIOC_CTRL_QUERY, &xq);
+    if (ret < 0) {
+        printf("ioctl查询失败: %s (errno=%d)\n", strerror(errno), errno);
+        printf("unit:%u cs:%d query:%d\n", unit, selector, query);
+        close(fd);
+        return 1;
+    }
+    return ret;
 }
 
 static int get_selector_len(int fd, __u8 unit, __u8 selector, __u16 *len)

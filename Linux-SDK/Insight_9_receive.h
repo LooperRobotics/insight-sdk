@@ -180,11 +180,36 @@ int insight9_receive_init_default(void);
 int insight9_receive_start(void);
 
 /**
+ * @brief Get current video format for a specific camera device.
+ * @param cam_id Camera ID (0..2).
+ * @param width Output width.
+ * @param height Output height.
+ * @param format Output V4L2 pixel format.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_get_current_format(int cam_id, int *width, int *height, unsigned int *format);
+
+/**
  * @brief Get the video device path for the specified camera.
  * @param cam_id Camera index (0..2).
  * @return Device path string, or NULL on failure.
  */
 const char *insight9_receive_get_video_dev(int cam_id);
+
+/**
+ * @brief Get the metadata device path for the specified camera.
+ * @param cam_id Camera index (0..2).
+ * @return Device path string, or NULL on failure.
+ */
+const char *insight9_receive_get_metadata_dev(int cam_id);
+
+/**
+ * @brief Read metadata timestamp from the metadata device.
+ * @param cam_id Camera index.
+ * @param timestamp Output parameter for the timestamp.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
 
 /**
  * @brief Start a specific camera.

@@ -86,9 +86,15 @@ target_include_directories(Insight9SDK PRIVATE ${FFMPEG_INCLUDE_DIRS})
 target_link_libraries(Insight9SDK PRIVATE
     ${FFMPEG_LIBRARIES}
     ${HIDAPI_TARGET}
-    ole32
     strmiids
-    uuid
+    ole32
+    oleaut32
+    mf
+    mfplat
+    mfreadwrite
+    mfuuid
+    propsys
+    sensorsapi
 )
 
 add_executable(example example.cpp)

@@ -136,12 +136,30 @@ static void ensure_hid_stats_initialized_locked(void) {
 
 static const char* image_format_to_string(unsigned int format) {
     switch (format) {
-        case 0x47504A4D: return "MJPEG";  // 'MJPEG'
+        case 0x47504A4D: return "MJPEG";  // 'MJPG'
         case 0x59455247: return "GREY";   // 'GREY'
         case 0x36315A:   return "Z16";    // 'Z16 '
+        case 0x32595559: return "YUYV";   // 'YUYV'
+        case 0x49385956: return "Y8I";    // 'Y8I '
+        case 0x42475200: return "RGB8";   // 'RGB8'
+        case 0x3231564E: return "NV12";   // 'NV12'
         default: return "UNKNOWN";
     }
 }
+
+static const char* pixel_format_to_string(PixelFormat format) {
+    switch (format) {
+        case PixelFormat::MJPEG: return "MJPEG";
+        case PixelFormat::GREY:  return "GREY";
+        case PixelFormat::Z16:   return "Z16";
+        case PixelFormat::RGB8:  return "RGB8";
+        case PixelFormat::Y8I:   return "Y8I";
+        case PixelFormat::YUYV:  return "YUYV";
+        case PixelFormat::NV12:  return "NV12";
+        default: return "UNKNOWN";
+    }
+}
+
 
 static const char* vio_status_to_string(VioStatus status) {
     switch (status) {
@@ -215,10 +233,151 @@ static void update_hid_stats(struct hid_stats* s, uint64_t ts) {
     s->last_ts = ts;
 }
 
+void print_device_capabilities() {
+    printf("\n========================================\n");
+    printf("    Device Capabilities Information\n");
+    printf("========================================\n");
+
+    const DeviceCapabilities_t* caps = insight9_receive_get_device_capabilities_ptr();
+    if (!caps) {
+        printf("Failed to get device capabilities (SDK not initialized?)\n");
+        return;
+    }
+
+    printf("\n[RGB Camera - cam_id: 0]\n");
+    printf("  Total capabilities: %zu\n", caps->rgb_capabilities.size());
+    if (caps->rgb_default.valid) {
+        printf("  Default: %dx%d@%d, format=%s\n", 
+               caps->rgb_default.width, 
+               caps->rgb_default.height,
+               caps->rgb_default.fps, 
+               pixel_format_to_string(caps->rgb_default.format));
+    }
+    printf("  All supported formats:\n");
+    for (size_t i = 0; i < caps->rgb_capabilities.size(); ++i) {
+        const auto& cap = caps->rgb_capabilities[i];
+        printf("    [%zu] %dx%d@%d, format=%s%s\n", 
+               i, cap.width, cap.height, cap.fps, 
+               pixel_format_to_string(cap.format),
+               (i == 0) ? " (default)" : "");
+    }
+
+    printf("\n[Gray Camera - cam_id: 1]\n");
+    printf("  Total capabilities: %zu\n", caps->gray_capabilities.size());
+    if (caps->gray_default.valid) {
+        printf("  Default: %dx%d@%d, format=%s\n", 
+               caps->gray_default.width, 
+               caps->gray_default.height,
+               caps->gray_default.fps, 
+               pixel_format_to_string(caps->gray_default.format));
+    }
+    printf("  All supported formats:\n");
+    for (size_t i = 0; i < caps->gray_capabilities.size(); ++i) {
+        const auto& cap = caps->gray_capabilities[i];
+        printf("    [%zu] %dx%d@%d, format=%s%s\n", 
+               i, cap.width, cap.height, cap.fps, 
+               pixel_format_to_string(cap.format),
+               (i == 0) ? " (default)" : "");
+    }
+
+    printf("\n[Depth Camera - cam_id: 2]\n");
+    printf("  Total capabilities: %zu\n", caps->depth_capabilities.size());
+    if (caps->depth_default.valid) {
+        printf("  Default: %dx%d@%d, format=%s\n", 
+               caps->depth_default.width, 
+               caps->depth_default.height,
+               caps->depth_default.fps, 
+               pixel_format_to_string(caps->depth_default.format));
+    }
+    printf("  All supported formats:\n");
+    for (size_t i = 0; i < caps->depth_capabilities.size(); ++i) {
+        const auto& cap = caps->depth_capabilities[i];
+        printf("    [%zu] %dx%d@%d, format=%s%s\n", 
+               i, cap.width, cap.height, cap.fps, 
+               pixel_format_to_string(cap.format),
+               (i == 0) ? " (default)" : "");
+    }
+
+    printf("\n========================================\n");
+}
+
+void print_device_capabilities_by_index() {
+    printf("\n========================================\n");
+    printf("    Device Capabilities (by index)\n");
+    printf("========================================\n");
+
+    const char* names[] = {"RGB", "Gray", "Depth"};
+    for (int cam_id = 0; cam_id < 3; ++cam_id) {
+        printf("\n[%s Camera - cam_id: %d]\n", names[cam_id], cam_id);
+        
+        int count = 0;
+        if (insight9_receive_get_device_capability_count(cam_id, &count) != 0) {
+            printf("  Failed to get capability count\n");
+            continue;
+        }
+        printf("  Total capabilities: %d\n", count);
+        
+        DeviceCapability defaultCap;
+        if (insight9_receive_get_device_default_capability(cam_id, &defaultCap) == 0) {
+            printf("  Default: %dx%d@%d, format=%s\n", 
+                   defaultCap.width, defaultCap.height,
+                   defaultCap.fps, pixel_format_to_string(defaultCap.format));
+        }
+        
+        printf("  All supported formats:\n");
+        for (int i = 0; i < count; ++i) {
+            DeviceCapability cap;
+            if (insight9_receive_get_device_capability_by_index(cam_id, i, &cap) == 0) {
+                printf("    [%d] %dx%d@%d, format=%s%s\n", 
+                       i, cap.width, cap.height, cap.fps,
+                       pixel_format_to_string(cap.format),
+                       (i == 0) ? " (default)" : "");
+            }
+        }
+    }
+    printf("\n========================================\n");
+}
+
+bool select_best_resolution(int cam_id, int target_width, int target_height, 
+                            int target_fps, DeviceCapability* selected) {
+    if (!selected) return false;
+    
+    int count = 0;
+    if (insight9_receive_get_device_capability_count(cam_id, &count) != 0 || count == 0) {
+        return false;
+    }
+    
+    int best_score = -1;
+    DeviceCapability best_cap;
+    best_cap.valid = false;
+    
+    for (int i = 0; i < count; ++i) {
+        DeviceCapability cap;
+        if (insight9_receive_get_device_capability_by_index(cam_id, i, &cap) != 0) {
+            continue;
+        }
+        
+        int score = abs(cap.width - target_width) + 
+                   abs(cap.height - target_height) + 
+                   abs(cap.fps - target_fps) * 2;
+        
+        if (best_score == -1 || score < best_score) {
+            best_score = score;
+            best_cap = cap;
+        }
+    }
+    
+    if (best_cap.valid) {
+        *selected = best_cap;
+        return true;
+    }
+    
+    return false;
+}
+
 void my_image_cb(int cam_id, uint8_t* data, size_t size,
                  int width, int height, unsigned int format,
-                 uint64_t timestamp, uint64_t right_timestamp,
-                 void* userdata) {
+                 uint64_t timestamp, void* userdata) {
     if (cam_id < 0 || cam_id >= 3) return;
     InterlockedExchange64(&last_image_time, GetTickCount64());
 
@@ -233,7 +392,7 @@ void my_image_cb(int cam_id, uint8_t* data, size_t size,
     s->format = format;
     maybe_print_img_stats_locked();
     LeaveCriticalSection(&g_stats_lock);
-    
+
     // Cheap hand-off to the per-camera worker: just copy the raw bytes.
     {
         std::lock_guard<std::mutex> lk(g_raw_lock);
@@ -270,6 +429,7 @@ void my_vio_cb(float px, float py, float pz,
     maybe_print_hid_stats_locked();
     LeaveCriticalSection(&g_stats_lock);
 }
+
 
 // Decode one raw frame into BGR panel(s); for depth, also align it to RGB and
 // build the colorized overlay. Runs on a per-camera worker thread.
@@ -384,7 +544,6 @@ void reconnect_worker() {
         if (last != 0 && (now - last) > 5000) {
             EnterCriticalSection(&g_sdk_op_lock);
             printf("[Reconnect] No image received for 5 seconds, attempting reconnect...\n");
-            ... // stop+cleanup+sleep(1000)+init+start，跟原来完全一样
             LeaveCriticalSection(&g_sdk_op_lock);
         }
     }
@@ -411,6 +570,7 @@ int main() {
     SetConsoleCtrlHandler(console_handler, TRUE);
     InitializeCriticalSection(&g_stats_lock);
     InitializeCriticalSection(&g_sdk_op_lock);
+
     int active_cam = -1;
     camera_params params = {0};
 
@@ -419,6 +579,34 @@ int main() {
         DeleteCriticalSection(&g_stats_lock);
         return -1;
     }
+    
+    print_device_capabilities();
+    
+    print_device_capabilities_by_index();
+    
+    printf("\n========================================\n");
+    printf("    Resolution Selection Demo\n");
+    printf("========================================\n");
+    
+    DeviceCapability selected;
+    if (select_best_resolution(0, 1920, 1080, 30, &selected)) {
+        printf("Best match for 1920x1080@30 on RGB: %dx%d@%d, format=%s\n",
+               selected.width, selected.height, selected.fps,
+               pixel_format_to_string(selected.format));
+    }
+    
+    if (select_best_resolution(1, 640, 480, 30, &selected)) {
+        printf("Best match for 640x480@30 on Gray: %dx%d@%d, format=%s\n",
+               selected.width, selected.height, selected.fps,
+               pixel_format_to_string(selected.format));
+    }
+    
+    if (select_best_resolution(2, 640, 480, 30, &selected)) {
+        printf("Best match for 640x480@30 on Depth: %dx%d@%d, format=%s\n",
+               selected.width, selected.height, selected.fps,
+               pixel_format_to_string(selected.format));
+    }
+    printf("========================================\n\n");
 
     insight9_receive_register_image_callback(my_image_cb, NULL);
     insight9_receive_register_imu_callback(my_imu_cb, NULL);
@@ -496,6 +684,15 @@ int main() {
         printf("Failed to get current FPS for gray camera\n");
     }
 
+    uint64_t* timestamp_ptr = (uint64_t*)malloc(sizeof(uint64_t));
+    insight9_receive_read_metadata_timestamp(0, timestamp_ptr);
+    printf("metadata timestamp: %llu\n", *timestamp_ptr);
+    free(timestamp_ptr);
+    uint64_t* timestamp_ptr2 = (uint64_t*)malloc(sizeof(uint64_t));
+    insight9_receive_read_metadata_timestamp(1, timestamp_ptr2);
+    printf("metadata timestamp: %llu\n", *timestamp_ptr2);
+    free(timestamp_ptr2);
+
     // Example: Read intrinsics/extrinsics of the three cameras
     {
         static const int calib_cams[] = {
@@ -554,12 +751,12 @@ int main() {
         }
     });
 
-    printf("\n=================================================\n\n");
-    printf("SDK started with all 3 cameras\n");
-    printf("A fixed grid window will appear: L / R / raw-depth / RGB+aligned-depth.\n");
-    printf("Gray camera will toggle every 15 seconds\n");
-    printf("Press 'q' or ESC in the window, or Ctrl+C, to stop...\n");
-
+    printf("SDK started with 2 UVC devices\n");
+    printf("  Camera 0: RGB\n");
+    printf("  Camera 1: Composite stream (Gray frames)\n");
+    printf("  Camera 2: Composite stream (Depth frames)\n");
+    printf("Gray/Depth composite stream will toggle between 20fps and 30fps every 10 seconds\n");
+    printf("SDK running, press Ctrl+C to stop...\n");
     // Fixed composite canvas layout.
     const cv::Rect roi_left(0, 0, CELL_W, CELL_H);          // top-left
     const cv::Rect roi_right(0, CELL_H, CELL_W, CELL_H);    // bottom-left

@@ -18,11 +18,23 @@
 namespace viewer {
 namespace {
 
-constexpr GUID kUvcExtensionGuid = {
-    0x04030201,
-    0x0605,
-    0x0807,
-    {0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+constexpr GUID kExtGuid_RealSense1 = {
+    0xc9606ccb,
+    0x594c,
+    0x4d25,
+    {0xaf, 0x47, 0xcc, 0xc4, 0x96, 0x43, 0x59, 0x95}
+};
+
+constexpr GUID kExtGuid_RealSense3 = {
+    0xb8ec416e,
+    0xa3ac,
+    0x4580,
+    {0x8d, 0x5c, 0x0b, 0xee, 0x15, 0x97, 0xe4, 0x3d}
+};
+
+constexpr const GUID* kCandidateExtGuids[] = {
+    &kExtGuid_RealSense1,
+    &kExtGuid_RealSense3,
 };
 
 constexpr GUID kIidIKsTopologyInfo = {
@@ -97,9 +109,48 @@ bool ExtensionUnitControl::open(const std::string& devicePath) {
         return false;
     }
 
-    printf("[XU] Bound extension unit GUID to device path: %s (node=%lu, unit=%u)\n",
-                devicePath.c_str(), nodeId_, static_cast<unsigned>(kXuUnitId));
+    if (!probeExtensionGuid()) {
+        printf("[XU] No known extension GUID matched on node=%lu for device: %s\n",
+               nodeId_, devicePath.c_str());
+        close();
+        return false;
+    }
+
+    printf("[XU] Bound extension unit GUID to device path: %s (node=%lu, unit=%u, guid=%s)\n",
+                devicePath.c_str(), nodeId_, static_cast<unsigned>(kXuUnitId),
+                getActiveGuidString().c_str());
     return true;
+}
+
+bool ExtensionUnitControl::probeExtensionGuid() {
+    for (const GUID* candidate : kCandidateExtGuids) {
+        std::memcpy(activeExtGuidBytes_, candidate, sizeof(activeExtGuidBytes_));
+
+        uint8_t camId = 0;
+        if (query(kActiveCameraSelector, KSPROPERTY_TYPE_GET, &camId, sizeof(camId))) {
+            return true;
+        }
+
+        camera_params params{};
+        if (query(kCameraParamsSelector, KSPROPERTY_TYPE_GET, &params, sizeof(params))) {
+            return true;
+        }
+    }
+
+    std::memset(activeExtGuidBytes_, 0, sizeof(activeExtGuidBytes_));
+    return false;
+}
+
+std::string ExtensionUnitControl::getActiveGuidString() const {
+    GUID g{};
+    std::memcpy(&g, activeExtGuidBytes_, sizeof(g));
+    char buf[64];
+    std::snprintf(buf, sizeof(buf),
+        "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        g.Data1, g.Data2, g.Data3,
+        g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+        g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    return std::string(buf);
 }
 
 void ExtensionUnitControl::close() {
@@ -110,6 +161,7 @@ void ExtensionUnitControl::close() {
     ksControl_ = nullptr;
     filter_ = nullptr;
     nodeId_ = 0;
+    std::memset(activeExtGuidBytes_, 0, sizeof(activeExtGuidBytes_));
 }
 
 bool ExtensionUnitControl::isOpen() const {
@@ -304,6 +356,7 @@ bool ExtensionUnitControl::resolveNodeId() {
             continue;
         }
         if (SUCCEEDED(topology->get_NodeType(i, &nodeType))) {
+            // 打印所有节点类型
             printf("[XU] Node %lu: GUID={%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
                    i, nodeType.Data1, nodeType.Data2, nodeType.Data3,
                    nodeType.Data4[0], nodeType.Data4[1], nodeType.Data4[2], nodeType.Data4[3],
@@ -334,7 +387,7 @@ bool ExtensionUnitControl::query(uint8_t selector, unsigned long flags, void* da
     }
 
     KSP_NODE property = {};
-    property.Property.Set = kUvcExtensionGuid;
+    std::memcpy(&property.Property.Set, activeExtGuidBytes_, sizeof(activeExtGuidBytes_));
     property.Property.Id = selector;
     property.Property.Flags = flags | KSPROPERTY_TYPE_TOPOLOGY;
     property.NodeId = nodeId_;

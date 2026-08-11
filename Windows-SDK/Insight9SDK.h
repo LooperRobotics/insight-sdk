@@ -4,27 +4,73 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string>
+#include <vector>
 
 #pragma pack(push, 1)
 typedef struct {
     uint8_t cam_id;             // Camera ID, 0/1
-    uint8_t resolution;         // Resolution index, RGB:[0-3], grayscale:[0-1]
-    uint8_t frame_rate;         // Frame-rate index, 0-5 map to 10/15/20/30/60/90 fps
+    uint8_t resolution;         // Resolution index
+    uint8_t frame_rate;         // Frame-rate index, 0-5
     float exposure_time;        // Exposure time in seconds, range 0.0~0.03
     float exposure_gain;        // Exposure gain, range 1.0~16.0
-    uint8_t auto_exposure;      // Auto exposure, 0 or 1
+    uint8_t auto_exposure;      // Auto exposure, 0/1
     float brightness;           // Brightness, range 0.0~127.0
     float contrast;             // Contrast, range 0.0~1.9
     float gamma_dark;           // Dark gamma, range 1.0~4.0
     float hue;                  // Hue, range 0.0~87.0
     float saturation;           // Saturation, range 0.0~1.999
-    uint8_t sharpness;         // Sharpness, 1~4095
+    uint8_t sharpness;          // Sharpness (1~255)
     uint8_t auto_white_balance; // Auto white balance, 0 or 1
     float white_balance;        // White balance, range 1.0~3.0
-    uint8_t decimation;         // Decimation, 1~255
-    uint8_t hardware_model;     // Hardware model, 0..3
+    uint8_t decimation;         // Decimation (1~255)
+    uint8_t hardware_model;     // Hardware model
 } camera_params;
 
+enum class PixelFormat {
+    Unknown,
+    MJPEG,
+    GREY,
+    Z16,
+    RGB8,
+    Y8I,
+    YUYV,
+    NV12
+};
+
+struct DeviceCapability {
+    int width;
+    int height;
+    int fps;
+    PixelFormat format;
+    bool valid;
+    
+    DeviceCapability() : width(0), height(0), fps(0), format(PixelFormat::Unknown), valid(false) {}
+};
+
+struct DeviceCapabilities_t {
+    std::vector<DeviceCapability> rgb_capabilities;
+    std::vector<DeviceCapability> gray_capabilities;
+    std::vector<DeviceCapability> depth_capabilities;
+    DeviceCapability rgb_default;
+    DeviceCapability gray_default;
+    DeviceCapability depth_default;
+    bool initialized;
+    
+    DeviceCapabilities_t() : initialized(false) {}
+};
+
+typedef struct {
+    int width;
+    int height;
+    int fps;
+    PixelFormat pixel_format;
+} video_config_t;
+
+typedef struct {
+    video_config_t rgb_config;
+    video_config_t gray_config;
+    video_config_t depth_config;
+} insight9_config_t;
 
 /**
  * Camera intrinsics, fields aligned with ROS sensor_msgs/CameraInfo.
@@ -83,29 +129,6 @@ enum {
     INSIGHT9_CALIB_CAM_RGB   = 2,   /* RGB             */
 };
 
-enum class PixelFormat {
-    Unknown,
-    MJPEG,
-    GREY,
-    Z16,
-    RGB8,
-    Y8I,
-    YUYV,
-    NV12
-};
-typedef struct {
-    int width;
-    int height;
-    int fps;
-    PixelFormat pixel_format;
-} video_config_t;
-
-typedef struct {
-    video_config_t rgb_config;
-    video_config_t gray_config;
-    video_config_t depth_config;
-} insight9_config_t;
-
 enum class VioStatus : uint8_t {
     NOT_INITED      = 0,
     RESTARTING      = 1,
@@ -129,13 +152,11 @@ extern "C" {
  * @param height    Image height.
  * @param format    V4L2 pixel format, such as V4L2_PIX_FMT_MJPEG or V4L2_PIX_FMT_GREY.
  * @param timestamp Image timestamp in microseconds, provided by the device or system time.
- * @param right_timestamp Right image timestamp in microseconds; valid only for the stereo grayscale camera.
  * @param userdata  User pointer passed when the callback is registered.
  */
 typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
                                int width, int height, unsigned int format,
-                               uint64_t timestamp, uint64_t right_timestamp,
-                               void *userdata);
+                               uint64_t timestamp, void *userdata);
 
 /**
  * @brief IMU data callback.
@@ -165,7 +186,6 @@ typedef void (*vio_callback)(float px, float py, float pz,
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_init(const insight9_config_t* config);
-
 
 /**
  * @brief Initialize the SDK with default configuration.
@@ -207,6 +227,18 @@ void insight9_receive_stop_camera(int cam_id);
 int insight9_receive_restart_camera(int cam_id);
 
 /**
+ * @brief Switch a specific camera to a new frame rate and apply it immediately.
+ *        Convenience wrapper that updates the target fps (as
+ *        insight9_receive_set_camera_fps() does) and then stops/reopens
+ *        just that one camera (as insight9_receive_restart_camera() does)
+ *        so the new value actually takes effect.
+ * @param cam_id Camera ID.
+ * @param fps    Desired frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_switch_camera_fps(int cam_id, int fps);
+
+/**
  * @brief Check if a camera is currently running.
  * @param cam_id Camera ID.
  * @return 1 if running, 0 otherwise.
@@ -239,6 +271,10 @@ void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
  * @brief Register the VIO callback.
  */
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
+
+const char *insight9_receive_get_metadata_dev(int cam_id);
+
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
 
 /**
  * @brief Set the frame rate for a specific camera (stored in config, requires restart).
@@ -367,10 +403,17 @@ int insight9_receive_get_current_fps(int* fps);
 int insight9_receive_get_vio_status(int* status);
 
 /**
- * @brief Get the hardware type/model as a string.
+ * @brief Get the hardware type/model as a string. This requires reading the current camera parameters to determine the hardware_model field, which is then mapped to a string.
  * @return Hardware type/model string, or "unknown" on failure.
  */
 const char* insight9_receive_get_hardware_type(void);
+
+#ifdef __cplusplus
+const DeviceCapabilities_t* insight9_receive_get_device_capabilities_ptr(void);
+int insight9_receive_get_device_default_capability(int cam_id, DeviceCapability* cap);
+int insight9_receive_get_device_capability_count(int cam_id, int* count);
+int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap);
+#endif
 
 #ifdef __cplusplus
 }

@@ -22,89 +22,1117 @@
 #include <cmath>
 #include <vector>
 #include <cfloat>
-#include <cmath>
-#include <vector>
-#include <cfloat>
+#include <dshow.h>
+#include <sensorsapi.h>
+#include <sensors.h>
+#include <propvarutil.h>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libavdevice/avdevice.h>
-}
+// ==================== Media Foundation ====================
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+#include <propsys.h>
+#include <initguid.h>
 
 #pragma comment(lib, "strmiids.lib")
-#pragma comment(lib, "avcodec.lib")
-#pragma comment(lib, "avformat.lib")
-#pragma comment(lib, "avutil.lib")
-#pragma comment(lib, "swscale.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "propsys.lib")
+
+// ==================== Define The Missing Media Foundation GUID ====================
+extern "C" {
+// Y800 - 8-bit grayscale
+DEFINE_GUID(MEDIASUBTYPE_Y800, 
+    0x30303859, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+
+// Z16 - 16-bit depth
+DEFINE_GUID(MEDIASUBTYPE_Z16, 
+    0x2036315A, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+
+DEFINE_GUID(MEDIASUBTYPE_YUY2, 
+    0x32595559, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+
+DEFINE_GUID(MEDIASUBTYPE_MJPG, 
+    0x47504A4D, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+
+DEFINE_GUID(MEDIASUBTYPE_RGB24, 
+    0x42475200, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+}
+// Y8I - RealSense Interleaved Infrared (FOURCC: 'Y8I ')
+DEFINE_GUID(MEDIASUBTYPE_Y8I, 
+    0x20493859, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+
+#define MFVideoFormat_Y800 MEDIASUBTYPE_Y800
+#define MFVideoFormat_Z16 MEDIASUBTYPE_Z16
+#define MFVideoFormat_MJPG MEDIASUBTYPE_MJPG
+#define MFVideoFormat_YUY2 MEDIASUBTYPE_YUY2
+#define MFVideoFormat_RGB24 MEDIASUBTYPE_RGB24
+#define MFVideoFormat_Y8I MEDIASUBTYPE_Y8I
 
 #include "ExtensionUnitControl.hpp"
 
+// ==================== Metadata extraction GUIDs ====================
+// These are not always publicly defined in older SDKs
+#define RS_META_CAPTURE_TIMING_OFF 12
+
+DEFINE_GUID(MFSampleExtension_CaptureMetadata,
+    0x2EBE23A8, 0xFAF5, 0x444A, 0xA6, 0xA2, 0xEB, 0x81, 0x08, 0x80, 0xAB, 0x5D);
+
+DEFINE_GUID(MF_CAPTURE_METADATA_FRAME_RAWSTREAM,
+    0x26CBE9DE, 0x5BC3, 0x4EDC, 0xB9, 0x94, 0x0F, 0x54, 0x4D, 0x74, 0x49, 0x3D);
+
+static const GUID VENDOR_META_ITEM0 = // {9252077B-2680-49B9-AE02-B19075973B70}
+    { 0x9252077B, 0x2680, 0x49B9, { 0xAE, 0x02, 0xB1, 0x90, 0x75, 0x97, 0x3B, 0x70 } };
+static const GUID VENDOR_META_ITEM1 = // {F9F88A87-E1DD-441E-95CB-42E21A64F1D9}
+    { 0xF9F88A87, 0xE1DD, 0x441E, { 0x95, 0xCB, 0x42, 0xE2, 0x1A, 0x64, 0xF1, 0xD9 } };
+
+// ==================== Sensor GUIDs ====================
+static const PROPERTYKEY SENSOR_DATA_TYPE_DEV_TS_LOW = {
+    { 0xB14C764F, 0x07CF, 0x41E8, { 0x9D, 0x82, 0xEB, 0xE3, 0xD0, 0x77, 0x6A, 0x6F } },
+    7
+};
+static const PROPERTYKEY SENSOR_DATA_TYPE_DEV_TS_HIGH = {
+    { 0xB14C764F, 0x07CF, 0x41E8, { 0x9D, 0x82, 0xEB, 0xE3, 0xD0, 0x77, 0x6A, 0x6F } },
+    8
+};
+
+// ==================== UVC and MS metadata structures ====================
+#pragma pack(push, 1)
+struct KsItemHeader {
+    uint32_t MetadataId;
+    uint32_t Size;
+};
+struct KsUvcTimestamp {
+    uint32_t PresentationTimeStamp;
+    uint32_t SourceClockReference;
+    uint16_t SofCounter;
+    uint16_t Reserved;
+};
+struct MsMetadataHeader {
+    KsItemHeader   header;
+    KsUvcTimestamp startOfFrame;
+    KsUvcTimestamp endOfFrame;
+};
+#pragma pack(pop)
+
+static constexpr size_t MS_HEADER_SIZE = 40;
+static constexpr size_t UVC_HEADER_SIZE = 12;
+
+static constexpr uint32_t RS_META_CAPTURE_TIMING_ID = 0x80000001u;
+
+static constexpr double ACCEL_SCALE_FACTOR   = -0.366459184;
+static constexpr double GYRO_SCALE_FACTOR    = -610.464183381;
+static constexpr double ACCEL_SCALE_LOOPERHUB = 0.0035913;
+static constexpr double GYRO_SCALE_LOOPERHUB  = 0.00106526;
+
+static std::mutex g_imuStateMutex;
+static float g_lastAx = 0, g_lastAy = 0, g_lastAz = 0;
+static float g_lastGx = 0, g_lastGy = 0, g_lastGz = 0;
+static uint64_t g_lastAccelTs = 0, g_lastGyroTs = 0;
+
+// ==================== HID Report Structures ====================
+#pragma pack(push, 1)
+struct imu_accel_report_t {
+    uint8_t  report_id;
+    uint8_t  sensor_state;
+    uint64_t timestamp;
+    int32_t  accel_x, accel_y, accel_z;
+    int32_t  custom_data1, custom_data2;
+    int16_t  custom_data3, custom_data4, custom_data5;
+    int8_t   custom_data6, custom_data7;
+};
+struct imu_gyro_report_t {
+    uint8_t  report_id;
+    uint8_t  sensor_state;
+    uint64_t timestamp;
+    int32_t  gyro_x, gyro_y, gyro_z;
+    int32_t  custom_data1, custom_data2;
+    int16_t  custom_data3, custom_data4, custom_data5;
+    int8_t   custom_data6, custom_data7;
+};
+struct vio_hid_payload {
+    uint64_t timestamp;
+    float px, py, pz;
+    float qx, qy, qz, qw;
+    uint8_t seq;
+    uint8_t reserved[3];
+};
+#pragma pack(pop)
+
 // ==================== Target Device VID/PID ====================
 #define VENDOR_ID  0x3652
-#define PRODUCT_ID 0x0104
+#define PRODUCT_ID 0x0b5c
 
 // ==================== Camera Configuration ====================
-#define CAM_NUM 3
+#define UVC_NUM 2
+#define LOGICAL_CAM_NUM 3
 #define HID_NUM 2
+
+#define RGB_CAM_ID    0
+#define GRAY_CAM_ID   1
+#define DEPTH_CAM_ID  2
+
+#define RGB_UVC_ID       0
+#define COMPOSITE_UVC_ID 1
+
+#define DEPTH_STREAM_ID  0
+#define GRAY_STREAM_ID   1
+
 #define MAIN_WIDTH   1088
 #define MAIN_HEIGHT  1920
-#define MAIN_FORMAT  PixelFormat::MJPEG
+#define MAIN_FORMAT  PixelFormat::YUYV
 #define SUB_WIDTH    544
-#define SUB_HEIGHT   1281
-#define SUB_FORMAT   PixelFormat::GREY
+#define SUB_HEIGHT   640
+#define SUB_FORMAT   PixelFormat::Y8I
 #define DEPTH_WIDTH  544
-#define DEPTH_HEIGHT 642
+#define DEPTH_HEIGHT 640
 #define DEPTH_FORMAT PixelFormat::Z16
-
-// ==================== Reconnect Backoff / Retry Limits ====================
-// Rationale: repeatedly opening / S_FMT-ing a device that is in a bad state
-// (e.g. a composite UVC+NCM gadget that is warm-restarting) generates a USB
-// transaction storm that can wedge the whole xhci controller. We therefore
-// back off exponentially between reconnect attempts and cap the number of
-// consecutive failures so a dead device cannot keep hammering the bus forever.
-#define RECONNECT_BACKOFF_BASE_MS 1000   // first retry delay
-#define RECONNECT_BACKOFF_MAX_MS  30000  // delay ceiling (exponential, capped)
-// Max consecutive failed reconnect attempts before a thread stops actively
-// reconnecting and idles at the ceiling interval (set to 0 to retry forever).
-// After the limit is hit the thread no longer generates fast USB traffic, but
-// still wakes periodically so a recovered device can be picked back up.
-#define RECONNECT_MAX_ATTEMPTS    30
-
-static bool g_com_initialized_by_sdk = false;
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
-class FFmpegVideoSource;
 class HidDevice;
+
+enum class FrameType {
+    Unknown,
+    Gray,
+    Depth,
+    Color
+};
+
+struct FrameInfo {
+    FrameType type;
+    uint64_t timestamp;
+    uint64_t right_timestamp;
+    int width;
+    int height;
+    PixelFormat format;
+    DWORD streamIndex;
+};
+
+static inline uint32_t rdLe32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline uint64_t rdLe64(const uint8_t* p) {
+    return  (uint64_t)p[0]        | ((uint64_t)p[1] << 8)  |
+            ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+            ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+            ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+static bool parseRsVendorMetadata(const uint8_t* buf, size_t len,
+                                  uint64_t* time_us_64, uint32_t* frame_counter)
+{
+    if (!buf || len < MS_HEADER_SIZE + 8)
+        return false;
+
+    size_t off = MS_HEADER_SIZE;
+    while (off + 8 <= len) {
+        uint32_t id   = rdLe32(buf + off);
+        uint32_t size = rdLe32(buf + off + 4);
+        if (size < 8 || off + size > len)
+            break;
+        if (id == RS_META_CAPTURE_TIMING_ID && size >= 28 && off + 20 + 8 <= len) {
+            if (frame_counter) *frame_counter = rdLe32(buf + off + 16);
+            if (time_us_64)    *time_us_64    = rdLe64(buf + off + 20);
+            return true;
+        }
+        off += size;
+    }
+
+    if (len >= MS_HEADER_SIZE + 8) {
+        if (time_us_64)    *time_us_64    = rdLe64(buf + 8);
+        if (frame_counter) *frame_counter = 0;
+        return true;
+    }
+    return false;
+}
+
+class MFVideoSource {
+public:
+    MFVideoSource() {
+        HRESULT hr = MFStartup(MF_VERSION);
+        if (FAILED(hr)) {
+            printf("[MFVideoSource] MFStartup failed: 0x%08lx\n", hr);
+        }
+    }
+    
+    ~MFVideoSource() {
+        close();
+        MFShutdown();
+    }
+
+    bool open(const std::string& devicePath, int deviceIndex, int width, int height, PixelFormat fmt, int fps)
+    {
+        close();
+
+        devicePath_ = devicePath;
+        deviceIndex_ = deviceIndex;
+        width_ = width;
+        height_ = height;
+        format_ = fmt;
+        fps_ = fps;
+
+        if (!createMediaSource(devicePath))
+            return false;
+
+        if (!configureSourceReader())
+            return false;
+        //------------------------------------------------
+        // RGB Camera
+        //------------------------------------------------
+        if (deviceIndex_ == 0)
+        {
+            if (!configureStream(0, fmt, width, height, fps)) {
+                printf("RGB stream configure failed.\n");
+                return false;
+            }
+        }
+        //------------------------------------------------
+        // Depth Camera
+        //------------------------------------------------
+        else
+        {
+            if (!configureStream(0, fmt, width, height, fps)) {
+                printf("Depth stream configure failed.\n");
+                return false;
+            }
+
+            PixelFormat grayFmt = PixelFormat::Y8I;
+            if (!configureStream(1, grayFmt, width, height, fps)) {
+                grayFmt = PixelFormat::GREY;
+                if (!configureStream(1, grayFmt, width, height, fps)) {
+                    printf("IR stream configure failed.\n");
+                    return false;
+                }
+            }
+        }
+
+        printf("[MFVideoSource] Open success: %dx%d@%d, format=%d\n", width, height, fps, (int)fmt);
+
+        return true;
+    }
+
+    bool openWithTwoStreams(const std::string& devicePath, int deviceIndex, 
+                            int width, int height, 
+                            PixelFormat fmt0, int fps0,
+                            PixelFormat fmt1, int fps1)
+    {
+        close();
+
+        devicePath_ = devicePath;
+        deviceIndex_ = deviceIndex;
+        width_ = width;
+        height_ = height;
+        format_ = fmt0;
+        fps_ = fps0;
+
+        if (!createMediaSource(devicePath))
+            return false;
+
+        if (!configureSourceReader())
+            return false;
+
+        if (!configureStream(0, fmt0, width, height, fps0)) {
+            printf("Stream 0 configure failed.\n");
+            return false;
+        }
+
+        if (!configureStream(1, fmt1, width, height, fps1)) {
+            printf("Stream 1 configure failed.\n");
+            return false;
+        }
+
+        printf("[MFVideoSource] Open success: two streams (%dx%d@%d, %dx%d@%d)\n", 
+            width, height, fps0, width, height, fps1);
+        return true;
+    }
+    
+    void close() {
+        stop();
+        
+        if (sourceReader_) {
+            sourceReader_->Release();
+            sourceReader_ = nullptr;
+        }
+        if (mediaSource_) {
+            mediaSource_->Shutdown();
+            mediaSource_->Release();
+            mediaSource_ = nullptr;
+        }
+    }
+    
+    bool start() {
+        if (!sourceReader_ || running_) return false;
+        running_ = true;
+        return true;
+    }
+    
+    void stop() {
+        running_ = false;
+    }
+    
+    bool isRunning() const { return running_; }
+
+    bool readFrame(DWORD streamIndex, uint8_t*& data, size_t& size, FrameInfo& info) {
+        data = nullptr;
+        size = 0;
+
+        memset(&info, 0, sizeof(info));
+
+        if (!running_) {
+            printf("[MFVideoSource] readFrame(%lu): running=false\n", streamIndex);
+            return false;
+        }
+
+        if (streamIndex >= 2) {
+            printf("[MFVideoSource] readFrame(%lu): invalid stream\n", streamIndex);
+            return false;
+        }
+
+        if (!streamEnabled_[streamIndex]) {
+            printf("[MFVideoSource] readFrame(%lu): stream disabled\n", streamIndex);
+            return false;
+        }
+
+        if (!sourceReader_) {
+            printf("[MFVideoSource] readFrame(%lu): sourceReader=null\n", streamIndex);
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(readerMutex_);
+        IMFSample* sample = nullptr;
+        DWORD actualStream = MF_SOURCE_READER_ANY_STREAM;
+        DWORD flags = 0;
+        LONGLONG ts = 0;
+
+        HRESULT hr = sourceReader_->ReadSample(streamIndex, 0, &actualStream, &flags, &ts, &sample);
+
+        if (FAILED(hr)) {
+            printf("[MFVideoSource] ReadSample(stream=%lu) FAILED hr=0x%08lx flags=0x%08lx actual=%lu\n",
+                streamIndex, hr, flags, actualStream);
+            if (sample) sample->Release();
+            return false;
+        }
+
+        if (actualStream != streamIndex && actualStream != MF_SOURCE_READER_ANY_STREAM) {
+            printf("[MFVideoSource] WARNING: requested stream=%lu but actual stream=%lu\n",
+                streamIndex, actualStream);
+        }
+
+        if (flags & MF_SOURCE_READERF_ERROR) {
+            printf("[MFVideoSource] Stream %lu ERROR flags=0x%08lx\n", streamIndex, flags);
+            if (sample) sample->Release();
+            return false;
+        }
+
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+            printf("[MFVideoSource] Stream %lu END_OF_STREAM\n", streamIndex);
+            if (sample) sample->Release();
+            return false;
+        }
+
+        if (flags & MF_SOURCE_READERF_STREAMTICK) {
+            printf("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n",
+                streamIndex, ts, sample);
+        }
+
+        if (!sample) {
+            printf("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n",
+                streamIndex, flags);
+            return false;
+        }
+        
+        uint64_t mdTimeUs64 = 0;
+        uint32_t mdFrameCounter = 0;
+        bool     mdValid = false;
+
+        {
+            IMFAttributes* pSampleAttrs = nullptr;
+            if (SUCCEEDED(sample->QueryInterface(IID_PPV_ARGS(&pSampleAttrs)))) {
+                IUnknown* spUnknown = nullptr;
+                if (SUCCEEDED(pSampleAttrs->GetUnknown(MFSampleExtension_CaptureMetadata,
+                                                       IID_PPV_ARGS(&spUnknown)))) {
+                    IMFAttributes* spMetadata = nullptr;
+                    if (SUCCEEDED(spUnknown->QueryInterface(IID_PPV_ARGS(&spMetadata)))) {
+                        IUnknown* spInner = nullptr;
+                        if (SUCCEEDED(spMetadata->GetUnknown(VENDOR_META_ITEM0,
+                                                             IID_PPV_ARGS(&spInner)))) {
+                            IMFMediaBuffer* spInnerBuf = nullptr;
+                            if (SUCCEEDED(spInner->QueryInterface(IID_PPV_ARGS(&spInnerBuf)))) {
+                                BYTE* pBytes = nullptr;
+                                DWORD metaLen = 0;
+                                if (SUCCEEDED(spInnerBuf->Lock(&pBytes, nullptr, &metaLen))) {
+                                    mdValid = parseRsVendorMetadata(pBytes, metaLen, &mdTimeUs64, &mdFrameCounter);
+                                    spInnerBuf->Unlock();
+                                }
+                                spInnerBuf->Release();
+                            }
+                            spInner->Release();
+                        }
+                        spMetadata->Release();
+                    }
+                    spUnknown->Release();
+                }
+                pSampleAttrs->Release();
+            }
+        }
+
+#if defined(INSIGHT9_MD_DEBUG)
+printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
+       streamIndex, (int)mdValid, mdFrameCounter, (unsigned long long)mdTimeUs64);
+#endif
+
+        IMFMediaBuffer* buffer = nullptr;
+        hr = sample->ConvertToContiguousBuffer(&buffer);
+        if (FAILED(hr) || !buffer) {
+            printf("[MFVideoSource] Stream %lu ConvertToContiguousBuffer failed hr=0x%08lx\n",
+                streamIndex, hr);
+            sample->Release();
+            return false;
+        }
+
+        BYTE* ptr = nullptr;
+
+        DWORD maxLen = 0;
+        DWORD curLen = 0;
+
+        hr = buffer->Lock(&ptr, &maxLen, &curLen);
+
+        if (FAILED(hr) || !ptr || curLen == 0) {
+            printf("[MFVideoSource] Stream %lu Buffer Lock failed hr=0x%08lx curLen=%lu\n",
+                streamIndex, hr, curLen);
+
+            buffer->Release();
+            sample->Release();
+
+            return false;
+        }
+
+        data = new (std::nothrow) uint8_t[curLen];
+
+        if (!data) {
+            buffer->Unlock();
+            buffer->Release();
+            sample->Release();
+
+            return false;
+        }
+        memcpy(data, ptr, curLen);
+        size = curLen;
+
+        buffer->Unlock();
+        buffer->Release();
+        sample->Release();
+
+        info.streamIndex = streamIndex;
+        info.width = streamWidth_[streamIndex];
+        info.height = streamHeight_[streamIndex];
+        info.format = streamFormat_[streamIndex];
+
+        switch (streamFormat_[streamIndex]) {
+            case PixelFormat::MJPEG: info.type = FrameType::Color; break;
+            case PixelFormat::Z16:   info.type = FrameType::Depth; break;
+            case PixelFormat::Y8I:   info.type = FrameType::Gray; break;
+            case PixelFormat::GREY:  info.type = FrameType::Gray; break;
+            case PixelFormat::YUYV:  info.type = FrameType::Color; break;
+            case PixelFormat::NV12:  info.type = FrameType::Color; break;
+            default:                 info.type = FrameType::Unknown; break;
+        }
+
+        if (mdValid) {
+            info.timestamp = mdTimeUs64;
+        } else {
+            info.timestamp = (uint64_t)(ts / 10);
+        }
+
+        if (lastTimestamp_[streamIndex] != 0 && lastTimestamp_[streamIndex] == info.timestamp) {
+            printf("[MFVideoSource] Stream %lu duplicate timestamp=%llu\n", streamIndex, info.timestamp);
+            delete[] data;
+            data = nullptr;
+            size = 0;
+            return false;
+        }
+        lastTimestamp_[streamIndex] = info.timestamp;
+
+        return true;
+    }
+
+    bool getDefaultCapability(int streamIndex, DeviceCapability& cap) {
+        if (!sourceReader_) return false;
+
+        IMFMediaType* type = nullptr;
+        HRESULT hr = sourceReader_->GetNativeMediaType(streamIndex, 0, &type);
+        if (FAILED(hr) || !type) {
+            return false;
+        }
+
+        GUID subtype;
+        UINT32 w = 0, h = 0;
+        UINT32 num = 0, den = 1;
+
+        type->GetGUID(MF_MT_SUBTYPE, &subtype);
+        MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
+        MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &num, &den);
+
+        PixelFormat fmt = guidToPixelFormat(subtype);
+        if (fmt == PixelFormat::Unknown) {
+            type->Release();
+            return false;
+        }
+
+        cap.width = w;
+        cap.height = h;
+        cap.fps = den ? num / den : 0;
+        cap.format = fmt;
+        cap.valid = true;
+
+        type->Release();
+        return true;
+    }
+
+    bool getAllCapabilities(int streamIndex, std::vector<DeviceCapability>& caps) {
+        if (!sourceReader_) return false;
+
+        caps.clear();
+        DWORD index = 0;
+
+        while (true) {
+            IMFMediaType* type = nullptr;
+            HRESULT hr = sourceReader_->GetNativeMediaType(streamIndex, index, &type);
+            if (FAILED(hr) || !type) break;
+
+            GUID subtype;
+            UINT32 w = 0, h = 0;
+            UINT32 num = 0, den = 1;
+
+            type->GetGUID(MF_MT_SUBTYPE, &subtype);
+            MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
+            MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &num, &den);
+
+            PixelFormat fmt = guidToPixelFormat(subtype);
+            if (fmt != PixelFormat::Unknown) {
+                DeviceCapability cap;
+                cap.width = w;
+                cap.height = h;
+                cap.fps = den ? num / den : 0;
+                cap.format = fmt;
+                cap.valid = true;
+                caps.push_back(cap);
+            }
+
+            type->Release();
+            ++index;
+        }
+
+        return !caps.empty();
+    }
+
+    bool MFVideoSource::tryReadMetadata(IMFSample* sample, uint8_t outBuffer[UVC_HEADER_SIZE]) {
+        if (!sample) return false;
+
+        HRESULT hr = S_OK;
+        IMFAttributes* pSampleAttrs = nullptr;
+        IUnknown* spUnknown = nullptr;
+        IMFAttributes* spMetadata = nullptr;
+        IMFMediaBuffer* spBuffer = nullptr;
+        BYTE* pData = nullptr;
+        DWORD curLen = 0;
+        bool success = false;
+
+        do {
+            hr = sample->QueryInterface(IID_PPV_ARGS(&pSampleAttrs));
+            if (FAILED(hr)) break;
+
+            hr = pSampleAttrs->GetUnknown(MFSampleExtension_CaptureMetadata, IID_PPV_ARGS(&spUnknown));
+            if (FAILED(hr) || !spUnknown) break;
+
+            hr = spUnknown->QueryInterface(IID_PPV_ARGS(&spMetadata));
+            if (FAILED(hr) || !spMetadata) break;
+
+            hr = spMetadata->GetUnknown(MF_CAPTURE_METADATA_FRAME_RAWSTREAM, IID_PPV_ARGS(&spBuffer));
+            if (FAILED(hr) || !spBuffer) break;
+
+            hr = spBuffer->Lock(&pData, nullptr, &curLen);
+            if (FAILED(hr) || !pData || curLen < sizeof(MsMetadataHeader)) break;
+
+            auto* ms = reinterpret_cast<const MsMetadataHeader*>(pData);
+
+            uint32_t pts = ms->startOfFrame.PresentationTimeStamp;
+
+            const uint8_t* vendor = pData + sizeof(MsMetadataHeader);
+            size_t vendorLen = curLen - sizeof(MsMetadataHeader);
+
+            if (vendorLen >= 24) {
+                uint32_t id   = read_le32(vendor + 0);
+                if (id == 0x80000001) {
+                    uint32_t frameCounter    = read_le32(vendor + 16);
+                    uint64_t sensorTimestamp = read_le32(vendor + 20);
+                }
+            }
+
+            success = true;
+        } while (false);
+
+        if (pData) spBuffer->Unlock();
+        if (spBuffer) spBuffer->Release();
+        if (spMetadata) spMetadata->Release();
+        if (spUnknown) spUnknown->Release();
+        if (pSampleAttrs) pSampleAttrs->Release();
+
+        return success;
+    }
+
+    uint64_t getLastTimestamp(DWORD streamIndex) const {
+        if (streamIndex >= 2) return 0;
+        return lastTimestamp_[streamIndex].load(std::memory_order_relaxed);
+    }
+
+private:
+    PixelFormat guidToPixelFormat(const GUID& guid) {
+        if (IsEqualGUID(guid, MFVideoFormat_MJPG)) return PixelFormat::MJPEG;
+        if (IsEqualGUID(guid, MEDIASUBTYPE_Z16)) return PixelFormat::Z16;
+        if (IsEqualGUID(guid, MEDIASUBTYPE_Y800)) return PixelFormat::GREY;
+        if (IsEqualGUID(guid, MFVideoFormat_Y8I)) return PixelFormat::Y8I;
+        if (IsEqualGUID(guid, MFVideoFormat_YUY2)) return PixelFormat::YUYV;
+        if (IsEqualGUID(guid, MFVideoFormat_RGB24)) return PixelFormat::RGB8;
+        if (IsEqualGUID(guid, MFVideoFormat_NV12)) return PixelFormat::NV12;
+        return PixelFormat::Unknown;
+    }
+
+    bool configureStream(DWORD streamIndex, PixelFormat fmt, int width, int height, int fps)
+    {
+        if (!sourceReader_) return false;
+
+        GUID targetSubtype = GUID_NULL;
+
+        switch(fmt)
+        {
+            case PixelFormat::MJPEG:
+                targetSubtype = MFVideoFormat_MJPG;
+                break;
+            case PixelFormat::Z16:
+                targetSubtype = MEDIASUBTYPE_Z16;
+                break;
+            case PixelFormat::Y8I:
+                targetSubtype = MFVideoFormat_Y8I;
+                break;
+            case PixelFormat::GREY:
+                targetSubtype = MEDIASUBTYPE_Y800;
+                break;
+            case PixelFormat::YUYV:
+                targetSubtype = MFVideoFormat_YUY2;
+                break;
+            case PixelFormat::NV12:
+                targetSubtype = MFVideoFormat_NV12;
+                break;
+            default:
+                return false;
+        }
+
+        IMFMediaType* bestType = nullptr;
+        DWORD index = 0;
+
+        while (true)
+        {
+            IMFMediaType* type = nullptr;
+
+            HRESULT hr = sourceReader_->GetNativeMediaType(streamIndex, index, &type);
+            if (FAILED(hr)) break;
+
+            GUID subtype;
+
+            UINT32 w = 0;
+            UINT32 h = 0;
+            UINT32 num = 0;
+            UINT32 den = 1;
+
+            type->GetGUID(MF_MT_SUBTYPE, &subtype);
+
+            MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
+
+            MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &num, &den);
+
+            char fourcc[5] = {0};
+
+            memcpy(fourcc, &subtype.Data1, 4);
+            // printf("[Stream%u] [%02u] %ux%u %u/%u %s\n", streamIndex, index, w, h, num, den, fourcc);
+
+            double rate = den ? (double)num / den : 0.0;
+            if (IsEqualGUID(subtype, targetSubtype) && w == (UINT32)width && h == (UINT32)height && fabs(rate - fps) < 0.1) {
+                bestType = type;
+                break;
+            }
+
+            type->Release();
+            ++index;
+        }
+
+        if(bestType==nullptr) {
+            printf("Cannot find media type for stream %u\n", streamIndex);
+            return false;
+        }
+
+        HRESULT hr = sourceReader_->SetCurrentMediaType(streamIndex, nullptr, bestType);
+
+        bestType->Release();
+
+        if(FAILED(hr)) {
+            printf("SetCurrentMediaType stream %u failed 0x%08lx\n", streamIndex, hr);
+            return false;
+        }
+
+        sourceReader_->Flush(streamIndex);
+
+        streamEnabled_[streamIndex]=true;
+        streamFormat_[streamIndex]=fmt;
+        streamWidth_[streamIndex]=width;
+        streamHeight_[streamIndex]=height;
+
+        return true;
+    }
+
+    std::string getSymbolicLink(const std::string& devicePath) {
+        std::string upper = devicePath;
+        for (char& c : upper) c = toupper(c);
+        
+        size_t vidPos = upper.find("VID_");
+        if (vidPos == std::string::npos) return "";
+        
+        size_t pidPos = upper.find("PID_");
+        if (pidPos == std::string::npos) return "";
+        
+        std::string vid = upper.substr(vidPos, 13);
+        std::string pid = upper.substr(pidPos, 13);
+        
+        size_t miPos = upper.find("MI_");
+        std::string mi = "";
+        if (miPos != std::string::npos) {
+            mi = upper.substr(miPos, 5);
+        }
+        
+        ICreateDevEnum* pDevEnum = nullptr;
+        IEnumMoniker* pEnum = nullptr;
+        HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER,
+                                    IID_ICreateDevEnum, (void**)&pDevEnum);
+        if (FAILED(hr)) return "";
+        
+        hr = pDevEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &pEnum, 0);
+        if (FAILED(hr) || !pEnum) {
+            pDevEnum->Release();
+            return "";
+        }
+        
+        IMoniker* pMoniker = nullptr;
+        std::string result;
+        
+        while (pEnum->Next(1, &pMoniker, NULL) == S_OK) {
+            IPropertyBag* pPropBag = nullptr;
+            hr = pMoniker->BindToStorage(0, 0, IID_IPropertyBag, (void**)&pPropBag);
+            if (SUCCEEDED(hr)) {
+                VARIANT var;
+                VariantInit(&var);
+                
+                hr = pPropBag->Read(L"DevicePath", &var, 0);
+                if (SUCCEEDED(hr) && var.vt == VT_BSTR) {
+                    std::wstring wpath = var.bstrVal;
+                    std::string path(wpath.begin(), wpath.end());
+                    
+                    std::string pathUpper = path;
+                    for (char& c : pathUpper) c = toupper(c);
+                    
+                    if (pathUpper.find(vid) != std::string::npos &&
+                        pathUpper.find(pid) != std::string::npos &&
+                        (mi.empty() || pathUpper.find(mi) != std::string::npos)) {
+                        
+                        result = path; 
+                        
+                        VariantClear(&var);
+                        pPropBag->Release();
+                        pMoniker->Release();
+                        pEnum->Release();
+                        pDevEnum->Release();
+                        printf("[MFVideoSource] Found symbolic link: %s\n", result.c_str());
+                        return result;
+                    }
+                }
+                VariantClear(&var);
+                pPropBag->Release();
+            }
+            pMoniker->Release();
+        }
+        
+        pEnum->Release();
+        pDevEnum->Release();
+        return "";
+    }
+
+    bool probeStreamCount() {
+        IMFPresentationDescriptor* pd = nullptr;
+        HRESULT hr = mediaSource_->CreatePresentationDescriptor(&pd);
+        if (FAILED(hr) || !pd) {
+            printf("[Probe] CreatePresentationDescriptor failed: 0x%08lx\n", hr);
+            return false;
+        }
+
+        DWORD streamCount = 0;
+        pd->GetStreamDescriptorCount(&streamCount);
+        streamCount_ = streamCount;
+        printf("[Probe] Total stream count on this media source: %lu\n", streamCount);
+
+        for (DWORD i = 0; i < streamCount; ++i) {
+            BOOL selected = FALSE;
+            IMFStreamDescriptor* sd = nullptr;
+            if (SUCCEEDED(pd->GetStreamDescriptorByIndex(i, &selected, &sd)) && sd) {
+                DWORD streamId = 0;
+                sd->GetStreamIdentifier(&streamId);
+                // printf("[Probe] stream[%lu] id=%lu selected=%d\n", i, streamId, selected);
+
+                IMFMediaTypeHandler* handler = nullptr;
+                if (SUCCEEDED(sd->GetMediaTypeHandler(&handler)) && handler) {
+                    GUID majorType = GUID_NULL;
+                    handler->GetMajorType(&majorType);
+                    const char* kindStr = "Unknown";
+                    if (majorType == MFMediaType_Video) kindStr = "Video";
+                    else if (majorType == MFMediaType_Metadata) kindStr = "Metadata";
+                    printf("[Probe]   stream[%lu] id=%lu selected=%d majorType=%s\n",
+                        i, streamId, selected, kindStr);
+
+                    DWORD typeCount = 0;
+                    handler->GetMediaTypeCount(&typeCount);
+                    for (DWORD t = 0; t < typeCount; ++t) {
+                        IMFMediaType* mt = nullptr;
+                        if (SUCCEEDED(handler->GetMediaTypeByIndex(t, &mt)) && mt) {
+                            GUID subtype; UINT32 w=0,h=0,num=0,den=1;
+                            mt->GetGUID(MF_MT_SUBTYPE, &subtype);
+                            MFGetAttributeSize(mt, MF_MT_FRAME_SIZE, &w, &h);
+                            MFGetAttributeRatio(mt, MF_MT_FRAME_RATE, &num, &den);
+                            char fourcc[5] = {0};
+                            memcpy(fourcc, &subtype.Data1, 4);
+                            // printf("    [type %lu] %ux%u %u/%u subtype=%s\n", t, w, h, num, den, fourcc);
+                            mt->Release();
+                        }
+                    }
+                    handler->Release();
+                }
+                sd->Release();
+            }
+        }
+        pd->Release();
+        return streamCount > 1;
+    }
+
+    bool createMediaSource(const std::string& devicePath) {
+        std::string symbolicLink = getSymbolicLink(devicePath);
+        if (symbolicLink.empty()) {
+            printf("[MFVideoSource] Failed to get symbolic link\n");
+            return false;
+        }
+        
+        std::wstring wlink(symbolicLink.begin(), symbolicLink.end());
+        
+        IMFAttributes* pAttributes = nullptr;
+        HRESULT hr = MFCreateAttributes(&pAttributes, 2);
+        if (FAILED(hr)) {
+            printf("[MFVideoSource] MFCreateAttributes failed: 0x%08lx\n", hr);
+            return false;
+        }
+        
+        pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, 
+                             MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+        pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                               wlink.c_str());
+        
+        IMFMediaSource* pSource = nullptr;
+        hr = MFCreateDeviceSource(pAttributes, &pSource);
+        pAttributes->Release();
+        
+        if (FAILED(hr)) {
+            printf("[MFVideoSource] MFCreateDeviceSource failed: 0x%08lx\n", hr);
+            return false;
+        }
+        
+        mediaSource_ = pSource;
+        probeStreamCount();
+        return true;
+    }
+    
+    bool configureSourceReader() {
+        IMFAttributes* attr = nullptr;
+
+        MFCreateAttributes(&attr,2);
+
+        attr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+        // attr->SetUINT32(MF_LOW_LATENCY, TRUE);
+        // attr->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
+        attr->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, FALSE);
+        // attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, FALSE);
+
+        HRESULT hr = MFCreateSourceReaderFromMediaSource(mediaSource_, attr, &sourceReader_);
+
+        if(attr) attr->Release();
+
+        if(FAILED(hr)) {
+            printf("[MFVideoSource] MFCreateSourceReaderFromMediaSource failed: 0x%08lX\n", hr);
+            return false;
+        }
+        //------------------------------------------
+        // disable all stream
+        //------------------------------------------
+        sourceReader_->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        sourceReader_->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+        //------------------------------------------
+        // RGB camera
+        //------------------------------------------
+        if(deviceIndex_==0)
+        {
+            sourceReader_->SetStreamSelection(0,TRUE);
+        }
+        //------------------------------------------
+        // Depth camera
+        //------------------------------------------
+        else
+        {
+            sourceReader_->SetStreamSelection(0,TRUE);
+            sourceReader_->SetStreamSelection(1,TRUE);
+        }
+
+        BOOL sel=FALSE;
+
+        sourceReader_->GetStreamSelection(0,&sel);
+        sourceReader_->GetStreamSelection(1,&sel);
+
+        DWORD streamCount = 0;
+        for (DWORD i = 0; i < streamCount_; ++i) {
+            IMFMediaType* pType = nullptr;
+            HRESULT hr = sourceReader_->GetCurrentMediaType(i, &pType);
+            if (FAILED(hr)) {
+                hr = sourceReader_->GetNativeMediaType(i, 0, &pType);
+            }
+            if (SUCCEEDED(hr) && pType) {
+                GUID majorType;
+                if (SUCCEEDED(pType->GetGUID(MF_MT_MAJOR_TYPE, &majorType)) &&
+                    majorType == MFMediaType_Metadata) {
+                    sourceReader_->SetStreamSelection(i, TRUE);
+                    printf("[MFVideoSource] Enabled metadata stream %lu\n", i);
+                    pType->Release();
+                    break;
+                }
+                pType->Release();
+            }
+        }
+
+        return true;
+    }
+    
+    bool findVideoStream() {
+        IMFMediaType* pType = nullptr;
+        HRESULT hr = sourceReader_->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pType);
+        if (FAILED(hr) || !pType) {
+            printf("[MFVideoSource] GetCurrentMediaType failed: 0x%08lx\n", hr);
+            return false;
+        }
+        
+        GUID majorType;
+        pType->GetGUID(MF_MT_MAJOR_TYPE, &majorType);
+        pType->Release();
+        
+        if (majorType != MFMediaType_Video) {
+            printf("[MFVideoSource] Not a video stream\n");
+            return false;
+        }
+        
+        return true;
+    }
+
+    static uint32_t read_le32(const uint8_t* p) {
+        return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) |
+            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+
+    IMFMediaSource* mediaSource_ = nullptr;
+    IMFSourceReader* sourceReader_ = nullptr;
+    
+    int width_ = 0;
+    int height_ = 0;
+    PixelFormat format_ = PixelFormat::Unknown;
+    int fps_ = 30;
+    std::string devicePath_;
+    int deviceIndex_ = -1;
+    
+    std::atomic<bool> running_{false};
+    std::mutex readerMutex_;
+    std::atomic<uint64_t> lastTimestamp_[2] = {0, 0};
+    uint32_t lastMeta32_[2]   = {0, 0};
+    uint64_t metaWrapHigh_[2] = {0, 0};
+    bool     metaInit_[2]     = {false, false};
+
+    uint64_t unwrapMetaTimestamp(DWORD streamIndex, uint32_t ts32) {
+        if (metaInit_[streamIndex] && ts32 < lastMeta32_[streamIndex] &&
+            (lastMeta32_[streamIndex] - ts32) > 0x80000000u) {
+            metaWrapHigh_[streamIndex] += 0x100000000ull;
+        }
+        lastMeta32_[streamIndex] = ts32;
+        metaInit_[streamIndex] = true;
+        return metaWrapHigh_[streamIndex] + (uint64_t)ts32;
+    }
+
+    DWORD streamCount_ = 0;
+    bool streamEnabled_[2] = {false, false};
+    PixelFormat streamFormat_[2] = {PixelFormat::Unknown, PixelFormat::Unknown};
+    int streamWidth_[2] = {0,0};
+    int streamHeight_[2] = {0,0};
+};
 
 struct sdk_ctx_t {
     insight9_config_t config;
-    FFmpegVideoSource* videos[CAM_NUM];
+    // =====================================================
+    // Physical UVC devices
+    // videos[0] = MI_03 RGB
+    // videos[1] = MI_00 Composite
+    //               stream 0 = Depth
+    //               stream 1 = Gray
+    // =====================================================
+    MFVideoSource* videos[UVC_NUM];
+    std::string videoPaths[UVC_NUM];
+    // =====================================================
+    // Logical camera state
+    // cam 0 = RGB
+    // cam 1 = Gray
+    // cam 2 = Depth
+    // =====================================================
+    std::atomic<bool> cam_running[LOGICAL_CAM_NUM];
+    std::thread videoThreads[UVC_NUM];
+    // =====================================================
     HidDevice* hidDevs[HID_NUM];
-    viewer::ExtensionUnitControl *xu;
-    std::thread videoThreads[CAM_NUM];
-    std::thread hidThreads[HID_NUM];
-    std::atomic<bool> running;
-    std::atomic<bool> cam_running[CAM_NUM];
-    image_callback imgCb = nullptr;
-    void* imgUser = nullptr;
-    imu_callback imuCb = nullptr;
-    void* imuUser = nullptr;
-    vio_callback vioCb = nullptr;
-    void* vioUser = nullptr;
-    std::string videoPaths[CAM_NUM];
     std::string hidPaths[HID_NUM];
+    std::thread hidThreads[HID_NUM];
+    viewer::ExtensionUnitControl* xu;
+    // =====================================================
+    std::atomic<bool> running;
+    image_callback imgCb;
+    void* imgUser;
+    imu_callback imuCb;
+    void* imuUser;
+    vio_callback vioCb;
+    void* vioUser;
     std::mutex imgMutex;
     std::mutex imuMutex;
     std::mutex vioMutex;
-    bool initialized = false;
-    uint64_t last_img_timestamp[CAM_NUM] = {0};
-} g_ctx;
+    bool initialized;
+    uint64_t last_img_timestamp[LOGICAL_CAM_NUM];
+    DeviceCapabilities_t device_caps;
+};
+
+static sdk_ctx_t g_ctx;
 
 std::string getDirectShowDeviceName(const std::string& devicePath) {
     ICreateDevEnum* pDevEnum = nullptr;
@@ -132,19 +1160,40 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
                 std::wstring wpath = var.bstrVal;
                 std::string path(wpath.begin(), wpath.end());
                 
-                if (path == devicePath) {
-                    VariantClear(&var);
-                    VariantInit(&var);
-                    hr = pPropBag->Read(L"FriendlyName", &var, 0);
-                    if (SUCCEEDED(hr) && var.vt == VT_BSTR) {
-                        std::wstring wname = var.bstrVal;
-                        std::string name(wname.begin(), wname.end());
+                std::string pathUpper = path;
+                for (char& c : pathUpper) c = toupper(c);
+                std::string devicePathUpper = devicePath;
+                for (char& c : devicePathUpper) c = toupper(c);
+                
+                size_t pos1 = pathUpper.find("VID_");
+                size_t pos2 = devicePathUpper.find("VID_");
+                if (pos1 != std::string::npos && pos2 != std::string::npos) {
+                    std::string pathId = pathUpper.substr(pos1);
+                    std::string deviceId = devicePathUpper.substr(pos2);
+                    
+                    size_t end1 = pathId.find_first_of("#\\");
+                    size_t end2 = deviceId.find_first_of("#\\");
+                    if (end1 != std::string::npos && end2 != std::string::npos) {
+                        pathId = pathId.substr(0, end1);
+                        deviceId = deviceId.substr(0, end2);
+                    }
+                    
+                    if (pathId == deviceId) {
                         VariantClear(&var);
-                        pPropBag->Release();
-                        pMoniker->Release();
-                        pEnum->Release();
-                        pDevEnum->Release();
-                        return name;
+                        VariantInit(&var);
+                        hr = pPropBag->Read(L"FriendlyName", &var, 0);
+                        if (SUCCEEDED(hr) && var.vt == VT_BSTR) {
+                            std::wstring wname = var.bstrVal;
+                            std::string name(wname.begin(), wname.end());
+                            VariantClear(&var);
+                            pPropBag->Release();
+                            pMoniker->Release();
+                            pEnum->Release();
+                            pDevEnum->Release();
+                            printf("[SDK] Matched device: %s -> FriendlyName: %s\n", 
+                                   devicePath.c_str(), name.c_str());
+                            return name;
+                        }
                     }
                 }
             }
@@ -161,11 +1210,15 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
 
 static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     std::vector<std::string> paths;
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::vector<std::string> rgbPaths;
+    std::vector<std::string> grayDepthPaths;
+    
     ICreateDevEnum* pDevEnum = nullptr;
     IEnumMoniker* pEnum = nullptr;
-    hr = CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER, IID_ICreateDevEnum, (void**)&pDevEnum);
+    HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER, 
+                                   IID_ICreateDevEnum, (void**)&pDevEnum);
     if (FAILED(hr)) return paths;
+    
     hr = pDevEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &pEnum, 0);
     if (SUCCEEDED(hr) && pEnum) {
         IMoniker* pMoniker = nullptr;
@@ -180,22 +1233,39 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
                     std::wstring wpath = var.bstrVal;
                     std::string path(wpath.begin(), wpath.end());
 
-                    char vidStr[16], pidStr[16];
-                    snprintf(vidStr, sizeof(vidStr), "vid_%04x", vid);
-                    snprintf(pidStr, sizeof(pidStr), "pid_%04x", pid);
-                    std::string lower = path;
-                    for (char& c : lower) c = tolower(c);
+                    VARIANT nameVar;
+                    VariantInit(&nameVar);
+                    std::string friendlyName;
+                    if (SUCCEEDED(pPropBag->Read(L"FriendlyName", &nameVar, 0)) && nameVar.vt == VT_BSTR) {
+                        std::wstring wname = nameVar.bstrVal;
+                        friendlyName = std::string(wname.begin(), wname.end());
+                        VariantClear(&nameVar);
+                    }
+
+                    std::string upper = path;
+                    for (char& c : upper) c = toupper(c);
                     
-                    if (lower.find(vidStr) != std::string::npos && 
-                        lower.find(pidStr) != std::string::npos) {
+                    char vidStr[16], pidStr[16];
+                    snprintf(vidStr, sizeof(vidStr), "VID_%04X", vid);
+                    snprintf(pidStr, sizeof(pidStr), "PID_%04X", pid);
+                    
+                    if (upper.find(vidStr) != std::string::npos && 
+                        upper.find(pidStr) != std::string::npos) {
                         
-                        std::regex mi_pattern(R"(mi_(\d+))", std::regex::icase);
-                        std::smatch match;
-                        if (std::regex_search(lower, match, mi_pattern)) {
-                            paths.push_back(path);
+                        if (upper.find("MI_03") != std::string::npos) {
+                            rgbPaths.push_back(path);
+                            printf("[SDK] Found RGB device (MI_03): %s\n", path.c_str());
+                            printf("[SDK]   FriendlyName: %s\n", friendlyName.c_str());
+                        } else if (upper.find("MI_00") != std::string::npos) {
+                            grayDepthPaths.push_back(path);
+                            printf("[SDK] Found Composite device (MI_00): %s\n", path.c_str());
+                            printf("[SDK]   FriendlyName: %s\n", friendlyName.c_str());
                         }
-                        else {
-                            paths.push_back(path);
+                        else if (upper.find("MI_04") != std::string::npos) {
+                            rgbPaths.push_back(path);
+                        } else if (upper.find("MI_06") != std::string::npos || 
+                                   upper.find("MI_08") != std::string::npos) {
+                            grayDepthPaths.push_back(path);
                         }
                     }
                 }
@@ -207,22 +1277,74 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
         pEnum->Release();
     }
     pDevEnum->Release();
-    if (SUCCEEDED(hr)) CoUninitialize();
-    std::sort(paths.begin(), paths.end(), [](const std::string& a, const std::string& b) {
-        std::regex pattern(R"(mi_(\d+))", std::regex::icase);
-        std::smatch match_a, match_b;
-        
-        int num_a = 999, num_b = 999;
-        if (std::regex_search(a, match_a, pattern)) {
-            num_a = std::stoi(match_a[1].str());
-        }
-        if (std::regex_search(b, match_b, pattern)) {
-            num_b = std::stoi(match_b[1].str());
-        }
-        return num_a < num_b;
-    });
     
+    std::sort(rgbPaths.begin(), rgbPaths.end());
+    std::sort(grayDepthPaths.begin(), grayDepthPaths.end());
+    
+    paths.insert(paths.end(), rgbPaths.begin(), rgbPaths.end());
+    paths.insert(paths.end(), grayDepthPaths.begin(), grayDepthPaths.end());
+
+    printf("[SDK] Found %zu UVC devices:\n", paths.size());
+    for (size_t i = 0; i < paths.size(); i++) {
+        printf("[SDK]   [%zu] %s\n", i, paths[i].c_str());
+    }
+
     return paths;
+}
+
+static bool probeDeviceCapabilities(const std::string& devicePath, int deviceIndex, 
+                                     DeviceCapabilities_t& caps) {
+    MFVideoSource* probeSource = new MFVideoSource();
+    
+    bool opened = false;
+    
+    if (deviceIndex == 0) {
+        opened = probeSource->open(devicePath, deviceIndex, 1088, 1920, PixelFormat::YUYV, 30);
+        if (!opened) opened = probeSource->open(devicePath, deviceIndex, 1088, 1920, PixelFormat::MJPEG, 30);
+        if (!opened) opened = probeSource->open(devicePath, deviceIndex, 1088, 1920, PixelFormat::NV12, 30);
+    } else {
+        opened = probeSource->openWithTwoStreams(devicePath, deviceIndex, 
+                                                 544, 640, 
+                                                 PixelFormat::Z16, 30,
+                                                 PixelFormat::Y8I, 30);
+    }
+    
+    if (!opened) {
+        printf("[Probe] Failed to open device\n");
+        delete probeSource;
+        return false;
+    }
+    
+    if (deviceIndex == 0) {
+        std::vector<DeviceCapability> allCaps;
+        if (probeSource->getAllCapabilities(0, allCaps)) {
+            caps.rgb_capabilities = allCaps;
+            if (!allCaps.empty()) {
+                caps.rgb_default = allCaps[0];
+            }
+        }
+    } else {
+        std::vector<DeviceCapability> depthCaps;
+        if (probeSource->getAllCapabilities(0, depthCaps)) {
+            caps.depth_capabilities = depthCaps;
+            if (!depthCaps.empty()) {
+                caps.depth_default = depthCaps[0];
+            }
+        }
+        
+        std::vector<DeviceCapability> grayCaps;
+        if (probeSource->getAllCapabilities(1, grayCaps)) {
+            caps.gray_capabilities = grayCaps;
+            if (!grayCaps.empty()) {
+                caps.gray_default = grayCaps[0];
+            }
+        }
+    }
+    
+    caps.initialized = true;
+    probeSource->close();
+    delete probeSource;
+    return true;
 }
 
 static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid) {
@@ -246,186 +1368,6 @@ static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid) {
     
     return paths;
 }
-
-void refreshVideoDevicePath(int camId) {
-    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    if (camId < (int)uvcPaths.size()) {
-        g_ctx.videoPaths[camId] = uvcPaths[camId];
-        printf("[SDK] Camera %d device path refreshed: %s\n", camId, uvcPaths[camId].c_str());
-    }
-}
-
-class FFmpegVideoSource {
-public:
-    bool open(const std::string& devicePath, int deviceIndex, int width, int height, PixelFormat fmt, int fps) {
-        close();
-        devicePath_ = devicePath;
-        deviceIndex_ = deviceIndex;
-        width_ = width;
-        height_ = height;
-        format_ = fmt;
-        fps_ = fps;
-        return true;
-    }
-    void close() {
-        if (fmtCtx_) {
-            avformat_close_input(&fmtCtx_);
-            fmtCtx_ = nullptr;
-        }
-
-        if (packet_) {
-            av_packet_free(&packet_);
-            packet_ = nullptr;
-        }
-
-        running_ = false;
-    }
-    bool start() {
-        if (fmtCtx_) return true;
-        avdevice_register_all();
-        
-        if (devicePath_.empty()) {
-            fprintf(stderr, "[FFmpegVideoSource] Device path is empty\n");
-            return false;
-        }
-        
-        std::string deviceName = getDirectShowDeviceName(devicePath_);
-        if (deviceName.empty()) {
-            // fprintf(stderr, "[FFmpegVideoSource] Cannot find DirectShow device name for path: %s\n", devicePath_.c_str());
-            return false;
-        }
-        
-        std::string inputName = "video=" + deviceName;
-        fprintf(stderr, "[FFmpegVideoSource] Opening device: %s\n", inputName.c_str());
-        
-        AVDictionary* opts = nullptr;
-        char sizeStr[32];
-        char fpsStr[16];
-        snprintf(sizeStr, sizeof(sizeStr), "%dx%d", width_, height_);
-        snprintf(fpsStr, sizeof(fpsStr), "%d", fps_);
-        printf("[FFmpegVideoSource] Video option %dx%d %dfps\n", width_, height_, fps_);
-        av_dict_set(&opts, "video_size", sizeStr, 0);
-        av_dict_set(&opts, "framerate", fpsStr, 0);
-        av_dict_set(&opts, "rtbufsize", "100M", 0);
-        
-        const AVInputFormat* ifmt = av_find_input_format("dshow");
-        fmtCtx_ = avformat_alloc_context();
-        runningPtr_ = &running_;
-        fmtCtx_->interrupt_callback.callback = interruptCallback;
-        fmtCtx_->interrupt_callback.opaque = this;
-        if (deviceIndex_ >= 0)
-        {
-            char idx[8];
-            sprintf(idx,"%d",deviceIndex_);
-            av_dict_set(&opts,"video_device_number",idx,0);
-        }
-        int ret = avformat_open_input(&fmtCtx_, inputName.c_str(), ifmt, &opts);
-        av_dict_free(&opts);
-        
-        if (ret < 0) {
-            char errbuf[256];
-            av_strerror(ret, errbuf, sizeof(errbuf));
-            fprintf(stderr, "[FFmpegVideoSource] Failed to open %s: %s\n", inputName.c_str(), errbuf);
-            return false;
-        }
-        
-        ret = avformat_find_stream_info(fmtCtx_, nullptr);
-        if (ret < 0) {
-            fprintf(stderr, "[FFmpegVideoSource] Failed to find stream info\n");
-            return false;
-        }
-        
-        for (unsigned i = 0; i < fmtCtx_->nb_streams; ++i) {
-            if (fmtCtx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                videoIdx_ = i;
-                break;
-            }
-        }
-        
-        if (videoIdx_ == -1) {
-            fprintf(stderr, "[FFmpegVideoSource] No video stream found\n");
-            return false;
-        }
-        
-        packet_ = av_packet_alloc();
-        running_ = true;
-        fprintf(stderr, "[FFmpegVideoSource] Started successfully\n");
-        return true;
-    }
-    void stop() {
-        running_ = false;
-        if (fmtCtx_) avformat_close_input(&fmtCtx_);
-        fmtCtx_ = nullptr;
-        if (packet_) av_packet_free(&packet_);
-        packet_ = nullptr;
-    }
-    bool pollFrame(uint8_t*& data, size_t& size, int& width, int& height, PixelFormat& fmt, uint64_t& ts, uint64_t& tsRight) {
-        if (!fmtCtx_ || !running_) return false;
-        int ret = av_read_frame(fmtCtx_, packet_);
-        if (ret < 0) {
-            if (ret == AVERROR(EAGAIN)) {
-                return false;
-            }
-            return false;
-        }
-        if (packet_->stream_index != videoIdx_) {
-            av_packet_unref(packet_);
-            return false;
-        }
-
-        uint8_t* copy = new uint8_t[packet_->size];
-        memcpy(copy, packet_->data, packet_->size);
-        data = copy;
-        size = packet_->size;
-        width = width_;
-        height = height_;
-        fmt = format_;
-
-        ts = 0;
-        tsRight = 0;
-        if (format_ == PixelFormat::MJPEG) {
-            const uint8_t* mjpegData = data;
-            const size_t mjpegSize = size;
-            size_t pos = 0;
-            while (pos + 4 < mjpegSize) {
-                if (mjpegData[pos] == 0xFF && mjpegData[pos + 1] == 0xE1) {
-                    const uint16_t len = (static_cast<uint16_t>(mjpegData[pos + 2]) << 8) | static_cast<uint16_t>(mjpegData[pos + 3]);
-                    if (len >= 12 && pos + 4 + len <= mjpegSize &&
-                        mjpegData[pos + 4] == 'T' && mjpegData[pos + 5] == 'S' &&
-                        mjpegData[pos + 6] == '_' && mjpegData[pos + 7] == '_') {
-                        memcpy(&ts, mjpegData + pos + 8, sizeof(uint64_t));
-                    }
-                    break;
-                }
-                ++pos;
-            }
-        } else if (format_ == PixelFormat::GREY && size >= static_cast<size_t>(width_) * (height_ - 1) + 8) {
-            memcpy(&ts, data + width_ * (height_ - 1), 8);
-        } else if (format_ == PixelFormat::Z16 && size >= static_cast<size_t>(width_) * (height_ - 2) * 2 + 8) {
-            memcpy(&ts, data + width_ * (height_ - 2) * 2, 8);
-        }
-
-        if (format_ == PixelFormat::GREY && size >= static_cast<size_t>(width_) * (height_ - 1) + 16) {
-            memcpy(&tsRight, data + width_ * (height_ - 1) + 8, 8);
-        }
-
-        av_packet_unref(packet_);
-        return true;
-    }
-
-private:
-    std::string devicePath_;
-    int deviceIndex_ = -1;
-    int width_ = 0, height_ = 0;
-    PixelFormat format_ = PixelFormat::Unknown;
-    int fps_ = 30;
-    AVFormatContext* fmtCtx_ = nullptr;
-    AVPacket* packet_ = nullptr;
-    int videoIdx_ = -1;
-    std::atomic<bool> running_{false};
-    static int interruptCallback(void* ctx);
-    std::atomic<bool>* runningPtr_ = nullptr;
-};
 
 class HidDevice {
 public:
@@ -452,153 +1394,388 @@ private:
     hid_device* dev_ = nullptr;
 };
 
-int FFmpegVideoSource::interruptCallback(void* ctx) {
-    FFmpegVideoSource* self = static_cast<FFmpegVideoSource*>(ctx);
-    return self->running_ ? 0 : 1;
+class ImuSensorEvents : public ISensorEvents {
+public:
+    ImuSensorEvents(bool isAccel, IPortableDeviceKeyCollection* pAllKeys)
+        : isAccel_(isAccel), pAllKeys_(pAllKeys) {
+        if (pAllKeys_) pAllKeys_->AddRef();
+    }
+    ~ImuSensorEvents() {
+        if (pAllKeys_) pAllKeys_->Release();
+    }
+
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_ISensorEvents) {
+            *ppv = static_cast<ISensorEvents*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // ISensorEvents
+    HRESULT STDMETHODCALLTYPE OnEvent(ISensor*, REFGUID, IPortableDeviceValues*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnLeave(REFSENSOR_ID sensorID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnStateChanged(ISensor* pSensor, SensorState state) override {
+        printf("[IMU] sensor state changed: %d (isAccel=%d)\n", (int)state, isAccel_);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDataUpdated(ISensor* pSensor, ISensorDataReport* pReport) override {
+        if (!pReport) return S_OK;
+
+        PROPVARIANT var;
+        PropVariantInit(&var);
+
+        uint32_t tsLow = 0, tsHigh = 0;
+        bool haveDevTs = false;
+        if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_DEV_TS_LOW, &var))) {
+            PropVariantToUInt32(var, &tsLow);
+            PropVariantClear(&var);
+            haveDevTs = true;
+        }
+        if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_DEV_TS_HIGH, &var))) {
+            PropVariantToUInt32(var, &tsHigh);
+            PropVariantClear(&var);
+        }
+
+        uint64_t ts_device = 0;
+        if (haveDevTs) {
+            uint32_t tick32 = ((tsHigh & 0xFFFF) << 16) | (tsLow & 0xFFFF);
+            ts_device = unwrapImuDeviceTimestamp(isAccel_, tick32);
+        }
+
+        if (isAccel_) {
+            double ax = 0, ay = 0, az = 0;
+            if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ACCELERATION_X_G, &var))) {
+                PropVariantToDouble(var, &ax); PropVariantClear(&var);
+            }
+            if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ACCELERATION_Y_G, &var))) {
+                PropVariantToDouble(var, &ay); PropVariantClear(&var);
+            }
+            if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ACCELERATION_Z_G, &var))) {
+                PropVariantToDouble(var, &az); PropVariantClear(&var);
+            }
+            constexpr double G_TO_MS2 = 9.80665;
+            std::lock_guard<std::mutex> lk(g_imuStateMutex);
+            g_lastAx = (float)(ax * G_TO_MS2);
+            g_lastAy = (float)(ay * G_TO_MS2);
+            g_lastAz = (float)(az * G_TO_MS2);
+            g_lastAccelTs = ts_device;
+        } else {
+            double gx = 0, gy = 0, gz = 0;
+            if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ANGULAR_VELOCITY_X_DEGREES_PER_SECOND, &var))) {
+                PropVariantToDouble(var, &gx); PropVariantClear(&var);
+            }
+            if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ANGULAR_VELOCITY_Y_DEGREES_PER_SECOND, &var))) {
+                PropVariantToDouble(var, &gy); PropVariantClear(&var);
+            }
+            if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ANGULAR_VELOCITY_Z_DEGREES_PER_SECOND, &var))) {
+                PropVariantToDouble(var, &gz); PropVariantClear(&var);
+            }
+            constexpr double DEG_TO_RAD = 3.14159265358979 / 180.0;
+            std::lock_guard<std::mutex> lk(g_imuStateMutex);
+            g_lastGx = (float)(gx * DEG_TO_RAD);
+            g_lastGy = (float)(gy * DEG_TO_RAD);
+            g_lastGz = (float)(gz * DEG_TO_RAD);
+            g_lastGyroTs = ts_device;
+        }
+
+        if (g_ctx.imuCb) {
+            std::lock_guard<std::mutex> lk(g_imuStateMutex);
+            g_ctx.imuCb(g_lastAx, g_lastAy, g_lastAz,
+                        g_lastGx, g_lastGy, g_lastGz,
+                        isAccel_ ? g_lastAccelTs : g_lastGyroTs,
+                        g_ctx.imuUser);
+        }
+        return S_OK;
+    }
+
+private:
+    bool isAccel_;
+    LONG ref_ = 1;
+    IPortableDeviceKeyCollection* pAllKeys_ = nullptr;
+
+    static uint64_t unwrapImuDeviceTimestamp(bool isAccel, uint32_t tick32) {
+        static std::mutex s_mtx;
+        static uint32_t s_lastTick[2] = {0, 0};
+        static uint64_t s_highPart[2] = {0, 0};
+        static bool     s_inited[2]   = {false, false};
+
+        int idx = isAccel ? 0 : 1;
+        std::lock_guard<std::mutex> lk(s_mtx);
+        if (!s_inited[idx]) {
+            s_inited[idx] = true;
+            s_lastTick[idx] = tick32;
+            return tick32;
+        }
+        if (tick32 < s_lastTick[idx]) {
+            s_highPart[idx] += (1ULL << 32);
+        }
+        s_lastTick[idx] = tick32;
+        return s_highPart[idx] + tick32;
+    }
+};
+
+// ============ IMU Thread：STA Message Pump ============
+static void imuSensorThreadFunc() {
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hrCo) && hrCo != S_FALSE) {
+        fprintf(stderr, "[IMU] CoInitializeEx(STA) failed hr=0x%08lx\n", hrCo);
+        return;
+    }
+
+    ISensorManager* pManager = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_SensorManager, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&pManager));
+    if (FAILED(hr)) {
+        fprintf(stderr, "[IMU] CoCreateInstance(SensorManager) failed hr=0x%08lx\n", hr);
+        CoUninitialize();
+        return;
+    }
+
+    ISensor *pAccel = nullptr, *pGyro = nullptr;
+    ImuSensorEvents *pAccelEvents = nullptr, *pGyroEvents = nullptr;
+
+    auto bindOne = [&](REFSENSOR_TYPE_ID typeId, bool isAccel, ISensor** outSensor, ImuSensorEvents** outEvents) {
+        ISensorCollection* pColl = nullptr;
+        if (FAILED(pManager->GetSensorsByType(typeId, &pColl)) || !pColl) return false;
+        ULONG count = 0;
+        pColl->GetCount(&count);
+        if (count == 0) { pColl->Release(); return false; }
+        ISensor* pSensor = nullptr;
+        pColl->GetAt(0, &pSensor);
+        pColl->Release();
+        if (!pSensor) return false;
+
+        IPortableDeviceKeyCollection* pAllKeys = nullptr;
+        pSensor->GetSupportedDataFields(&pAllKeys);
+
+        auto* events = new ImuSensorEvents(isAccel, pAllKeys);
+        if (pAllKeys) pAllKeys->Release();
+        if (FAILED(pSensor->SetEventSink(events))) {
+            events->Release();
+            pSensor->Release();
+            return false;
+        }
+        *outSensor = pSensor;
+        *outEvents = events;
+        return true;
+    };
+
+    bool hasAccel = bindOne(SENSOR_TYPE_ACCELEROMETER_3D, true, &pAccel, &pAccelEvents);
+    bool hasGyro  = bindOne(SENSOR_TYPE_GYROMETER_3D, false, &pGyro, &pGyroEvents);
+
+    if (!hasAccel && !hasGyro) {
+        fprintf(stderr, "[IMU] No accelerometer/gyrometer sensor found via Sensor API\n");
+        pManager->Release();
+        CoUninitialize();
+        return;
+    }
+    printf("[IMU] Sensor API bound: accel=%d gyro=%d\n", hasAccel, hasGyro);
+
+    // STA Message Pump
+    MSG msg;
+    while (g_ctx.running) {
+        DWORD ret = MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+        if (!g_ctx.running) break;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    if (pAccel) { pAccel->SetEventSink(nullptr); pAccel->Release(); }
+    if (pGyro)  { pGyro->SetEventSink(nullptr);  pGyro->Release(); }
+    if (pAccelEvents) pAccelEvents->Release();
+    if (pGyroEvents)  pGyroEvents->Release();
+    pManager->Release();
+    CoUninitialize();
+    printf("[IMU] sensor thread exited\n");
 }
 
-static void videoThreadFunc(int camId) {
-    auto* src = g_ctx.videos[camId];
-    if (!src) return;
+static int streamToLogicalCamId(int uvcId, DWORD streamIndex) {
+    if (uvcId == RGB_UVC_ID && streamIndex == 0) {
+        return RGB_CAM_ID;  // 0
+    } else if (uvcId == COMPOSITE_UVC_ID) {
+        if (streamIndex == DEPTH_STREAM_ID) {
+            return DEPTH_CAM_ID;  // 2
+        } else if (streamIndex == GRAY_STREAM_ID) {
+            return GRAY_CAM_ID;   // 1
+        }
+    }
+    return -1;
+}
 
-    uint64_t& last_ts = g_ctx.last_img_timestamp[camId];
+static void deliverFrame(int uvcId, uint8_t* data, size_t size, const FrameInfo& info) {
+    if (!g_ctx.imgCb) return;
     
-    bool need_reconnect = false;
-    auto last_reconnect_attempt = std::chrono::steady_clock::now();
-    auto last_success_time = std::chrono::steady_clock::now();
-    bool first_frame_received = false;
+    int callbackCamId = streamToLogicalCamId(uvcId, info.streamIndex);
+    if (callbackCamId < 0 || callbackCamId >= LOGICAL_CAM_NUM) {
+        printf("[SDK] Invalid frame mapping: uvc=%d stream=%lu\n", uvcId, info.streamIndex);
+        return;
+    }
 
-    while (g_ctx.cam_running[camId]) {
-        uint8_t* data = nullptr;
-        size_t size = 0;
-        int w = 0, h = 0;
-        PixelFormat fmt = PixelFormat::Unknown;
-        uint64_t ts = 0, tsRight = 0;
+    unsigned int v4l2Fmt = 0;
+    if (info.format == PixelFormat::MJPEG) v4l2Fmt = 0x47504A4D;  // 'MJPG'
+    else if (info.format == PixelFormat::GREY) v4l2Fmt = 0x59455247;  // 'GREY'
+    else if (info.format == PixelFormat::Z16) v4l2Fmt = 0x36315A;  // 'Z16 '
+    else if (info.format == PixelFormat::Y8I) v4l2Fmt = 0x49385956;  // 'Y8I '
+    else if (info.format == PixelFormat::YUYV) v4l2Fmt = 0x32595559;  // 'YUYV'
+    else if (info.format == PixelFormat::RGB8) v4l2Fmt = 0x42475200;  // 'RGB8'
+    else if (info.format == PixelFormat::NV12) v4l2Fmt = 0x3231564E;   // 'NV12'
 
-        if (!src->pollFrame(data, size, w, h, fmt, ts, tsRight)) {
-            if (!g_ctx.cam_running[camId]) break;
-            
-            auto now = std::chrono::steady_clock::now();
-            if (first_frame_received && (now - last_success_time > std::chrono::seconds(3))) {
-                need_reconnect = true;
+    g_ctx.imgCb(callbackCamId, data, size, info.width, info.height, 
+                v4l2Fmt, info.timestamp, g_ctx.imgUser);
+}
+
+static void videoThreadFunc(int uvcId) {
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hrCo) && hrCo != S_FALSE) {
+        printf("[SDK] videoThreadFunc(%d): CoInitializeEx failed hr=0x%08lx\n", uvcId, hrCo);
+        return;
+    }
+    if (uvcId < 0 || uvcId >= UVC_NUM) {
+        return;
+    }
+
+    MFVideoSource* src = g_ctx.videos[uvcId];
+
+    if (!src) {
+        return;
+    }
+
+    printf("[SDK] Video thread started: UVC=%d path=%s\n", uvcId, g_ctx.videoPaths[uvcId].c_str());
+    // =====================================================
+    // RGB UVC
+    // =====================================================
+    if (uvcId == RGB_UVC_ID) {
+        while (g_ctx.running && g_ctx.cam_running[RGB_CAM_ID] && src->isRunning()) {
+            uint8_t* data = nullptr;
+            size_t size = 0;
+            FrameInfo info{};
+
+            if (src->readFrame(0, data, size, info)) {
+                deliverFrame( uvcId, data, size, info);
+                delete[] data;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
         }
+    }
+    // =====================================================
+    // MI_00 Composite UVC
+    //
+    // Stream 0 = Depth
+    // Stream 1 = Gray
+    // =====================================================
+    else if (uvcId == COMPOSITE_UVC_ID) {
+        while (g_ctx.running && (g_ctx.cam_running[GRAY_CAM_ID] || g_ctx.cam_running[DEPTH_CAM_ID]) && src->isRunning()) {
+            bool gotFrame = false;
+            // =================================================
+            // Depth
+            // Stream 0 -> cam 2
+            // =================================================
+            if (g_ctx.cam_running[DEPTH_CAM_ID]) {
+                uint8_t* data = nullptr;
+                size_t size = 0;
+                FrameInfo info{};
 
-        if (!first_frame_received) {
-            first_frame_received = true;
-            printf("[SDK] Camera %d received first frame\n", camId);
-        }
-        last_success_time = std::chrono::steady_clock::now();
-
-        uint8_t* callbackData = data;
-        size_t callbackSize = size;
-        bool customAllocated = false;
-        uint64_t finalTs = ts;
-        uint64_t finalTsRight = tsRight;
-
-        if (fmt == PixelFormat::MJPEG && size >= 4 && data[0] == 0xFF && data[1] == 0xD8) {
-            size_t pos = 2;
-            bool foundApp1 = false;
-            
-            while (pos + 3 < size) {
-                if (data[pos] == 0xFF && data[pos+1] == 0xE1) {
-                    uint16_t segLen = (data[pos+2] << 8) | data[pos+3];
-                    size_t appTotal = 2 + segLen;
-                    
-                    if (pos + appTotal <= size) {
-                        if (appTotal >= 2 + 4 + sizeof(uint64_t) &&
-                            data[pos + 4] == 'T' && data[pos + 5] == 'S' &&
-                            data[pos + 6] == '_' && data[pos + 7] == '_') {
-                            
-                            size_t remainingSize = size - (pos + appTotal);
-                            uint8_t* newBuf = new uint8_t[2 + remainingSize];
-                            newBuf[0] = 0xFF;
-                            newBuf[1] = 0xD8;
-                            if (remainingSize > 0) {
-                                memcpy(newBuf + 2, data + pos + appTotal, remainingSize);
-                            }
-                            
-                            callbackData = newBuf;
-                            callbackSize = 2 + remainingSize;
-                            customAllocated = true;
-                            foundApp1 = true;
-                            
-                            break;
-                        }
-                    }
-                    pos += appTotal;
-                } else {
-                    pos++;
+                if (src->readFrame(DEPTH_STREAM_ID, data, size, info)) {
+                    deliverFrame(uvcId, data, size, info);
+                    delete[] data;
+                    gotFrame = true;
                 }
             }
+            // =================================================
+            // Gray / IR
+            // Stream 1 -> cam 1
+            // =================================================
+            if (g_ctx.cam_running[GRAY_CAM_ID]) {
+                uint8_t* data = nullptr;
+                size_t size = 0;
+                FrameInfo info{};
+                if (src->readFrame(GRAY_STREAM_ID, data, size, info)) {
+                    deliverFrame(uvcId, data, size, info);
+                    delete[] data;
+                    gotFrame = true;
+                }
+            }
+            if (!gotFrame) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
-
-        bool shouldCallCallback = true;
-        if (callbackData == nullptr || callbackSize == 0) shouldCallCallback = false;
-        else if (finalTs == 0) shouldCallCallback = false;
-        else if (finalTs == last_ts) shouldCallCallback = false;
-        else last_ts = finalTs;
-
-        if (shouldCallCallback && g_ctx.imgCb) {
-            unsigned int v4l2Fmt = 0;
-            if (fmt == PixelFormat::MJPEG) v4l2Fmt = 0x47504A4D;
-            else if (fmt == PixelFormat::GREY) v4l2Fmt = 0x59455247;
-            else if (fmt == PixelFormat::Z16) v4l2Fmt = 0x36315A;
-            else if (fmt == PixelFormat::Y8I) v4l2Fmt = 0x49385956;
-            
-            g_ctx.imgCb(camId, callbackData, callbackSize, w, h, v4l2Fmt, 
-                       finalTs, finalTsRight, g_ctx.imgUser);
-        }
-
-        if (customAllocated) {
-            delete[] callbackData;
-        }
-        delete[] data;
     }
+
+    printf("[SDK] Video thread stopped: UVC=%d\n", uvcId);
+    CoUninitialize();
 }
 
 static void hidThreadFunc(int idx) {
     auto* dev = g_ctx.hidDevs[idx];
     if (!dev) return;
+
+    uint64_t last_accel_ts = 0, last_gyro_ts = 0, last_vio_ts = 0;
+    float last_ax = 0, last_ay = 0, last_az = 0;
+    float last_gx = 0, last_gy = 0, last_gz = 0;
+
     uint8_t buf[64];
     while (g_ctx.running) {
         size_t len = sizeof(buf);
-        if (dev->read(buf, len)) {
-            if (idx == 0 && g_ctx.imuCb) {
-                if (len >= 32) {
-                    float ax, ay, az, gx, gy, gz;
-                    uint64_t ts;
-                    memcpy(&ax, buf, 4);
-                    memcpy(&ay, buf+4, 4);
-                    memcpy(&az, buf+8, 4);
-                    memcpy(&gx, buf+12, 4);
-                    memcpy(&gy, buf+16, 4);
-                    memcpy(&gz, buf+20, 4);
-                    memcpy(&ts, buf+24, 8);
-                    g_ctx.imuCb(ax, ay, az, gx, gy, gz, ts, g_ctx.imuUser);
+        if (!dev->read(buf, len)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        uint8_t report_id = buf[0];
+
+        if (idx == 0) {
+            if (report_id == 0x01 && len >= sizeof(imu_accel_report_t)) {
+                auto* r = reinterpret_cast<imu_accel_report_t*>(buf);
+                if (r->timestamp == last_accel_ts) continue;
+                last_accel_ts = r->timestamp;
+                last_ax = (float)((double)r->accel_x / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB);
+                last_ay = (float)((double)r->accel_y / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB);
+                last_az = (float)((double)r->accel_z / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB);
+                if (g_ctx.imuCb) {
+                    g_ctx.imuCb(last_ax, last_ay, last_az, last_gx, last_gy, last_gz,
+                                r->timestamp, g_ctx.imuUser);
                 }
-            } else if (idx == 1 && g_ctx.vioCb) {
-                if (len >= 32) {
-                    uint64_t ts; float px, py, pz, qx, qy, qz, qw;
-                    memcpy(&ts, buf, 8);
-                    memcpy(&px, buf+8, 4);
-                    memcpy(&py, buf+12, 4);
-                    memcpy(&pz, buf+16, 4);
-                    memcpy(&qx, buf+20, 4);
-                    memcpy(&qy, buf+24, 4);
-                    memcpy(&qz, buf+28, 4);
-                    memcpy(&qw, buf+32, 4);
-                    g_ctx.vioCb(px, py, pz, qx, qy, qz, qw, ts, g_ctx.vioUser);
+            } else if (report_id == 0x02 && len >= sizeof(imu_gyro_report_t)) {
+                auto* r = reinterpret_cast<imu_gyro_report_t*>(buf);
+                if (r->timestamp == last_gyro_ts) continue;
+                last_gyro_ts = r->timestamp;
+                last_gx = (float)((double)r->gyro_x / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB);
+                last_gy = (float)((double)r->gyro_y / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB);
+                last_gz = (float)((double)r->gyro_z / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB);
+                if (g_ctx.imuCb) {
+                    g_ctx.imuCb(last_ax, last_ay, last_az, last_gx, last_gy, last_gz,
+                                r->timestamp, g_ctx.imuUser);
                 }
             }
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (len >= sizeof(vio_hid_payload)) {
+                auto* p = reinterpret_cast<vio_hid_payload*>(buf);
+                if (p->timestamp != 0 && p->timestamp == last_vio_ts) continue;
+                last_vio_ts = p->timestamp;
+                if (g_ctx.vioCb) {
+                    g_ctx.vioCb(p->px, p->py, p->pz, p->qx, p->qy, p->qz, p->qw,
+                                p->timestamp, g_ctx.vioUser);
+                }
+            }
         }
     }
 }
 
+// ==================== SDK API ====================
 int insight9_receive_init(const insight9_config_t* config) {
     if (g_ctx.initialized) {
         fprintf(stderr, "[SDK] Already initialized\n");
@@ -619,17 +1796,20 @@ int insight9_receive_init(const insight9_config_t* config) {
 
     memset(&g_ctx, 0, sizeof(g_ctx));
     g_ctx.running = false;
-    for (int i = 0; i < CAM_NUM; ++i) {
+    for (int i = 0; i < UVC_NUM; ++i) {
+        g_ctx.videos[i] = nullptr;
+    }
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
         g_ctx.cam_running[i] = false;
+        g_ctx.last_img_timestamp[i] = 0;
     }
     g_ctx.config = *config;
 
-    avdevice_register_all();
     hid_init();
 
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    if (uvcPaths.size() < 3) {
-        fprintf(stderr, "[SDK] Need at least 3 UVC devices, found %zu\n", uvcPaths.size());
+    if (uvcPaths.size() < 2) {
+        fprintf(stderr, "[SDK] Need at least 2 UVC devices, found %zu\n", uvcPaths.size());
         return -1;
     }
     
@@ -639,45 +1819,57 @@ int insight9_receive_init(const insight9_config_t* config) {
         CoUninitialize();
         return -1;
     }
-    g_com_initialized_by_sdk = SUCCEEDED(hr) || hr == S_FALSE;
-    fprintf(stderr, "[SDK] COM initialized by SDK (hr=0x%08lx)\n", hr);
 
-    for (int i = 0; i < CAM_NUM; ++i) {
+    for (int i = 0; i < UVC_NUM; ++i) {
         g_ctx.videoPaths[i] = uvcPaths[i];
-        g_ctx.videos[i] = new FFmpegVideoSource();
-        int w = (i==0)? config->rgb_config.width : (i==1)? config->gray_config.width : config->depth_config.width;
-        int h = (i==0)? config->rgb_config.height : (i==1)? config->gray_config.height : config->depth_config.height;
-        PixelFormat fmt = (i==0)? config->rgb_config.pixel_format : (i==1)? config->gray_config.pixel_format : config->depth_config.pixel_format;
-        int fps = (i==0)? config->rgb_config.fps : (i==1)? config->gray_config.fps : config->depth_config.fps;
-        if (!g_ctx.videos[i]->open(uvcPaths[i], i, w, h, fmt, fps)) {
+        g_ctx.videos[i] = new MFVideoSource();
+        bool opened = false;
+        if (i == RGB_UVC_ID) {
+            opened = g_ctx.videos[i]->open(uvcPaths[i], i,
+                        config->rgb_config.width, config->rgb_config.height,
+                        config->rgb_config.pixel_format, config->rgb_config.fps);
+        } else if (i == COMPOSITE_UVC_ID) {
+            int depthW = config->depth_config.width, depthH = config->depth_config.height;
+            int grayW  = config->gray_config.width,  grayH  = config->gray_config.height;
+            if (depthW != grayW || depthH != grayH) {
+                printf("[SDK] Warning: composite streams size mismatch, using Gray size for both.\n");
+                depthW = grayW; depthH = grayH;
+            }
+            opened = g_ctx.videos[i]->openWithTwoStreams(uvcPaths[i], i,
+                        depthW, depthH, config->depth_config.pixel_format, config->depth_config.fps,
+                        config->gray_config.pixel_format, config->gray_config.fps);
+        }
+        if (!opened) {
             fprintf(stderr, "[SDK] Failed to open video device %d: %s\n", i, uvcPaths[i].c_str());
             return -1;
         }
     }
+    
     auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
-    if (hidPaths.size() < 2) {
-        fprintf(stderr, "[SDK] IMU or VIO device not found (found %zu HID devices)\n", hidPaths.size());
+    if (hidPaths.size() < 1) {
+        fprintf(stderr, "[SDK] VIO device not found (found %zu HID devices)\n", hidPaths.size());
         return -1;
     }
     g_ctx.hidPaths[0] = hidPaths[0];
-    g_ctx.hidPaths[1] = hidPaths[1];
-    printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
-    printf("[HID] VIO device (interface %d): %s\n", 1, g_ctx.hidPaths[1].c_str());
+    // g_ctx.hidPaths[1] = hidPaths[1];
+    // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
+    printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
-    g_ctx.hidDevs[1] = new HidDevice();
+    // g_ctx.hidDevs[1] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open IMU HID\n");
         return -1;
     }
-    if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
-        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
-        return -1;
-    }
+    // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
+    //     fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+    //     return -1;
+    // }
 
     g_ctx.xu = new viewer::ExtensionUnitControl();
     if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open XU control\n");
-        delete g_ctx.xu; g_ctx.xu = nullptr;
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
     }
 
     g_ctx.initialized = true;
@@ -704,89 +1896,180 @@ int insight9_receive_init_default() {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE) {
         fprintf(stderr, "[SDK] CoInitializeEx failed, hr=0x%08lx\n", hr);
+        CoUninitialize();
         return -1;
     }
-    g_com_initialized_by_sdk = SUCCEEDED(hr) || hr == S_FALSE;
-    fprintf(stderr, "[SDK] COM initialized by SDK (hr=0x%08lx)\n", hr);
 
     memset(&g_ctx, 0, sizeof(g_ctx));
-    for (int i = 0; i < CAM_NUM; ++i) {
+    g_ctx.running = false;
+    
+    for (int i = 0; i < UVC_NUM; ++i) {
+        g_ctx.videos[i] = nullptr;
+    }
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
         g_ctx.cam_running[i] = false;
+        g_ctx.last_img_timestamp[i] = 0;
     }
 
-    g_ctx.config.rgb_config.width = MAIN_WIDTH;
-    g_ctx.config.rgb_config.height = MAIN_HEIGHT;
-    g_ctx.config.rgb_config.fps = 30;
-    g_ctx.config.rgb_config.pixel_format = MAIN_FORMAT;
-    
-    g_ctx.config.gray_config.width = SUB_WIDTH;
-    g_ctx.config.gray_config.height = SUB_HEIGHT;
-    g_ctx.config.gray_config.fps = 30;
-    g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
-    
-    g_ctx.config.depth_config.width = DEPTH_WIDTH;
-    g_ctx.config.depth_config.height = DEPTH_HEIGHT;
-    g_ctx.config.depth_config.fps = 30;
-    g_ctx.config.depth_config.pixel_format = DEPTH_FORMAT;
-
-    avdevice_register_all();
     hid_init();
 
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    if (uvcPaths.size() < 3) {
-        fprintf(stderr, "[SDK] Need at least 3 UVC devices, found %zu\n", uvcPaths.size());
+    if (uvcPaths.size() < 2) {
+        fprintf(stderr, "[SDK] Need at least 2 UVC devices, found %zu\n", uvcPaths.size());
         return -1;
     }
-    for (int i = 0; i < CAM_NUM; ++i) {
+
+    printf("[SDK] Probing device capabilities...\n");
+    
+    if (uvcPaths.size() > 0) {
+        probeDeviceCapabilities(uvcPaths[0], 0, g_ctx.device_caps);
+    }
+    
+    if (uvcPaths.size() > 1) {
+        probeDeviceCapabilities(uvcPaths[1], 1, g_ctx.device_caps);
+    }
+    
+    if (g_ctx.device_caps.rgb_default.valid) {
+        g_ctx.config.rgb_config.width = g_ctx.device_caps.rgb_default.width;
+        g_ctx.config.rgb_config.height = g_ctx.device_caps.rgb_default.height;
+        g_ctx.config.rgb_config.fps = g_ctx.device_caps.rgb_default.fps;
+        g_ctx.config.rgb_config.pixel_format = g_ctx.device_caps.rgb_default.format;
+        printf("[SDK] Using probed RGB config: %dx%d@%d\n", 
+               g_ctx.config.rgb_config.width, 
+               g_ctx.config.rgb_config.height,
+               g_ctx.config.rgb_config.fps);
+    } else {
+        g_ctx.config.rgb_config.width = MAIN_WIDTH;
+        g_ctx.config.rgb_config.height = MAIN_HEIGHT;
+        g_ctx.config.rgb_config.fps = 30;
+        g_ctx.config.rgb_config.pixel_format = MAIN_FORMAT;
+        printf("[SDK] Using fallback RGB config: %dx%d@%d\n", 
+               g_ctx.config.rgb_config.width, 
+               g_ctx.config.rgb_config.height,
+               g_ctx.config.rgb_config.fps);
+    }
+    
+    if (g_ctx.device_caps.gray_default.valid) {
+        g_ctx.config.gray_config.width = g_ctx.device_caps.gray_default.width;
+        g_ctx.config.gray_config.height = g_ctx.device_caps.gray_default.height;
+        g_ctx.config.gray_config.fps = g_ctx.device_caps.gray_default.fps;
+        g_ctx.config.gray_config.pixel_format = g_ctx.device_caps.gray_default.format;
+        printf("[SDK] Using probed Gray config: %dx%d@%d\n", 
+               g_ctx.config.gray_config.width, 
+               g_ctx.config.gray_config.height,
+               g_ctx.config.gray_config.fps);
+    } else {
+        g_ctx.config.gray_config.width = SUB_WIDTH;
+        g_ctx.config.gray_config.height = SUB_HEIGHT;
+        g_ctx.config.gray_config.fps = 30;
+        g_ctx.config.gray_config.pixel_format = SUB_FORMAT;
+        printf("[SDK] Using fallback Gray config: %dx%d@%d\n", 
+               g_ctx.config.gray_config.width, 
+               g_ctx.config.gray_config.height,
+               g_ctx.config.gray_config.fps);
+    }
+    
+    if (g_ctx.device_caps.depth_default.valid) {
+        g_ctx.config.depth_config.width = g_ctx.device_caps.depth_default.width;
+        g_ctx.config.depth_config.height = g_ctx.device_caps.depth_default.height;
+        g_ctx.config.depth_config.fps = g_ctx.device_caps.depth_default.fps;
+        g_ctx.config.depth_config.pixel_format = g_ctx.device_caps.depth_default.format;
+        printf("[SDK] Using probed Depth config: %dx%d@%d\n", 
+            g_ctx.config.depth_config.width, 
+            g_ctx.config.depth_config.height,
+            g_ctx.config.depth_config.fps);
+    } else {
+        if (g_ctx.device_caps.gray_default.valid) {
+            g_ctx.config.depth_config.width = g_ctx.device_caps.gray_default.width;
+            g_ctx.config.depth_config.height = g_ctx.device_caps.gray_default.height;
+            g_ctx.config.depth_config.fps = g_ctx.device_caps.gray_default.fps;
+            g_ctx.config.depth_config.pixel_format = PixelFormat::Z16;
+            printf("[SDK] Using Gray config for Depth fallback: %dx%d@%d\n", 
+                g_ctx.config.depth_config.width, 
+                g_ctx.config.depth_config.height,
+                g_ctx.config.depth_config.fps);
+        } else {
+            g_ctx.config.depth_config.width = 424;
+            g_ctx.config.depth_config.height = 240;
+            g_ctx.config.depth_config.fps = 30;
+            g_ctx.config.depth_config.pixel_format = PixelFormat::Z16;
+            printf("[SDK] Using hardcoded Depth fallback: 424x240@30\n");
+        }
+    }
+    
+     for (int i = 0; i < UVC_NUM; ++i) {
         g_ctx.videoPaths[i] = uvcPaths[i];
-        g_ctx.videos[i] = new FFmpegVideoSource();
-        int w = (i==0)? MAIN_WIDTH : (i==1)? SUB_WIDTH : DEPTH_WIDTH;
-        int h = (i==0)? MAIN_HEIGHT : (i==1)? SUB_HEIGHT : DEPTH_HEIGHT;
-        PixelFormat fmt = (i==0)? MAIN_FORMAT : (i==1)? SUB_FORMAT : DEPTH_FORMAT;
-        if (!g_ctx.videos[i]->open(uvcPaths[i], i, w, h, fmt, 30)) {
-            fprintf(stderr, "[SDK] Failed to open video device %d: %s\n", i, uvcPaths[i].c_str());
+        g_ctx.videos[i] = new MFVideoSource();
+        
+        bool opened = false;
+        if (i == RGB_UVC_ID) {
+            int w = g_ctx.config.rgb_config.width;
+            int h = g_ctx.config.rgb_config.height;
+            int fps = g_ctx.config.rgb_config.fps;
+            PixelFormat fmt = g_ctx.config.rgb_config.pixel_format;
+
+            opened = g_ctx.videos[i]->open(uvcPaths[i], i, w, h, fmt, fps);
+        } else if (i == COMPOSITE_UVC_ID) {
+            int depthW = g_ctx.config.depth_config.width;
+            int depthH = g_ctx.config.depth_config.height;
+            int depthFps = g_ctx.config.depth_config.fps;
+            PixelFormat depthFmt = g_ctx.config.depth_config.pixel_format;
+            int grayW = g_ctx.config.gray_config.width;
+            int grayH = g_ctx.config.gray_config.height;
+            int grayFps = g_ctx.config.gray_config.fps;
+            PixelFormat grayFmt = g_ctx.config.gray_config.pixel_format;
+            if (depthW != grayW || depthH != grayH) {
+                printf("[SDK] Warning: Composite streams have different configured sizes. "
+                    "Using Gray resolution for both because the current UVC device requires one shared media type size.\n"
+                );
+
+                depthW = grayW;
+                depthH = grayH;
+            }
+
+            printf("[SDK] Opening Composite UVC %d:\n"
+                "        Stream0 Depth: %dx%d@%d fmt=%d\n"
+                "        Stream1 Gray : %dx%d@%d fmt=%d\n",
+                i, depthW, depthH, depthFps, (int)depthFmt,
+                grayW, grayH, grayFps, (int)grayFmt
+            );
+
+            opened = g_ctx.videos[i]->openWithTwoStreams(uvcPaths[i], i,
+                    depthW, depthH, depthFmt,
+                    depthFps, grayFmt, grayFps
+                );
+        }
+        if (!opened) {
+            fprintf(stderr, "[SDK] Failed to open physical UVC %d: %s\n", i, uvcPaths[i].c_str());
+            delete g_ctx.videos[i];
+            g_ctx.videos[i] = nullptr;
             return -1;
         }
     }
+
     auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
-    if (hidPaths.size() < 2) {
-        fprintf(stderr, "[SDK] IMU or VIO device not found (found %zu HID devices)\n", hidPaths.size());
+    if (hidPaths.size() < 1) {
+        fprintf(stderr, "[SDK] VIO device not found (found %zu HID devices)\n", hidPaths.size());
         return -1;
     }
     g_ctx.hidPaths[0] = hidPaths[0];
-    g_ctx.hidPaths[1] = hidPaths[1];
-    printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
-    printf("[HID] VIO device (interface %d): %s\n", 1, g_ctx.hidPaths[1].c_str());
+    // g_ctx.hidPaths[1] = hidPaths[1];
+    // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
+    printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
-    g_ctx.hidDevs[1] = new HidDevice();
+    // g_ctx.hidDevs[1] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open IMU HID\n");
         return -1;
     }
-    if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
-        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
-        return -1;
-    }
+    // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
+    //     fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+    //     return -1;
+    // }
 
     g_ctx.xu = new viewer::ExtensionUnitControl();
-    if (g_ctx.xu->open(g_ctx.videoPaths[0])) {
-        printf("[SDK] XU control opened, reading current FPS...\n");
-        
-        uint8_t fpsIndex = 0;
-        if (g_ctx.xu->readCurrentFps(fpsIndex)) {
-            const int validFps[] = {0, 20, 30, 40, 50};
-            if (fpsIndex >= 0 && fpsIndex < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
-                int currentFps = validFps[fpsIndex];
-                if (currentFps > 0) {
-                    g_ctx.config.gray_config.fps = currentFps;
-                    printf("[SDK] Read current Gray FPS from device: %d (index: %d)\n", currentFps, fpsIndex);
-                }
-            }
-        } else {
-            printf("[SDK] Failed to read current FPS, using default\n");
-        }
-    } else {
-        fprintf(stderr, "[SDK] Failed to open XU control, using default FPS\n");
+    if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
+        fprintf(stderr, "[SDK] Failed to open XU control\n");
         delete g_ctx.xu;
         g_ctx.xu = nullptr;
     }
@@ -798,118 +2081,206 @@ int insight9_receive_init_default() {
 int insight9_receive_start() {
     if (!g_ctx.initialized || g_ctx.running) return -1;
     g_ctx.running = true;
+    g_ctx.cam_running[RGB_CAM_ID] = true;
+    g_ctx.cam_running[GRAY_CAM_ID] = true;
+    g_ctx.cam_running[DEPTH_CAM_ID] = true;
     
-    for (int i = 0; i < CAM_NUM; ++i) {
-        insight9_receive_start_camera(i);
+    for (int uvcId = 0; uvcId < UVC_NUM; ++uvcId) {
+        if (!g_ctx.videos[uvcId]) {
+            continue;
+        }
+
+        if (!g_ctx.videos[uvcId]->start()) {
+            fprintf(stderr, "[SDK] Failed to start UVC %d\n", uvcId);
+            g_ctx.running = false;
+            return -1;
+        }
+
+        g_ctx.videoThreads[uvcId] = std::thread(videoThreadFunc, uvcId);
     }
     
-    for (int i = 0; i < HID_NUM; ++i) {
-        g_ctx.hidThreads[i] = std::thread(hidThreadFunc, i);
-    }
+    g_ctx.hidThreads[0] = std::thread(imuSensorThreadFunc);
+    g_ctx.hidThreads[1] = std::thread(hidThreadFunc, 1);
+
     return 0;
 }
 
-const char* insight9_receive_get_video_dev(int cam_id) {
-    return (cam_id >=0 && cam_id < CAM_NUM) ? g_ctx.videoPaths[cam_id].c_str() : nullptr;
-}
+static int mapCompositeCamId(int cam_id);
 
 int insight9_receive_start_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
-    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    if (g_ctx.cam_running[cam_id]) return 0;
+    int mapped = mapCompositeCamId(cam_id);
+    if (mapped < 0 || mapped >= UVC_NUM) return -1;
+    if (g_ctx.cam_running[mapped]) return 0;
     
-    if (!g_ctx.videos[cam_id]) {
+    if (!g_ctx.videos[mapped]) {
         auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-        if (cam_id >= (int)uvcPaths.size()) return -1;
+        if (mapped >= (int)uvcPaths.size()) return -1;
         
-        g_ctx.videoPaths[cam_id] = uvcPaths[cam_id];
-        g_ctx.videos[cam_id] = new FFmpegVideoSource();
+        g_ctx.videoPaths[mapped] = uvcPaths[mapped];
+        g_ctx.videos[mapped] = new MFVideoSource();
         
-        int w = (cam_id==0)? g_ctx.config.rgb_config.width : 
-                (cam_id==1)? g_ctx.config.gray_config.width : 
-                            g_ctx.config.depth_config.width;
-        int h = (cam_id==0)? g_ctx.config.rgb_config.height : 
-                (cam_id==1)? g_ctx.config.gray_config.height : 
-                            g_ctx.config.depth_config.height;
-        PixelFormat fmt = (cam_id==0)? g_ctx.config.rgb_config.pixel_format : 
-                           (cam_id==1)? g_ctx.config.gray_config.pixel_format : 
-                                        g_ctx.config.depth_config.pixel_format;
-        int fps = (cam_id==0)? g_ctx.config.rgb_config.fps : 
-                   (cam_id==1)? g_ctx.config.gray_config.fps : 
-                                g_ctx.config.depth_config.fps;
-        
-        if (!g_ctx.videos[cam_id]->open(uvcPaths[cam_id], cam_id, w, h, fmt, fps)) {
-            delete g_ctx.videos[cam_id];
-            g_ctx.videos[cam_id] = nullptr;
-            return -1;
+        if (cam_id == 0) {
+            int w = g_ctx.config.rgb_config.width;
+            int h = g_ctx.config.rgb_config.height;
+            PixelFormat fmt = g_ctx.config.rgb_config.pixel_format;
+            int fps = g_ctx.config.rgb_config.fps;
+            
+            if (!g_ctx.videos[mapped]->open(uvcPaths[mapped], mapped, w, h, fmt, fps)) {
+                delete g_ctx.videos[mapped];
+                g_ctx.videos[mapped] = nullptr;
+                return -1;
+            }
+        } else {
+            int w = g_ctx.config.gray_config.width;
+            int h = g_ctx.config.gray_config.height;
+            PixelFormat depthFmt = g_ctx.config.depth_config.pixel_format;
+            PixelFormat grayFmt = g_ctx.config.gray_config.pixel_format;
+            int fps = g_ctx.config.gray_config.fps;
+            
+            if (!g_ctx.videos[mapped]->openWithTwoStreams(uvcPaths[mapped], mapped, w, h, depthFmt, fps, grayFmt, fps)) {
+                delete g_ctx.videos[mapped];
+                g_ctx.videos[mapped] = nullptr;
+                return -1;
+            }
         }
     }
     
-    g_ctx.cam_running[cam_id] = true;
-    g_ctx.videos[cam_id]->start();
+    g_ctx.cam_running[mapped] = true;
+    g_ctx.videos[mapped]->start();
     
-    if (g_ctx.videoThreads[cam_id].joinable()) {
-        g_ctx.videoThreads[cam_id].join();
+    if (g_ctx.videoThreads[mapped].joinable()) {
+        g_ctx.videoThreads[mapped].join();
     }
-    g_ctx.videoThreads[cam_id] = std::thread(videoThreadFunc, cam_id);
+    g_ctx.videoThreads[mapped] = std::thread(videoThreadFunc, mapped);
     
     return 0;
 }
 
 void insight9_receive_stop_camera(int cam_id) {
-    if (cam_id < 0 || cam_id >= CAM_NUM) return;
-    
-    g_ctx.cam_running[cam_id] = false;
-    
-    if (g_ctx.videos[cam_id]) {
-        g_ctx.videos[cam_id]->stop();
+    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) {
+        return;
     }
-    
-    if (g_ctx.videoThreads[cam_id].joinable()) {
-        g_ctx.videoThreads[cam_id].join();
+    printf("[SDK] Stop logical camera %d\n", cam_id);
+
+    if (cam_id == RGB_CAM_ID) {
+        g_ctx.cam_running[RGB_CAM_ID] = false;
+        if (g_ctx.videos[RGB_UVC_ID]) {
+            g_ctx.videos[RGB_UVC_ID]->stop();
+        }
+        if (g_ctx.videoThreads[RGB_UVC_ID].joinable()) {
+            g_ctx.videoThreads[RGB_UVC_ID].join();
+        }
+        return;
+    }
+
+    if (cam_id == GRAY_CAM_ID) {
+        g_ctx.cam_running[GRAY_CAM_ID] = false;
+    } else if (cam_id == DEPTH_CAM_ID) {
+        g_ctx.cam_running[DEPTH_CAM_ID] = false;
+    }
+
+    if (!g_ctx.cam_running[GRAY_CAM_ID] && !g_ctx.cam_running[DEPTH_CAM_ID]) {
+        if (g_ctx.videos[COMPOSITE_UVC_ID]) {
+            g_ctx.videos[COMPOSITE_UVC_ID]->stop();
+        }
+
+        if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
+            g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
+        }
     }
 }
 
 int insight9_receive_restart_camera(int cam_id) {
-    if (!g_ctx.initialized) return -1;
-    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    
-    insight9_receive_stop_camera(cam_id);
-    
-    delete g_ctx.videos[cam_id];
-    g_ctx.videos[cam_id] = nullptr;
-    
-    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    if (cam_id >= (int)uvcPaths.size()) {
-        fprintf(stderr, "[SDK] Camera %d not found during restart\n", cam_id);
+    if (!g_ctx.initialized) {
         return -1;
     }
 
-    int w = (cam_id==0)? g_ctx.config.rgb_config.width : 
-            (cam_id==1)? g_ctx.config.gray_config.width : 
-                        g_ctx.config.depth_config.width;
-    int h = (cam_id==0)? g_ctx.config.rgb_config.height : 
-            (cam_id==1)? g_ctx.config.gray_config.height : 
-                        g_ctx.config.depth_config.height;
-    PixelFormat fmt = (cam_id==0)? g_ctx.config.rgb_config.pixel_format : 
-                       (cam_id==1)? g_ctx.config.gray_config.pixel_format : 
-                                    g_ctx.config.depth_config.pixel_format;
-    int fps = (cam_id==0)? g_ctx.config.rgb_config.fps : 
-               (cam_id==1)? g_ctx.config.gray_config.fps : 
-                            g_ctx.config.depth_config.fps;
-    
-    g_ctx.videos[cam_id] = new FFmpegVideoSource();
-    if (!g_ctx.videos[cam_id]->open(uvcPaths[cam_id], cam_id, w, h, fmt, fps)) {
-        delete g_ctx.videos[cam_id];
-        g_ctx.videos[cam_id] = nullptr;
+    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) {
         return -1;
     }
-    
-    return insight9_receive_start_camera(cam_id);
+
+    int uvcId = mapCompositeCamId(cam_id);
+
+    if (uvcId < 0 || uvcId >= UVC_NUM) {
+        return -1;
+    }
+
+    printf( "[SDK] Restart logical camera %d (physical UVC %d)\n", cam_id, uvcId);
+
+    if (cam_id == RGB_CAM_ID) {
+        insight9_receive_stop_camera(RGB_CAM_ID);
+
+        delete g_ctx.videos[RGB_UVC_ID];
+
+        g_ctx.videos[RGB_UVC_ID] = nullptr;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        g_ctx.videos[RGB_UVC_ID] = new MFVideoSource();
+
+        if (!g_ctx.videos[RGB_UVC_ID]->open(g_ctx.videoPaths[RGB_UVC_ID],
+                    RGB_UVC_ID,
+                    g_ctx.config.rgb_config.width,
+                    g_ctx.config.rgb_config.height,
+                    g_ctx.config.rgb_config.pixel_format,
+                    g_ctx.config.rgb_config.fps)) {
+            delete g_ctx.videos[RGB_UVC_ID];
+            g_ctx.videos[RGB_UVC_ID] = nullptr;
+            return -1;
+        }
+
+        g_ctx.cam_running[RGB_CAM_ID] = true;
+        g_ctx.videos[RGB_UVC_ID]->start();
+        g_ctx.videoThreads[RGB_UVC_ID] = std::thread(videoThreadFunc, RGB_UVC_ID);
+
+        return 0;
+    }
+
+    g_ctx.cam_running[GRAY_CAM_ID] = false;
+    g_ctx.cam_running[DEPTH_CAM_ID] = false;
+
+    if (g_ctx.videos[COMPOSITE_UVC_ID]) {
+        g_ctx.videos[COMPOSITE_UVC_ID]->stop();
+    }
+
+    if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
+        g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
+    }
+
+    delete g_ctx.videos[COMPOSITE_UVC_ID];
+    g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    g_ctx.videos[COMPOSITE_UVC_ID] = new MFVideoSource();
+
+    int w = g_ctx.config.gray_config.width;
+    int h = g_ctx.config.gray_config.height;
+    int fps = g_ctx.config.gray_config.fps;
+
+    PixelFormat depthFmt = g_ctx.config.depth_config.pixel_format;
+    PixelFormat grayFmt = g_ctx.config.gray_config.pixel_format;
+
+    if (!g_ctx.videos[COMPOSITE_UVC_ID]->openWithTwoStreams(g_ctx.videoPaths[COMPOSITE_UVC_ID],
+                COMPOSITE_UVC_ID, w, h, depthFmt, fps, grayFmt, fps)) {
+        delete g_ctx.videos[COMPOSITE_UVC_ID];
+        g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
+
+        return -1;
+    }
+
+    g_ctx.cam_running[GRAY_CAM_ID] = true;
+    g_ctx.cam_running[DEPTH_CAM_ID] = true;
+    g_ctx.videos[COMPOSITE_UVC_ID]->start();
+
+    g_ctx.videoThreads[COMPOSITE_UVC_ID] = std::thread(videoThreadFunc, COMPOSITE_UVC_ID);
+
+    return 0;
 }
 
 int insight9_receive_switch_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM || fps <= 0) return -1;
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= UVC_NUM || fps <= 0) return -1;
 
     printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
 
@@ -931,37 +2302,46 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
 }
 
 int insight9_receive_is_camera_running(int cam_id) {
-    if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
-    return g_ctx.cam_running[cam_id] ? 1 : 0;
+    int mapped = mapCompositeCamId(cam_id);
+    if (mapped < 0 || mapped >= UVC_NUM) return 0;
+    return g_ctx.cam_running[mapped] ? 1 : 0;
 }
 
 void insight9_receive_stop() {
-    if (!g_ctx.running) return;
+    if (!g_ctx.running) {return;}
     g_ctx.running = false;
-    
-    for (int i = 0; i < CAM_NUM; ++i) {
+
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
         g_ctx.cam_running[i] = false;
-        if (g_ctx.videos[i]) g_ctx.videos[i]->stop();
     }
-    for (int i = 0; i < CAM_NUM; ++i) {
-        if (g_ctx.videoThreads[i].joinable()) g_ctx.videoThreads[i].join();
+
+    for (int i = 0; i < UVC_NUM; ++i) {
+        if (g_ctx.videos[i]) {
+            g_ctx.videos[i]->stop();
+        }
     }
+
+    for (int i = 0; i < UVC_NUM; ++i) {
+        if (g_ctx.videoThreads[i].joinable()) {
+            g_ctx.videoThreads[i].join();
+        }
+    }
+
     for (int i = 0; i < HID_NUM; ++i) {
-        if (g_ctx.hidThreads[i].joinable()) g_ctx.hidThreads[i].join();
+        if (g_ctx.hidThreads[i].joinable()) {
+            g_ctx.hidThreads[i].join();
+        }
     }
 }
 
 void insight9_receive_cleanup() {
     insight9_receive_stop();
 
-    fprintf(stderr, "[SDK] Cleaning up resources...\n");
-    for (int i = 0; i < CAM_NUM; ++i) {
-        if (g_ctx.videos[i]) {
-            g_ctx.videos[i]->stop();
-            delete g_ctx.videos[i];
-            g_ctx.videos[i] = nullptr;
-        }
+    for (int i = 0; i < UVC_NUM; ++i) {
+        delete g_ctx.videos[i];
+        g_ctx.videos[i] = nullptr;
     }
+
     for (int i = 0; i < HID_NUM; ++i) {
         if (g_ctx.hidDevs[i]) {
             g_ctx.hidDevs[i]->close();
@@ -969,47 +2349,187 @@ void insight9_receive_cleanup() {
             g_ctx.hidDevs[i] = nullptr;
         }
     }
-    if (g_ctx.xu) {
-        delete g_ctx.xu;
-        g_ctx.xu = nullptr;
-    }
-    
+
+    delete g_ctx.xu;
+
+    g_ctx.xu = nullptr;
     g_ctx.initialized = false;
     g_ctx.running = false;
-    for (int i = 0; i < CAM_NUM; ++i) {
+
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
         g_ctx.cam_running[i] = false;
     }
-    
+
     hid_exit();
-    
-    if (g_com_initialized_by_sdk) {
-        fprintf(stderr, "[SDK] Uninitializing COM...\n");
-        CoUninitialize();
-        g_com_initialized_by_sdk = false;
+
+    CoUninitialize();
+}
+
+// ==================== The remaining API implementations ====================
+static int mapCompositeCamId(int cam_id) {
+    if (cam_id == RGB_CAM_ID) {
+        return RGB_UVC_ID;
     }
-    
-    fprintf(stderr, "[SDK] Cleanup complete\n");
+    if (cam_id == GRAY_CAM_ID || cam_id == DEPTH_CAM_ID) {
+        return COMPOSITE_UVC_ID;
+    }
+    return -1;
+}
+
+static int mapCamIdToStreamIndex(int cam_id) {
+    if (cam_id == RGB_CAM_ID)   return 0;
+    if (cam_id == DEPTH_CAM_ID) return DEPTH_STREAM_ID;  // 0
+    if (cam_id == GRAY_CAM_ID)  return GRAY_STREAM_ID;   // 1
+    return -1;
+}
+
+const char* insight9_receive_get_video_dev(int cam_id) {
+    int mapped = mapCompositeCamId(cam_id);
+    return (mapped >= 0 && mapped < UVC_NUM) ? g_ctx.videoPaths[mapped].c_str() : nullptr;
 }
 
 int insight9_receive_set_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    
+    if (!g_ctx.initialized || cam_id < 0 || cam_id > 2) return -1;
     if (cam_id == 0) {
         g_ctx.config.rgb_config.fps = fps;
         printf("[SDK] Set RGB FPS to %d\n", fps);
-    } else if (cam_id == 1) {
+    } else {
         g_ctx.config.gray_config.fps = fps;
-        printf("[SDK] Set Gray FPS to %d\n", fps);
-    } else if (cam_id == 2) {
-        g_ctx.config.depth_config.fps = fps;
-        printf("[SDK] Set Depth FPS to %d\n", fps);
+        printf("[SDK] Set Gray/Depth composite FPS to %d\n", fps);
     }
     return 0;
 }
 
-void insight9_receive_register_image_callback(image_callback cb, void *user) { g_ctx.imgCb = cb; g_ctx.imgUser = user; }
-void insight9_receive_register_imu_callback(imu_callback cb, void *user) { g_ctx.imuCb = cb; g_ctx.imuUser = user; }
-void insight9_receive_register_vio_callback(vio_callback cb, void *user) { g_ctx.vioCb = cb; g_ctx.vioUser = user; }
+void insight9_receive_register_image_callback(image_callback cb, void *user) { 
+    g_ctx.imgCb = cb; 
+    g_ctx.imgUser = user; 
+}
+
+void insight9_receive_register_imu_callback(imu_callback cb, void *user) { 
+    g_ctx.imuCb = cb; 
+    g_ctx.imuUser = user; 
+}
+
+void insight9_receive_register_vio_callback(vio_callback cb, void *user) { 
+    g_ctx.vioCb = cb; 
+    g_ctx.vioUser = user; 
+}
+
+const DeviceCapabilities_t* insight9_receive_get_device_capabilities_ptr(void) {
+    if (!g_ctx.initialized) {
+        fprintf(stderr, "[SDK] Not initialized\n");
+        return nullptr;
+    }
+    return &g_ctx.device_caps;
+}
+
+int insight9_receive_get_device_default_capability(int cam_id, DeviceCapability* cap) {
+    if (!g_ctx.initialized) {
+        fprintf(stderr, "[SDK] Not initialized\n");
+        return -1;
+    }
+    
+    if (!cap) {
+        fprintf(stderr, "[SDK] Invalid cap parameter\n");
+        return -1;
+    }
+    
+    const DeviceCapability* target = nullptr;
+    switch (cam_id) {
+        case 0: target = &g_ctx.device_caps.rgb_default; break;
+        case 1: target = &g_ctx.device_caps.gray_default; break;
+        case 2: target = &g_ctx.device_caps.depth_default; break;
+        default:
+            fprintf(stderr, "[SDK] Invalid cam_id: %d (must be 0, 1, or 2)\n", cam_id);
+            return -1;
+    }
+    
+    if (!target->valid) {
+        fprintf(stderr, "[SDK] No default capability found for cam_id %d\n", cam_id);
+        return -1;
+    }
+    
+    memcpy(cap, target, sizeof(DeviceCapability));
+    return 0;
+}
+
+int insight9_receive_get_device_capability_count(int cam_id, int* count) {
+    if (!g_ctx.initialized) {
+        fprintf(stderr, "[SDK] Not initialized\n");
+        return -1;
+    }
+    
+    if (!count) {
+        fprintf(stderr, "[SDK] Invalid count parameter\n");
+        return -1;
+    }
+    
+    const std::vector<DeviceCapability>* vec = nullptr;
+    switch (cam_id) {
+        case 0: vec = &g_ctx.device_caps.rgb_capabilities; break;
+        case 1: vec = &g_ctx.device_caps.gray_capabilities; break;
+        case 2: vec = &g_ctx.device_caps.depth_capabilities; break;
+        default:
+            fprintf(stderr, "[SDK] Invalid cam_id: %d (must be 0, 1, or 2)\n", cam_id);
+            return -1;
+    }
+    
+    *count = (int)vec->size();
+    return 0;
+}
+
+int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap) {
+    if (!g_ctx.initialized) {
+        fprintf(stderr, "[SDK] Not initialized\n");
+        return -1;
+    }
+    
+    if (!cap) {
+        fprintf(stderr, "[SDK] Invalid cap parameter\n");
+        return -1;
+    }
+    
+    if (index < 0) {
+        fprintf(stderr, "[SDK] Invalid index: %d (must be >= 0)\n", index);
+        return -1;
+    }
+    
+    const std::vector<DeviceCapability>* vec = nullptr;
+    switch (cam_id) {
+        case 0: vec = &g_ctx.device_caps.rgb_capabilities; break;
+        case 1: vec = &g_ctx.device_caps.gray_capabilities; break;
+        case 2: vec = &g_ctx.device_caps.depth_capabilities; break;
+        default:
+            fprintf(stderr, "[SDK] Invalid cam_id: %d (must be 0, 1, or 2)\n", cam_id);
+            return -1;
+    }
+    
+    if (index >= (int)vec->size()) {
+        fprintf(stderr, "[SDK] Index %d out of range (size: %zu)\n", index, vec->size());
+        return -1;
+    }
+    
+    memcpy(cap, &(*vec)[index], sizeof(DeviceCapability));
+    return 0;
+}
+
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t* timestamp) {
+    if (!timestamp) return -1;
+
+    int uvcId = mapCompositeCamId(cam_id);
+    int streamIdx = mapCamIdToStreamIndex(cam_id);
+    if (uvcId < 0 || uvcId >= UVC_NUM || streamIdx < 0 || !g_ctx.videos[uvcId]) {
+        return -1;
+    }
+
+    uint64_t ts = g_ctx.videos[uvcId]->getLastTimestamp(streamIdx);
+    if (ts == 0) {
+        return -1;
+    }
+
+    *timestamp = ts;
+    return 0;
+}
 
 int insight9_receive_set_active_camera(int cam_id) {
     if (!g_ctx.xu) return -1;
@@ -1041,19 +2561,22 @@ int insight9_receive_get_camera_params(camera_params *params) {
 
 int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
+    int mapped = mapCompositeCamId(cam_id);
+    if (mapped < 0) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
-    return g_ctx.xu->writeCameraParams((uint8_t)cam_id, xuParams) ? 0 : -1;
+    return g_ctx.xu->writeCameraParams((uint8_t)mapped, xuParams) ? 0 : -1;
 }
 
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     if (!g_ctx.xu || !params) return -1;
+    int mapped = mapCompositeCamId(cam_id);
+    if (mapped < 0) return -1;
     viewer::camera_params xuParams;
-    if (!g_ctx.xu->readCameraParams((uint8_t)cam_id, xuParams)) return -1;
+    if (!g_ctx.xu->readCameraParams((uint8_t)mapped, xuParams)) return -1;
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
-
 
 int insight9_receive_reset_camera_params(int) { 
    // Reading factory defaults from the device requires additional implementation. A simple approach is to read

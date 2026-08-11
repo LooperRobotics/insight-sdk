@@ -86,8 +86,8 @@ enum : uint8_t {
 
 inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
 inline constexpr uint8_t kXuUnitId = 3;
-inline constexpr uint8_t kCameraParamsSelector = 4;
-inline constexpr uint8_t kActiveCameraSelector = 7;
+inline constexpr uint8_t kCameraParamsSelector = 18;
+inline constexpr uint8_t kActiveCameraSelector = 19;
 inline constexpr uint8_t kCameraCalibSelectorBase = 0x14;
 inline constexpr uint8_t kCurrentFpsSelector = 0x17;
 inline constexpr uint8_t kVioManagerStatus = 0x18;
@@ -124,15 +124,18 @@ public:
     // camIdx: kCalibCamLeft / kCalibCamRight / kCalibCamRgb.
     bool readCameraCalib(uint8_t camIdx, camera_calib& calib) const;
     bool readVioStatus(uint8_t& val) const;
+    std::string getActiveGuidString() const;
 
 private:
     bool bindFilterByDevicePath(const std::string& devicePath);
     bool resolveNodeId();
+    bool probeExtensionGuid();
     bool query(uint8_t selector, unsigned long flags, void* data, unsigned long size) const;
 
     IBaseFilter* filter_ = nullptr;
     IKsControl* ksControl_ = nullptr;
     unsigned long nodeId_ = 0;
+    uint8_t activeExtGuidBytes_[16] = {};
 };
 
 void printParams(const camera_params& params);

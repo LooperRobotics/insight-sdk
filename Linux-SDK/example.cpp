@@ -1,4 +1,5 @@
 #include "Insight_9_receive.h"
+#include "hid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -138,7 +139,7 @@ static void ensure_hid_stats_initialized_locked(void) {
 static const char *image_format_to_string(unsigned int format) {
     switch (format) {
         case V4L2_PIX_FMT_MJPEG:
-            return "RGB";
+            return "MJPEG";
         case V4L2_PIX_FMT_YUYV:
             return "yuyv";
         case V4L2_PIX_FMT_GREY:
@@ -177,13 +178,14 @@ static void maybe_print_img_stats_locked(void) {
     printf("\n========= Image Callbacks : 1/s =========\n");
     for (int i = 0; i < 3; i++) {
         const struct cam_stats *cs = &g_stats[i];
-        printf("IMG[%d]: fps=%.1f ts=%lu size=%zu %dx%d format=%s\n",
+        printf("IMG[%d]: fps=%.1f ts=%lu size=%zu %dx%d format=0x%x %s\n",
                i,
                cs->cb_count / elapsed,
                (unsigned long)cs->last_ts,
                cs->last_size,
                cs->width,
                cs->height,
+               cs->format,
                image_format_to_string(cs->format));
     }
     fflush(stdout);

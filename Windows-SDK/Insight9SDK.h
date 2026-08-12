@@ -207,6 +207,14 @@ void insight9_receive_stop_camera(int cam_id);
 int insight9_receive_restart_camera(int cam_id);
 
 /**
+ * @brief Switch the frame rate of a specific camera.
+ * @param cam_id Camera ID (0: RGB, 1: Grayscale, 2: Depth).
+ * @param fps    Desired frame rate.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_switch_camera_fps(int cam_id, int fps);
+
+/**
  * @brief Check if a camera is currently running.
  * @param cam_id Camera ID.
  * @return 1 if running, 0 otherwise.

@@ -384,7 +384,6 @@ void reconnect_worker() {
         if (last != 0 && (now - last) > 5000) {
             EnterCriticalSection(&g_sdk_op_lock);
             printf("[Reconnect] No image received for 5 seconds, attempting reconnect...\n");
-            ... // stop+cleanup+sleep(1000)+init+start，跟原来完全一样
             LeaveCriticalSection(&g_sdk_op_lock);
         }
     }

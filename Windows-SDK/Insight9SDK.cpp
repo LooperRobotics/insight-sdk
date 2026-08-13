@@ -228,6 +228,19 @@ static inline uint64_t rdLe64(const uint8_t* p) {
             ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
 }
 
+static void sortCapabilities(std::vector<DeviceCapability>& caps) {
+    std::sort(caps.begin(), caps.end(), [](const DeviceCapability& a, const DeviceCapability& b) {
+        if (a.format != b.format) {
+            return static_cast<int>(a.format) < static_cast<int>(b.format);
+        }
+        const long long areaA = (long long)a.width * a.height;
+        const long long areaB = (long long)b.width * b.height;
+        if (areaA != areaB) return areaA < areaB;
+        if (a.width != b.width) return a.width < b.width;
+        return a.fps < b.fps;
+    });
+}
+
 static bool parseRsVendorMetadata(const uint8_t* buf, size_t len,
                                   uint64_t* time_us_64, uint32_t* frame_counter)
 {
@@ -1335,26 +1348,29 @@ static bool probeDeviceCapabilities(const std::string& devicePath, int deviceInd
     if (deviceIndex == 0) {
         std::vector<DeviceCapability> allCaps;
         if (probeSource->getAllCapabilities(0, allCaps)) {
-            caps.rgb_capabilities = allCaps;
             if (!allCaps.empty()) {
                 caps.rgb_default = allCaps[0];
             }
+            sortCapabilities(allCaps);
+            caps.rgb_capabilities = allCaps;
         }
     } else {
         std::vector<DeviceCapability> depthCaps;
         if (probeSource->getAllCapabilities(0, depthCaps)) {
-            caps.depth_capabilities = depthCaps;
             if (!depthCaps.empty()) {
                 caps.depth_default = depthCaps[0];
             }
+            sortCapabilities(depthCaps);
+            caps.depth_capabilities = depthCaps;
         }
-        
+
         std::vector<DeviceCapability> grayCaps;
         if (probeSource->getAllCapabilities(1, grayCaps)) {
-            caps.gray_capabilities = grayCaps;
             if (!grayCaps.empty()) {
                 caps.gray_default = grayCaps[0];
             }
+            sortCapabilities(grayCaps);
+            caps.gray_capabilities = grayCaps;
         }
     }
     
@@ -2287,7 +2303,7 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
 
     insight9_receive_stop_camera(cam_id);
-    Sleep(2000);
+    Sleep(3000);
 
     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
         fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);

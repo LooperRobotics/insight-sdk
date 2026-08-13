@@ -67,8 +67,8 @@ struct __attribute__((packed)) imu_gyro_report_t {
     int32_t  gyro_x;
     int32_t  gyro_y;
     int32_t  gyro_z;
-    int32_t  custom_data1;
-    int32_t  custom_data2;
+    uint32_t timestamp_l;
+    uint32_t timestamp_h;
     int16_t  custom_data3;
     int16_t  custom_data4;
     int16_t  custom_data5;
@@ -83,8 +83,8 @@ struct __attribute__((packed)) imu_accel_report_t {
     int32_t  accel_x;
     int32_t  accel_y;
     int32_t  accel_z;
-    int32_t  custom_data1;
-    int32_t  custom_data2;
+    uint32_t timestamp_l;
+    uint32_t timestamp_h;
     int16_t  custom_data3;
     int16_t  custom_data4;
     int16_t  custom_data5;
@@ -241,6 +241,8 @@ void *hid_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
+    uint64_t accel_ts = 0;
+    uint64_t gyro_ts = 0;
     uint64_t last_accel_ts = 0;
     uint64_t last_gyro_ts = 0;
     uint64_t last_imu_ts = 0;
@@ -303,32 +305,36 @@ void *hid_thread(void *arg) {
         if (idx == 0) {
             if (report_id == 0x01 && n >= (int)sizeof(struct imu_accel_report_t)) {
                 struct imu_accel_report_t *accel = (struct imu_accel_report_t*)buf;
-                if (accel->timestamp == last_accel_ts) {
+                accel_ts = ((uint64_t)(accel->timestamp_h & 0xffffffff) << 32) |
+                                    (uint64_t)(accel->timestamp_l & 0xffffffff);
+                if (accel_ts == last_accel_ts) {
                     continue;
                 }
-                last_accel_ts = accel->timestamp;
+                last_accel_ts = accel_ts;
                 last_ax = (float)accel->accel_x / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
                 last_ay = (float)accel->accel_y / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
                 last_az = (float)accel->accel_z / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
                 if (g_ctx.imu_cb) {
                     g_ctx.imu_cb(last_ax, last_ay, last_az,
                                  last_gx, last_gy, last_gz,
-                                 accel->timestamp,
+                                 accel_ts,
                                  g_ctx.imu_userdata);
                 }
             } else if (report_id == 0x02 && n >= (int)sizeof(struct imu_gyro_report_t)) {
                 struct imu_gyro_report_t *gyro = (struct imu_gyro_report_t*)buf;
-                if (gyro->timestamp == last_gyro_ts) {
+                gyro_ts = ((uint64_t)(gyro->timestamp_h & 0xffffffff) << 32) | 
+                                    (uint64_t)(gyro->timestamp_l & 0xffffffff);
+                if (gyro_ts== last_gyro_ts) {
                     continue;
                 }
-                last_gyro_ts = gyro->timestamp;
+                last_gyro_ts = gyro_ts;
                 last_gx = (float)gyro->gyro_x / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
                 last_gy = (float)gyro->gyro_y / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
                 last_gz = (float)gyro->gyro_z / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
                 if (g_ctx.imu_cb) {
                     g_ctx.imu_cb(last_ax, last_ay, last_az,
                                  last_gx, last_gy, last_gz,
-                                 gyro->timestamp,
+                                 gyro_ts,
                                  g_ctx.imu_userdata);
                 }
             }

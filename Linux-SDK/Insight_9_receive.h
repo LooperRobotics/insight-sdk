@@ -300,7 +300,7 @@ int insight9_receive_start_camera(int cam_id);
  * @brief Stop a specific camera.
  * @param cam_id Camera ID.
  */
-void insight9_receive_stop_camera(int cam_id);
+void insight9_receive_all_stop_camera(int cam_id);
 
 /**
  * @brief Restart a specific camera (stop and start again).
@@ -319,7 +319,7 @@ int insight9_receive_is_camera_running(int cam_id);
 /**
  * @brief Stop all capture threads.
  */
-void insight9_receive_stop(void);
+void insight9_receive_all_stop(void);
 
 /**
  * @brief Release all resources. Must be called after stopping.

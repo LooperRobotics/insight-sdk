@@ -629,15 +629,15 @@ static int init_capture(struct cam_ctx *ctx) {
                ctx->cam_id, ctx->width, ctx->height, ctx->format);
     }
 
-    // set_framerate(ctx->fd, ctx->fps);
-    // int cam_id = ctx->cam_id;
-    // if (cam_id == 0) {
-    //     set_framerate(ctx->fd, g_ctx.config.rgb_config.fps);
-    // } else if (cam_id == 1) {
-    //     set_framerate(ctx->fd, g_ctx.config.gray_config.fps);
-    // } else if (cam_id == 2) {
-    //     set_framerate(ctx->fd, g_ctx.config.depth_config.fps);
-    // }
+    set_framerate(ctx->fd, ctx->fps);
+    int cam_id = ctx->cam_id;
+    if (cam_id == 0) {
+        set_framerate(ctx->fd, g_ctx.config.rgb_config.fps);
+    } else if (cam_id == 1) {
+        set_framerate(ctx->fd, g_ctx.config.gray_config.fps);
+    } else if (cam_id == 2) {
+        set_framerate(ctx->fd, g_ctx.config.depth_config.fps);
+    }
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
@@ -1793,11 +1793,12 @@ int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp) {
     return *timestamp != 0 ? 0 : -1;
 }
 
-void insight9_receive_stop_camera(int cam_id) {
+void insight9_receive_all_stop_camera(int cam_id) {
     if (cam_id < 0 || cam_id >= CAM_NUM) return;
     
     g_ctx.cam_running[cam_id] = false;
-    
+
+    usleep(200000);  // 200ms
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
     safe_cleanup_camera(ctx);
     
@@ -1813,7 +1814,7 @@ int insight9_receive_restart_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
     
-    insight9_receive_stop_camera(cam_id);
+    insight9_receive_all_stop_camera(cam_id);
     usleep(100000);
     return insight9_receive_start_camera(cam_id);
 }
@@ -1826,10 +1827,10 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     printf("[SDK] Switching camera %d to %d fps...\n", cam_id, fps);
 
     // 1. 停止相机（使用安全清理）
-    insight9_receive_stop_camera(cam_id);
+    insight9_receive_all_stop_camera(cam_id);
     
     // 2. 等待设备完全释放
-    usleep(200000);  // 200ms
+    usleep(1000000);  // 200ms
     
     // 3. 更新配置中的FPS
     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
@@ -1853,7 +1854,7 @@ int insight9_receive_is_camera_running(int cam_id) {
     return g_ctx.cam_running[cam_id] ? 1 : 0;
 }
 
-void insight9_receive_stop(void) {
+void insight9_receive_all_stop(void) {
     if (!g_ctx.running) return;
     g_ctx.running = false;
 
@@ -1886,7 +1887,7 @@ void insight9_receive_cleanup(void) {
     printf("[SDK] Cleaning up...\n");
 
     if (g_ctx.running) {
-        insight9_receive_stop();
+        insight9_receive_all_stop();
     }
 
     for (int i = 0; i < CAM_NUM; i++) {

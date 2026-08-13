@@ -22,7 +22,7 @@ static pthread_mutex_t g_sdk_op_lock = PTHREAD_MUTEX_INITIALIZER;
 void sigint_handler(int sig) {
     printf("\n[Signal] Received SIGINT, stopping...\n");
     keep_running = 0;
-    insight9_receive_stop();
+    insight9_receive_all_stop();
 }
 
 struct cam_stats {
@@ -202,19 +202,19 @@ static void maybe_print_hid_stats_locked(void) {
     if (elapsed < 0.5) {
         return;
     }
-    printf("\n========= HID Callbacks : 0.5/s =========\n");
+    // printf("\n========= HID Callbacks : 0.5/s =========\n");
 
-    printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
-           g_imu_stats.cb_count / elapsed,
-           g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
-           g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
-           (unsigned long)g_imu_stats.last_ts);
+    // printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
+    //        g_imu_stats.cb_count / elapsed,
+    //        g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
+    //        g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
+    //        (unsigned long)g_imu_stats.last_ts);
 
-    printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
-           g_vio_stats.cb_count / elapsed,
-           g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
-           g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
-           (unsigned long)g_vio_stats.last_ts);
+    // printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
+    //        g_vio_stats.cb_count / elapsed,
+    //        g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
+    //        g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
+    //        (unsigned long)g_vio_stats.last_ts);
     fflush(stdout);
 
     if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
@@ -434,7 +434,7 @@ void* reconnect_worker(void* arg) {
             } else {
                 printf("Failed to get current FPS for gray camera\n");
             }
-            insight9_receive_stop();
+            insight9_receive_all_stop();
             insight9_receive_cleanup();
            
             insight9_config_t config_reinit;
@@ -468,7 +468,7 @@ void* reconnect_worker(void* arg) {
         }
         pthread_mutex_unlock(&g_sdk_op_lock);
     }
-    insight9_receive_stop();
+    insight9_receive_all_stop();
     insight9_receive_cleanup();
     return NULL;
 }
@@ -492,7 +492,7 @@ void toggle_gray_camera_fps() {
 
 void* fps_switch_worker(void* arg) {
     while (keep_running) {
-        sleep(10);
+        sleep(15);
         if (!keep_running) break;
         toggle_gray_camera_fps();
     }
@@ -512,7 +512,7 @@ int main() {
 
     insight9_receive_register_image_callback(my_image_cb, NULL);
     insight9_receive_register_imu_callback(my_imu_cb, NULL);
-    // insight9_receive_register_vio_callback(my_vio_cb, NULL);
+    insight9_receive_register_vio_callback(my_vio_cb, NULL);
 
     if (insight9_receive_start() != 0) {
         fprintf(stderr, "SDK start failed\n");
@@ -520,40 +520,188 @@ int main() {
         return -1;
     }
 
-    pthread_mutex_lock(&g_stats_lock);
-    for (int cam_id = 0; cam_id < 3; cam_id++) {
-        int width = 0, height = 0;
-        unsigned int format = 0;
-        if (insight9_receive_get_current_format(cam_id, &width, &height, &format) == 0) {
-            g_stats[cam_id].cb_count = 0;
-            g_stats[cam_id].last_ts = 0;
-            g_stats[cam_id].last_size = 0;
-            g_stats[cam_id].width = width;
-            g_stats[cam_id].height = height;
-            g_stats[cam_id].format = format;
-            printf("Camera %d format: %dx%d fmt=0x%x %s\n",
-                   cam_id, width, height, format, image_format_to_string(format));
+    printf("\n================ Extension Unit Control Test ================\n");
+    printf("\n---------------- camera params control ----------------\n");
+
+    // Example: Get current active camera and its parameters
+    if (insight9_receive_get_active_camera(&active_cam) == 0) {
+        printf("Current active camera: %d\n", active_cam);
+        if(insight9_receive_get_camera_params(&params) == 0) {
+            printf("Camera parameters retrieved successfully\n");
+            insight9_receive_print_camera_params(&params);
         } else {
-            printf("Camera %d failed to query current format\n", cam_id);
+            printf("Failed to get camera parameters\n");
+        }
+    } else {
+        printf("Failed to get active camera\n");
+    }
+
+    if(insight9_receive_get_camera_params_for(1, &params) == 0) {
+        printf("Camera parameters for cam %d retrieved successfully\n", active_cam);
+        insight9_receive_print_camera_params(&params);
+    } else {
+        printf("Failed to get camera parameters for cam %d\n", active_cam);
+    }
+
+    if (insight9_receive_get_active_camera(&active_cam) == 0) {
+        printf("Current active camera: %d\n", active_cam);
+    } else {
+        printf("Failed to get active camera\n");
+    }
+
+    // Example: Adjust RGB camera parameters
+    params.cam_id = 0;
+    params.brightness = 80.0f;
+    params.contrast = 1.2f;
+    params.exposure_time = 0.015f;
+    params.exposure_gain = 4.0f;
+    params.auto_white_balance = 1;
+    params.resolution = 0;
+    params.frame_rate = 2;
+    params.auto_exposure = 0;
+    params.gamma_dark = 2.0f;
+    params.hue = 40.0f;
+    params.saturation = 1.0f;
+    params.sharpness = 128;
+    params.white_balance = 2.0f;
+    params.decimation = 1;
+
+    if (insight9_receive_set_camera_params_for(0, &params) == 0) {
+        printf("Camera parameters set successfully\n");
+        if(insight9_receive_get_camera_params_for(0, &params) == 0) {
+            printf("Camera parameters for cam %d after setting:\n", 0);
+            insight9_receive_print_camera_params(&params);
+        } else {
+            printf("Failed to get camera parameters for cam %d after setting\n", 0);
+        }
+    } else {
+        printf("Failed to set camera parameters (invalid range or XU not available)\n");
+    }
+    
+    printf("\n---------------- get looper info ----------------\n");
+    
+    int fps = 0;
+    if (insight9_receive_get_current_fps(&fps) == 0) {
+        printf("Current FPS for gray camera: %d\n", fps);
+    } else {
+        printf("Failed to get current FPS for gray camera\n");
+    }
+
+    // Example: Read intrinsics/extrinsics of the three cameras
+    {
+        static const int calib_cams[] = {
+            INSIGHT9_CALIB_CAM_LEFT, INSIGHT9_CALIB_CAM_RIGHT, INSIGHT9_CALIB_CAM_RGB
+        };
+        static const char *calib_names[] = {"left", "right", "rgb"};
+        camera_calib calib;
+        for (int i = 0; i < 3; i++) {
+            if (insight9_receive_get_camera_calib(calib_cams[i], &calib) == 0) {
+                printf("Calibration for %s camera:\n", calib_names[i]);
+                insight9_receive_print_camera_calib(&calib);
+            } else {
+                printf("Failed to get calibration for %s camera\n", calib_names[i]);
+            }
+        }
+
+        // Cache the LEFT + RGB calibration used to align depth onto RGB.
+        if (insight9_receive_get_camera_calib(INSIGHT9_CALIB_CAM_LEFT, &g_left_calib) == 0 &&
+            insight9_receive_get_camera_calib(INSIGHT9_CALIB_CAM_RGB, &g_rgb_calib) == 0) {
+            g_calib_ready = true;
+            printf("Depth->RGB alignment enabled (RGB %ux%u).\n",
+                   g_rgb_calib.intrinsics.width, g_rgb_calib.intrinsics.height);
+        } else {
+            printf("Calibration unavailable; depth->RGB overlay disabled.\n");
         }
     }
-    pthread_mutex_unlock(&g_stats_lock);
 
+    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
+    
     pthread_t reconnect_thread;
     pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);
+    pthread_t fps_switch_thread;
+    pthread_create(&fps_switch_thread, NULL, fps_switch_worker, NULL);
 
+    printf("\n=================================================\n\n");
     printf("SDK running with all 3 cameras\n");
-    printf("Gray camera will toggle between 20fps and 30fps every 10 seconds\n");
-    printf("Press Ctrl+C to stop...\n");
+    printf("A fixed grid window will appear: L / R / raw-depth / RGB+aligned-depth.\n");
+    printf("Press 'q' or ESC in the window, or Ctrl+C, to stop...\n");
 
-    while (keep_running) {
-        sleep(1);
+    // Fixed composite canvas layout.
+    const cv::Rect roi_left (0,      0,      CELL_W, CELL_H);  // top-left
+    const cv::Rect roi_right(0,      CELL_H, CELL_W, CELL_H);  // bottom-left
+    const cv::Rect roi_depth(CELL_W, 0,      CELL_W, CELL_H);  // top-right
+    const cv::Rect roi_rgb  (CELL_W, CELL_H, RGB_W,  RGB_H);   // bottom-right
+    const int canvas_w = CELL_W + std::max(CELL_W, RGB_W);
+    const int canvas_h = std::max(CELL_H + CELL_H, CELL_H + RGB_H);
+
+    const char *win_name = "Insight9 - L/R / Depth / RGB+AlignedDepth";
+    cv::namedWindow(win_name, cv::WINDOW_AUTOSIZE);
+
+    auto blit = [](cv::Mat &canvas, const cv::Mat &panel, const cv::Rect &roi) {
+        if (panel.empty()) return;
+        cv::Mat dst = canvas(roi);
+        cv::resize(panel, dst, dst.size());
+    };
+
+    // One worker thread per stream (independent decoding + alignment).
+    std::thread workers[3];
+    for (int cam = 0; cam < 3; cam++) {
+        workers[cam] = std::thread(camera_worker, cam);
     }
 
-    // pthread_join(fps_thread, NULL);
-    pthread_join(reconnect_thread, NULL);
+    while (keep_running) {
+        // Grab the latest panels/overlay under the lock (cheap shallow copies),
+        // then do the heavy compositing unlocked so workers are never blocked.
+        cv::Mat left, right, depth, rgb, acolor, amask;
+        {
+            std::lock_guard<std::mutex> lk(g_panel_lock);
+            left   = g_panel[PANEL_LEFT];
+            right  = g_panel[PANEL_RIGHT];
+            depth  = g_panel[PANEL_DEPTH];
+            rgb    = g_panel[PANEL_RGB];
+            acolor = g_aligned_color;
+            amask  = g_aligned_mask;
+        }
 
-    insight9_receive_stop();
+        // Bottom-right = RGB with the aligned depth semi-transparently overlaid.
+        cv::Mat rgb_view;
+        if (!rgb.empty()) {
+            rgb_view = rgb.clone();
+            if (!acolor.empty() && acolor.size() == rgb.size() &&
+                !amask.empty() && amask.size() == rgb.size()) {
+                cv::Mat blend;
+                cv::addWeighted(rgb, 0.5, acolor, 0.5, 0, blend);
+                blend.copyTo(rgb_view, amask);
+            }
+        }
+
+        cv::Mat canvas = cv::Mat::zeros(canvas_h, canvas_w, CV_8UC3);
+        blit(canvas, left,     roi_left);
+        blit(canvas, right,    roi_right);
+        blit(canvas, depth,    roi_depth);
+        blit(canvas, rgb_view, roi_rgb);
+
+        cv::Mat shown;
+        cv::resize(canvas, shown, cv::Size(), DISPLAY_SCALE, DISPLAY_SCALE);
+        cv::imshow(win_name, shown);
+
+        int key = cv::waitKey(30);
+        if (key == 'q' || key == 27) {
+            keep_running = 0;
+        }
+    }
+
+    // Wake and join the worker threads.
+    g_raw_cv.notify_all();
+    for (int cam = 0; cam < 3; cam++) {
+        if (workers[cam].joinable()) workers[cam].join();
+    }
+    cv::destroyAllWindows();
+
+    pthread_join(reconnect_thread, NULL);
+    pthread_join(fps_switch_thread, NULL);
+
+    insight9_receive_all_stop();
     insight9_receive_cleanup();
     printf("Program exited.\n");
     return 0;

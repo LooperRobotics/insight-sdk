@@ -2140,7 +2140,7 @@ int insight9_receive_start_camera(int cam_id) {
     g_ctx.cam_running[mapped] = true;
     g_ctx.videos[mapped]->start();
     
-    joinWithTimeout(g_ctx.videoThreads[mapped], 3000, "video");
+    joinWithTimeout(g_ctx.videoThreads[mapped], 1000, "video");
     g_ctx.videoThreads[mapped] = std::thread(videoThreadFunc, mapped);
     
     return 0;
@@ -2172,7 +2172,7 @@ void insight9_receive_stop_camera(int cam_id) {
     if (!g_ctx.cam_running[GRAY_CAM_ID] && !g_ctx.cam_running[DEPTH_CAM_ID]) {
         if (g_ctx.videos[COMPOSITE_UVC_ID]) g_ctx.videos[COMPOSITE_UVC_ID]->stop();
         g_ctx.videoThreadStuck[COMPOSITE_UVC_ID] =
-            !joinWithTimeout(g_ctx.videoThreads[COMPOSITE_UVC_ID], 3000, "video[Composite]");
+            !joinWithTimeout(g_ctx.videoThreads[COMPOSITE_UVC_ID], 1000, "video[Composite]");
 
         if (g_ctx.videoThreadStuck[COMPOSITE_UVC_ID]) {
             fprintf(stderr, "[SDK][WARN] Composite video source leaked intentionally\n");
@@ -2287,7 +2287,7 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
 
     insight9_receive_stop_camera(cam_id);
-    Sleep(3000);
+    Sleep(2000);
 
     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
         fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
@@ -2320,12 +2320,12 @@ void insight9_receive_stop() {
     for (int i = 0; i < UVC_NUM; ++i) {
         char label[32];
         snprintf(label, sizeof(label), "video[%d]", i);
-        g_ctx.videoThreadStuck[i] = !joinWithTimeout(g_ctx.videoThreads[i], 3000, label);
+        g_ctx.videoThreadStuck[i] = !joinWithTimeout(g_ctx.videoThreads[i], 1000, label);
     }
     for (int i = 0; i < HID_NUM; ++i) {
         char label[32];
         snprintf(label, sizeof(label), "hid[%d]", i);
-        g_ctx.hidThreadStuck[i] = !joinWithTimeout(g_ctx.hidThreads[i], 3000, label);
+        g_ctx.hidThreadStuck[i] = !joinWithTimeout(g_ctx.hidThreads[i], 1000, label);
     }
 }
 

@@ -256,6 +256,21 @@ static bool parseRsVendorMetadata(const uint8_t* buf, size_t len,
     return false;
 }
 
+static bool joinWithTimeout(std::thread& t, DWORD timeoutMs, const char* label) {
+    if (!t.joinable()) return true;
+    HANDLE h = t.native_handle();
+    if (WaitForSingleObject(h, timeoutMs) == WAIT_OBJECT_0) {
+        t.join();
+        return true;
+    }
+    fprintf(stderr,
+            "[SDK][WARN] Thread '%s' did not exit within %lu ms "
+            "(likely stuck in ReadSample/blocking I/O). Detaching instead of waiting forever.\n",
+            label, timeoutMs);
+    t.detach();
+    return false;
+}
+
 class MFVideoSource {
 public:
     MFVideoSource() {
@@ -1111,6 +1126,8 @@ struct sdk_ctx_t {
     // =====================================================
     std::atomic<bool> cam_running[LOGICAL_CAM_NUM];
     std::thread videoThreads[UVC_NUM];
+    bool videoThreadStuck[UVC_NUM] = {false, false};
+    bool hidThreadStuck[HID_NUM] = {false, false};
     // =====================================================
     HidDevice* hidDevs[HID_NUM];
     std::string hidPaths[HID_NUM];
@@ -1737,39 +1754,13 @@ static void hidThreadFunc(int idx) {
 
         uint8_t report_id = buf[0];
 
-        if (idx == 0) {
-            if (report_id == 0x01 && len >= sizeof(imu_accel_report_t)) {
-                auto* r = reinterpret_cast<imu_accel_report_t*>(buf);
-                if (r->timestamp == last_accel_ts) continue;
-                last_accel_ts = r->timestamp;
-                last_ax = (float)((double)r->accel_x / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB);
-                last_ay = (float)((double)r->accel_y / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB);
-                last_az = (float)((double)r->accel_z / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB);
-                if (g_ctx.imuCb) {
-                    g_ctx.imuCb(last_ax, last_ay, last_az, last_gx, last_gy, last_gz,
-                                r->timestamp, g_ctx.imuUser);
-                }
-            } else if (report_id == 0x02 && len >= sizeof(imu_gyro_report_t)) {
-                auto* r = reinterpret_cast<imu_gyro_report_t*>(buf);
-                if (r->timestamp == last_gyro_ts) continue;
-                last_gyro_ts = r->timestamp;
-                last_gx = (float)((double)r->gyro_x / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB);
-                last_gy = (float)((double)r->gyro_y / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB);
-                last_gz = (float)((double)r->gyro_z / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB);
-                if (g_ctx.imuCb) {
-                    g_ctx.imuCb(last_ax, last_ay, last_az, last_gx, last_gy, last_gz,
-                                r->timestamp, g_ctx.imuUser);
-                }
-            }
-        } else {
-            if (len >= sizeof(vio_hid_payload)) {
-                auto* p = reinterpret_cast<vio_hid_payload*>(buf);
-                if (p->timestamp != 0 && p->timestamp == last_vio_ts) continue;
-                last_vio_ts = p->timestamp;
-                if (g_ctx.vioCb) {
-                    g_ctx.vioCb(p->px, p->py, p->pz, p->qx, p->qy, p->qz, p->qw,
-                                p->timestamp, g_ctx.vioUser);
-                }
+        if (len >= sizeof(vio_hid_payload)) {
+            auto* p = reinterpret_cast<vio_hid_payload*>(buf);
+            if (p->timestamp != 0 && p->timestamp == last_vio_ts) continue;
+            last_vio_ts = p->timestamp;
+            if (g_ctx.vioCb) {
+                g_ctx.vioCb(p->px, p->py, p->pz, p->qx, p->qy, p->qz, p->qw,
+                            p->timestamp, g_ctx.vioUser);
             }
         }
     }
@@ -1854,9 +1845,9 @@ int insight9_receive_init(const insight9_config_t* config) {
     // g_ctx.hidPaths[1] = hidPaths[1];
     // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
     printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
-    g_ctx.hidDevs[0] = new HidDevice();
+    g_ctx.hidDevs[1] = new HidDevice();
     // g_ctx.hidDevs[1] = new HidDevice();
-    if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
+    if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open IMU HID\n");
         return -1;
     }
@@ -2059,7 +2050,7 @@ int insight9_receive_init_default() {
     g_ctx.hidDevs[0] = new HidDevice();
     // g_ctx.hidDevs[1] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open IMU HID\n");
+        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
         return -1;
     }
     // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
@@ -2100,7 +2091,7 @@ int insight9_receive_start() {
     }
     
     g_ctx.hidThreads[0] = std::thread(imuSensorThreadFunc);
-    g_ctx.hidThreads[1] = std::thread(hidThreadFunc, 1);
+    g_ctx.hidThreads[1] = std::thread(hidThreadFunc, 0);
 
     return 0;
 }
@@ -2149,9 +2140,7 @@ int insight9_receive_start_camera(int cam_id) {
     g_ctx.cam_running[mapped] = true;
     g_ctx.videos[mapped]->start();
     
-    if (g_ctx.videoThreads[mapped].joinable()) {
-        g_ctx.videoThreads[mapped].join();
-    }
+    joinWithTimeout(g_ctx.videoThreads[mapped], 3000, "video");
     g_ctx.videoThreads[mapped] = std::thread(videoThreadFunc, mapped);
     
     return 0;
@@ -2181,13 +2170,20 @@ void insight9_receive_stop_camera(int cam_id) {
     }
 
     if (!g_ctx.cam_running[GRAY_CAM_ID] && !g_ctx.cam_running[DEPTH_CAM_ID]) {
-        if (g_ctx.videos[COMPOSITE_UVC_ID]) {
-            g_ctx.videos[COMPOSITE_UVC_ID]->stop();
-        }
+        if (g_ctx.videos[COMPOSITE_UVC_ID]) g_ctx.videos[COMPOSITE_UVC_ID]->stop();
+        g_ctx.videoThreadStuck[COMPOSITE_UVC_ID] =
+            !joinWithTimeout(g_ctx.videoThreads[COMPOSITE_UVC_ID], 3000, "video[Composite]");
 
-        if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
-            g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
+        if (g_ctx.videoThreadStuck[COMPOSITE_UVC_ID]) {
+            fprintf(stderr, "[SDK][WARN] Composite video source leaked intentionally\n");
+        } else {
+            delete g_ctx.videos[COMPOSITE_UVC_ID];
         }
+        g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
+        g_ctx.videoThreadStuck[COMPOSITE_UVC_ID] = false;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        g_ctx.videos[COMPOSITE_UVC_ID] = new MFVideoSource();
     }
 }
 
@@ -2211,9 +2207,15 @@ int insight9_receive_restart_camera(int cam_id) {
     if (cam_id == RGB_CAM_ID) {
         insight9_receive_stop_camera(RGB_CAM_ID);
 
-        delete g_ctx.videos[RGB_UVC_ID];
+        if (g_ctx.videoThreadStuck[RGB_UVC_ID]) {
+            fprintf(stderr, "[SDK][WARN] RGB video source leaked intentionally "
+                            "(stuck thread may still reference it)\n");
+        } else {
+            delete g_ctx.videos[RGB_UVC_ID];
+        }
 
         g_ctx.videos[RGB_UVC_ID] = nullptr;
+        g_ctx.videoThreadStuck[RGB_UVC_ID] = false;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
@@ -2308,29 +2310,22 @@ int insight9_receive_is_camera_running(int cam_id) {
 }
 
 void insight9_receive_stop() {
-    if (!g_ctx.running) {return;}
+    if (!g_ctx.running) return;
     g_ctx.running = false;
 
-    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
-        g_ctx.cam_running[i] = false;
-    }
-
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) g_ctx.cam_running[i] = false;
     for (int i = 0; i < UVC_NUM; ++i) {
-        if (g_ctx.videos[i]) {
-            g_ctx.videos[i]->stop();
-        }
+        if (g_ctx.videos[i]) g_ctx.videos[i]->stop();
     }
-
     for (int i = 0; i < UVC_NUM; ++i) {
-        if (g_ctx.videoThreads[i].joinable()) {
-            g_ctx.videoThreads[i].join();
-        }
+        char label[32];
+        snprintf(label, sizeof(label), "video[%d]", i);
+        g_ctx.videoThreadStuck[i] = !joinWithTimeout(g_ctx.videoThreads[i], 3000, label);
     }
-
     for (int i = 0; i < HID_NUM; ++i) {
-        if (g_ctx.hidThreads[i].joinable()) {
-            g_ctx.hidThreads[i].join();
-        }
+        char label[32];
+        snprintf(label, sizeof(label), "hid[%d]", i);
+        g_ctx.hidThreadStuck[i] = !joinWithTimeout(g_ctx.hidThreads[i], 3000, label);
     }
 }
 
@@ -2338,14 +2333,24 @@ void insight9_receive_cleanup() {
     insight9_receive_stop();
 
     for (int i = 0; i < UVC_NUM; ++i) {
-        delete g_ctx.videos[i];
+        if (g_ctx.videoThreadStuck[i]) {
+            fprintf(stderr, "[SDK][WARN] Video source leaked intentionally "
+                            "(stuck thread may still reference it)\n");
+        } else {
+            delete g_ctx.videos[i];
+        }
         g_ctx.videos[i] = nullptr;
     }
 
     for (int i = 0; i < HID_NUM; ++i) {
         if (g_ctx.hidDevs[i]) {
-            g_ctx.hidDevs[i]->close();
-            delete g_ctx.hidDevs[i];
+            if (g_ctx.hidThreadStuck[i]) {
+                fprintf(stderr, "[SDK][WARN] HID device %d leaked intentionally "
+                                "(stuck thread may still reference it)\n", i);
+            } else {
+                g_ctx.hidDevs[i]->close();
+                delete g_ctx.hidDevs[i];
+            }
             g_ctx.hidDevs[i] = nullptr;
         }
     }

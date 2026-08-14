@@ -513,6 +513,38 @@ static void process_raw_frame(int cam_id, const raw_frame& rf) {
         g_panel[PANEL_DEPTH] = depth_bgr;
         g_aligned_color = acolor;   // empty if calib/align unavailable
         g_aligned_mask = amask;
+    } else if (rf.fmt == 0x32595559) { // YUYV
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 2) return;
+        
+        cv::Mat bgr;
+        cv::Mat yuyv_mat(h, w, CV_8UC2, (void*)data);
+        cv::cvtColor(yuyv_mat, bgr, cv::COLOR_YUV2BGR_YUYV);
+        
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_RGB] = bgr;
+    } else if (rf.fmt == 0x3231564E) { // NV12
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 3 / 2) return;
+        
+        cv::Mat bgr;
+        cv::Mat nv12_mat(h * 3 / 2, w, CV_8UC1, (void*)data);
+        cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
+        
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_RGB] = bgr;
+    } else if (rf.fmt == 0x49385956) { // Y8I
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 2) return;
+
+        cv::Mat interleaved(h, w, CV_8UC2, (void*)data);
+        std::vector<cv::Mat> channels(2);
+        cv::split(interleaved, channels);
+
+        cv::Mat left_bgr, right_bgr;
+        cv::cvtColor(channels[0], left_bgr, cv::COLOR_GRAY2BGR);
+        cv::cvtColor(channels[1], right_bgr, cv::COLOR_GRAY2BGR);
+
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_LEFT] = left_bgr;
+        g_panel[PANEL_RIGHT] = right_bgr;
     }
 }
 

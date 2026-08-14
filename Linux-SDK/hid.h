@@ -6,6 +6,7 @@
 #include <atomic>
 #include <pthread.h>
 #include <sys/time.h>
+#include "Insight_9_receive_internal.h"
 
 #define CAM_NUM 3
 #define HID_NUM 2

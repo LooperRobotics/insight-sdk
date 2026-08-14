@@ -410,31 +410,17 @@ public:
     
     bool isRunning() const { return running_; }
 
-    bool readFrame(DWORD streamIndex, uint8_t*& data, size_t& size, FrameInfo& info) {
+    bool readFrame(DWORD requestedStream, uint8_t*& data, size_t& size, FrameInfo& info, DWORD* outActualStream = nullptr) {
         data = nullptr;
         size = 0;
 
         memset(&info, 0, sizeof(info));
 
-        if (!running_) {
-            printf("[MFVideoSource] readFrame(%lu): running=false\n", streamIndex);
-            return false;
+        if (requestedStream != MF_SOURCE_READER_ANY_STREAM) {
+            if (requestedStream >= 2) return false;
+            if (!streamEnabled_[requestedStream]) return false;
         }
-
-        if (streamIndex >= 2) {
-            printf("[MFVideoSource] readFrame(%lu): invalid stream\n", streamIndex);
-            return false;
-        }
-
-        if (!streamEnabled_[streamIndex]) {
-            printf("[MFVideoSource] readFrame(%lu): stream disabled\n", streamIndex);
-            return false;
-        }
-
-        if (!sourceReader_) {
-            printf("[MFVideoSource] readFrame(%lu): sourceReader=null\n", streamIndex);
-            return false;
-        }
+        if (!sourceReader_) return false;
 
         std::lock_guard<std::mutex> lock(readerMutex_);
         IMFSample* sample = nullptr;
@@ -442,40 +428,38 @@ public:
         DWORD flags = 0;
         LONGLONG ts = 0;
 
-        HRESULT hr = sourceReader_->ReadSample(streamIndex, 0, &actualStream, &flags, &ts, &sample);
-
+        HRESULT hr = sourceReader_->ReadSample(requestedStream, 0, &actualStream, &flags, &ts, &sample);
         if (FAILED(hr)) {
             printf("[MFVideoSource] ReadSample(stream=%lu) FAILED hr=0x%08lx flags=0x%08lx actual=%lu\n",
-                streamIndex, hr, flags, actualStream);
+                requestedStream, hr, flags, actualStream);
+            if (sample) sample->Release();
+            return false;
+        }
+        if (outActualStream) *outActualStream = actualStream;
+
+        if (actualStream < 2 && !streamEnabled_[actualStream]) {
             if (sample) sample->Release();
             return false;
         }
 
-        if (actualStream != streamIndex && actualStream != MF_SOURCE_READER_ANY_STREAM) {
-            printf("[MFVideoSource] WARNING: requested stream=%lu but actual stream=%lu\n",
-                streamIndex, actualStream);
-        }
-
         if (flags & MF_SOURCE_READERF_ERROR) {
-            printf("[MFVideoSource] Stream %lu ERROR flags=0x%08lx\n", streamIndex, flags);
+            // printf("[MFVideoSource] Stream %lu ERROR flags=0x%08lx\n", streamIndex, flags);
             if (sample) sample->Release();
             return false;
         }
 
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-            printf("[MFVideoSource] Stream %lu END_OF_STREAM\n", streamIndex);
+            // printf("[MFVideoSource] Stream %lu END_OF_STREAM\n", streamIndex);
             if (sample) sample->Release();
             return false;
         }
 
         if (flags & MF_SOURCE_READERF_STREAMTICK) {
-            printf("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n",
-                streamIndex, ts, sample);
+            // printf("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n", streamIndex, ts, sample);
         }
 
         if (!sample) {
-            printf("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n",
-                streamIndex, flags);
+            // printf("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n", streamIndex, flags);
             return false;
         }
         
@@ -523,7 +507,7 @@ printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
         hr = sample->ConvertToContiguousBuffer(&buffer);
         if (FAILED(hr) || !buffer) {
             printf("[MFVideoSource] Stream %lu ConvertToContiguousBuffer failed hr=0x%08lx\n",
-                streamIndex, hr);
+                actualStream, hr);
             sample->Release();
             return false;
         }
@@ -537,7 +521,7 @@ printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
 
         if (FAILED(hr) || !ptr || curLen == 0) {
             printf("[MFVideoSource] Stream %lu Buffer Lock failed hr=0x%08lx curLen=%lu\n",
-                streamIndex, hr, curLen);
+                actualStream, hr, curLen);
 
             buffer->Release();
             sample->Release();
@@ -561,12 +545,12 @@ printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
         buffer->Release();
         sample->Release();
 
-        info.streamIndex = streamIndex;
-        info.width = streamWidth_[streamIndex];
-        info.height = streamHeight_[streamIndex];
-        info.format = streamFormat_[streamIndex];
+        info.streamIndex = actualStream;
+        info.width = streamWidth_[actualStream];
+        info.height = streamHeight_[actualStream];
+        info.format = streamFormat_[actualStream];
 
-        switch (streamFormat_[streamIndex]) {
+        switch (streamFormat_[actualStream]) {
             case PixelFormat::MJPEG: info.type = FrameType::Color; break;
             case PixelFormat::Z16:   info.type = FrameType::Depth; break;
             case PixelFormat::Y8I:   info.type = FrameType::Gray; break;
@@ -582,14 +566,14 @@ printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
             info.timestamp = (uint64_t)(ts / 10);
         }
 
-        if (lastTimestamp_[streamIndex] != 0 && lastTimestamp_[streamIndex] == info.timestamp) {
-            printf("[MFVideoSource] Stream %lu duplicate timestamp=%llu\n", streamIndex, info.timestamp);
+        if (lastTimestamp_[actualStream] != 0 && lastTimestamp_[actualStream] == info.timestamp) {
+            printf("[MFVideoSource] Stream %lu duplicate timestamp=%llu\n", actualStream, info.timestamp);
             delete[] data;
             data = nullptr;
             size = 0;
             return false;
         }
-        lastTimestamp_[streamIndex] = info.timestamp;
+        lastTimestamp_[actualStream] = info.timestamp;
 
         return true;
     }
@@ -1712,37 +1696,21 @@ static void videoThreadFunc(int uvcId) {
     // =====================================================
     else if (uvcId == COMPOSITE_UVC_ID) {
         while (g_ctx.running && (g_ctx.cam_running[GRAY_CAM_ID] || g_ctx.cam_running[DEPTH_CAM_ID]) && src->isRunning()) {
-            bool gotFrame = false;
-            // =================================================
-            // Depth
-            // Stream 0 -> cam 2
-            // =================================================
-            if (g_ctx.cam_running[DEPTH_CAM_ID]) {
-                uint8_t* data = nullptr;
-                size_t size = 0;
-                FrameInfo info{};
+            uint8_t* data = nullptr;
+            size_t size = 0;
+            FrameInfo info{};
+            DWORD actualStream = MF_SOURCE_READER_ANY_STREAM;
 
-                if (src->readFrame(DEPTH_STREAM_ID, data, size, info)) {
+            bool gotFrame = src->readFrame(MF_SOURCE_READER_ANY_STREAM, data, size, info, &actualStream);
+
+            if (gotFrame) {
+                if (actualStream == DEPTH_STREAM_ID && g_ctx.cam_running[DEPTH_CAM_ID]) {
                     deliverFrame(uvcId, data, size, info);
-                    delete[] data;
-                    gotFrame = true;
-                }
-            }
-            // =================================================
-            // Gray / IR
-            // Stream 1 -> cam 1
-            // =================================================
-            if (g_ctx.cam_running[GRAY_CAM_ID]) {
-                uint8_t* data = nullptr;
-                size_t size = 0;
-                FrameInfo info{};
-                if (src->readFrame(GRAY_STREAM_ID, data, size, info)) {
+                } else if (actualStream == GRAY_STREAM_ID && g_ctx.cam_running[GRAY_CAM_ID]) {
                     deliverFrame(uvcId, data, size, info);
-                    delete[] data;
-                    gotFrame = true;
                 }
-            }
-            if (!gotFrame) {
+                delete[] data;
+            } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }

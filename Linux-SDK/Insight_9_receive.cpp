@@ -21,6 +21,8 @@
 #include "UvcExtensionUnit.hpp"
 #include <math.h>
 #include <vector>
+#include <algorithm>
+#include "Insight_9_receive_internal.h"
 
 // ==================== Reconnect Backoff / Retry Limits ====================
 // Rationale: repeatedly opening / S_FMT-ing a device that is in a bad state
@@ -258,6 +260,23 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
         }
     }
     return count;
+}
+
+static PixelFormat fourccToPixelFormat(unsigned int fcc) {
+    switch (fcc) {
+        case V4L2_PIX_FMT_MJPEG: return PixelFormat::MJPEG;
+        case V4L2_PIX_FMT_GREY:  return PixelFormat::GREY;
+        case V4L2_PIX_FMT_YUYV:  return PixelFormat::YUYV;
+        case V4L2_PIX_FMT_NV12:  return PixelFormat::NV12;
+#ifdef V4L2_PIX_FMT_Z16
+        case V4L2_PIX_FMT_Z16:   return PixelFormat::Z16;
+#endif
+#ifdef V4L2_PIX_FMT_Y8I
+        case V4L2_PIX_FMT_Y8I:   return PixelFormat::Y8I;
+#endif
+        default:
+            return PixelFormat::Unknown;
+    }
 }
 
 // 获取单个分辨率的帧率列表
@@ -1789,7 +1808,7 @@ int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp) {
     return *timestamp != 0 ? 0 : -1;
 }
 
-void insight9_receive_all_stop_camera(int cam_id) {
+void insight9_receive_stop_camera(int cam_id) {
     if (cam_id < 0 || cam_id >= CAM_NUM) return;
     
     g_ctx.cam_running[cam_id] = false;
@@ -1824,7 +1843,7 @@ int insight9_receive_restart_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
     
-    insight9_receive_all_stop_camera(cam_id);
+    insight9_receive_stop_camera(cam_id);
     usleep(100000);
     return insight9_receive_start_camera(cam_id);
 }
@@ -1837,7 +1856,7 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     printf("[SDK] Switching camera %d to %d fps...\n", cam_id, fps);
 
     // 1. 停止相机（使用安全清理）
-    insight9_receive_all_stop_camera(cam_id);
+    insight9_receive_stop_camera(cam_id);
     
     // 2. 等待设备完全释放
     usleep(1000000);  // 200ms
@@ -1862,7 +1881,7 @@ int insight9_receive_is_camera_running(int cam_id) {
     return g_ctx.cam_running[cam_id] ? 1 : 0;
 }
 
-void insight9_receive_all_stop(void) {
+void insight9_receive_stop(void) {
     if (!g_ctx.running) return;
     g_ctx.running = false;
 
@@ -1904,7 +1923,7 @@ void insight9_receive_cleanup(void) {
     printf("[SDK] Cleaning up...\n");
 
     if (g_ctx.running) {
-        insight9_receive_all_stop();
+        insight9_receive_stop();
     }
 
     for (int i = 0; i < CAM_NUM; i++) {
@@ -1971,6 +1990,60 @@ void insight9_receive_register_imu_callback(imu_callback cb, void *userdata) {
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata) {
     g_ctx.vio_cb = cb;
     g_ctx.vio_userdata = userdata;
+}
+
+static bool buildCapabilityList(struct cam_ctx* ctx, std::vector<DeviceCapability>& out) {
+    out.clear();
+    if (!ctx || !ctx->formats_info) return false;
+
+    for (int f = 0; f < ctx->format_num; ++f) {
+        const struct uvc_format_info& fmt = ctx->formats_info[f];
+        PixelFormat pf = fourccToPixelFormat(fmt.fcc);
+        if (pf == PixelFormat::Unknown) continue;   // SDK 不认识的格式先跳过，不展示
+
+        for (int r = 0; r < fmt.frames_num; ++r) {
+            const struct uvc_frame_info& frame = fmt.frames[r];
+            for (int iv = 0; iv < 8; ++iv) {
+                unsigned int fps = frame.intervals[iv];
+                if (fps == 0) break;   // intervals[] 用 0 表示后面没有更多帧率了
+                DeviceCapability cap;
+                cap.width = frame.width;
+                cap.height = frame.height;
+                cap.fps = (int)fps;
+                cap.format = pf;
+                cap.valid = true;
+                out.push_back(cap);
+            }
+        }
+    }
+
+    // 跟 Windows 那边保持一致的排序：先按 format 分组，组内分辨率、帧率从小到大
+    std::sort(out.begin(), out.end(), [](const DeviceCapability& a, const DeviceCapability& b) {
+        if (a.format != b.format) return (int)a.format < (int)b.format;
+        long long areaA = (long long)a.width * a.height;
+        long long areaB = (long long)b.width * b.height;
+        if (areaA != areaB) return areaA < areaB;
+        if (a.width != b.width) return a.width < b.width;
+        return a.fps < b.fps;
+    });
+    return true;
+}
+
+int insight9_receive_get_device_capability_count(int cam_id, int* count) {
+    if (!count || cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    std::vector<DeviceCapability> caps;
+    if (!buildCapabilityList(&g_ctx.cams[cam_id], caps)) return -1;
+    *count = (int)caps.size();
+    return 0;
+}
+
+int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap) {
+    if (!cap || cam_id < 0 || cam_id >= CAM_NUM || index < 0) return -1;
+    std::vector<DeviceCapability> caps;
+    if (!buildCapabilityList(&g_ctx.cams[cam_id], caps)) return -1;
+    if (index >= (int)caps.size()) return -1;
+    *cap = caps[index];
+    return 0;
 }
 
 extern "C" {

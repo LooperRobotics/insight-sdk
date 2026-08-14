@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <atomic>
-#include "UvcExtensionUnit.hpp"
 
 
 // ==================== Target Device VID/PID ====================
@@ -167,6 +166,16 @@ typedef struct {
     video_config_t depth_config;
 } insight9_config_t;
 
+struct DeviceCapability {
+    int width;
+    int height;
+    int fps;
+    PixelFormat format;
+    bool valid;
+
+    DeviceCapability() : width(0), height(0), fps(0), format(PixelFormat::Unknown), valid(false) {}
+};
+
 // VIO status enumeration, matching the device firmware
 enum class VioStatus : uint8_t {
     NOT_INITED      = 0,
@@ -218,38 +227,6 @@ typedef void (*imu_callback)(float ax, float ay, float az,
 typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint64_t timestamp, void *userdata);
-
-
-typedef struct {
-    // Cameras
-    struct cam_ctx cams[CAM_NUM];
-    char metadata_devs[CAM_NUM][MAX_PATH];
-    char metadata_usb_paths[CAM_NUM][MAX_PATH];
-    char video_devs[CAM_NUM][MAX_PATH];   // Dynamically resolved video device paths
-    char video_usb_paths[CAM_NUM][MAX_PATH]; // Matching USB root paths, used for rediscovery after reconnect
-    // HID devices (only two are used: 0=IMU, 1=VIO)
-    char hid_devs[HID_NUM][MAX_PATH];           // Dynamically resolved hidraw device paths
-    char hid_usb_paths[HID_NUM][MAX_PATH];   // Matching HID USB root paths, used for rediscovery after reconnect
-    pthread_t hid_tids[HID_NUM];
-    // Callbacks
-    image_callback img_cb;
-    void *img_userdata;
-    imu_callback imu_cb;
-    void *imu_userdata;
-    vio_callback vio_cb;
-    void *vio_userdata;
-    // Running flag
-    std::atomic<bool> running;
-    insight9_config_t config;
-    std::atomic<bool> cam_running[CAM_NUM];
-    pthread_t video_tids[CAM_NUM];
-    struct timespec last_frame_time[CAM_NUM];
-    bool first_frame_received[CAM_NUM];
-    // Initialization flag
-    int initialized;
-    viewer::UvcExtensionUnit *xu_control;
-    std::atomic<bool> xu_ready;
-} sdk_ctx_t;
 
 /**
  * @brief Initialize the SDK with custom configuration.
@@ -313,7 +290,7 @@ int insight9_receive_start_camera(int cam_id);
  * @brief Stop a specific camera.
  * @param cam_id Camera ID.
  */
-void insight9_receive_all_stop_camera(int cam_id);
+void insight9_receive_stop_camera(int cam_id);
 
 /**
  * @brief Restart a specific camera (stop and start again).
@@ -344,7 +321,7 @@ int insight9_receive_is_camera_running(int cam_id);
 /**
  * @brief Stop all capture threads.
  */
-void insight9_receive_all_stop(void);
+void insight9_receive_stop(void);
 
 /**
  * @brief Release all resources. Must be called after stopping.
@@ -501,6 +478,11 @@ int insight9_receive_get_vio_status(int* status);
 const char* insight9_receive_get_hardware_type(void);
 
 int insight9_receive_switch_camera_fps(int cam_id, int fps);
+
+#ifdef __cplusplus
+int insight9_receive_get_device_capability_count(int cam_id, int* count);
+int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap);
+#endif
 
 #ifdef __cplusplus
 }

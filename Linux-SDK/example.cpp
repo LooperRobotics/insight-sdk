@@ -22,7 +22,7 @@ static pthread_mutex_t g_sdk_op_lock = PTHREAD_MUTEX_INITIALIZER;
 void sigint_handler(int sig) {
     printf("\n[Signal] Received SIGINT, stopping...\n");
     keep_running = 0;
-    insight9_receive_all_stop();
+    insight9_receive_stop();
 }
 
 struct cam_stats {
@@ -448,7 +448,7 @@ void* reconnect_worker(void* arg) {
             } else {
                 printf("Failed to get current FPS for gray camera\n");
             }
-            insight9_receive_all_stop();
+            insight9_receive_stop();
             insight9_receive_cleanup();
            
             insight9_config_t config_reinit;
@@ -482,7 +482,7 @@ void* reconnect_worker(void* arg) {
         }
         pthread_mutex_unlock(&g_sdk_op_lock);
     }
-    insight9_receive_all_stop();
+    insight9_receive_stop();
     insight9_receive_cleanup();
     return NULL;
 }
@@ -715,7 +715,7 @@ int main() {
     pthread_join(reconnect_thread, NULL);
     pthread_join(fps_switch_thread, NULL);
 
-    insight9_receive_all_stop();
+    insight9_receive_stop();
     insight9_receive_cleanup();
     printf("Program exited.\n");
     return 0;

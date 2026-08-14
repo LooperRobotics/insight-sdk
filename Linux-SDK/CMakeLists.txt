@@ -57,8 +57,8 @@ target_link_libraries(insight9 PRIVATE
 )
 
 set_target_properties(insight9 PROPERTIES
-    VERSION ${PROJECT_VERSION}
-    SOVERSION 1
+    # VERSION ""
+    # SOVERSION ""
     OUTPUT_NAME "insight9"
 )
 

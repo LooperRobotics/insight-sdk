@@ -36,9 +36,7 @@
 // still wakes periodically so a recovered device can be picked back up.
 #define RECONNECT_MAX_ATTEMPTS    30
 
-
-
-sdk_ctx_t g_ctx = {0};
+sdk_ctx_t g_ctx{};
 
 // Compute the exponential backoff delay (ms) for the Nth consecutive failure
 // (attempt counted from 1), capped at RECONNECT_BACKOFF_MAX_MS.
@@ -1330,7 +1328,6 @@ static void *capture_thread(void *arg) {
         }
 
         uint64_t timestamp = read_latest_metadata_timestamp(ctx);
-        uint64_t right_timestamp = 0;
         if (ctx->meta_fd < 0) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));

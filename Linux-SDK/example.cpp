@@ -202,19 +202,19 @@ static void maybe_print_hid_stats_locked(void) {
     if (elapsed < 0.5) {
         return;
     }
-    // printf("\n========= HID Callbacks : 0.5/s =========\n");
+    printf("\n========= HID Callbacks : 0.5/s =========\n");
 
-    // printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
-    //        g_imu_stats.cb_count / elapsed,
-    //        g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
-    //        g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
-    //        (unsigned long)g_imu_stats.last_ts);
+    printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
+           g_imu_stats.cb_count / elapsed,
+           g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
+           g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
+           (unsigned long)g_imu_stats.last_ts);
 
-    // printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
-    //        g_vio_stats.cb_count / elapsed,
-    //        g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
-    //        g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
-    //        (unsigned long)g_vio_stats.last_ts);
+    printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
+           g_vio_stats.cb_count / elapsed,
+           g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
+           g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
+           (unsigned long)g_vio_stats.last_ts);
     fflush(stdout);
 
     if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
@@ -397,6 +397,20 @@ static void process_raw_frame(int cam_id, const raw_frame &rf) {
         
         std::lock_guard<std::mutex> lk(g_panel_lock);
         g_panel[PANEL_RGB] = bgr;
+    } else if (rf.fmt == V4L2_PIX_FMT_Y8I) {
+        if (w <= 0 || h <= 0 || size < (size_t)w * h * 2) return;
+
+        cv::Mat interleaved(h, w, CV_8UC2, (void*)data);
+        std::vector<cv::Mat> channels(2);
+        cv::split(interleaved, channels);
+
+        cv::Mat left_bgr, right_bgr;
+        cv::cvtColor(channels[0], left_bgr, cv::COLOR_GRAY2BGR);
+        cv::cvtColor(channels[1], right_bgr, cv::COLOR_GRAY2BGR);
+
+        std::lock_guard<std::mutex> lk(g_panel_lock);
+        g_panel[PANEL_LEFT] = left_bgr;
+        g_panel[PANEL_RIGHT] = right_bgr;
     }
 }
 

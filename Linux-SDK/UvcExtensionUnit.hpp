@@ -82,8 +82,8 @@ enum : uint8_t {
 
 inline constexpr int kFramerateMap[] = {90, 60, 30, 20, 15, 10};
 inline constexpr uint8_t kXuUnitId = 3;
-inline constexpr uint8_t kCameraParamsSelector = 4;
-inline constexpr uint8_t kActiveCameraSelector = 7;
+inline constexpr uint8_t kCameraParamsSelector = 18;
+inline constexpr uint8_t kActiveCameraSelector = 19;
 inline constexpr uint8_t kCameraCalibSelectorBase = 0x14;
 inline constexpr uint8_t kCurrentFpsSelector = 0x17;
 inline constexpr uint8_t kVioManagerStatus = 0x18;

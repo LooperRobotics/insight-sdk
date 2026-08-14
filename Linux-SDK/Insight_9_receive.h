@@ -3,7 +3,68 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <string>
+#include <pthread.h>
+#include <atomic>
+#include "UvcExtensionUnit.hpp"
+
+
+// ==================== Target Device VID/PID ====================
+#define VENDOR_ID  0x3652
+#define PRODUCT_ID 0x0b5c
+
+// ==================== Camera Configuration ====================
+#define CAM_NUM 3
+#define HID_NUM 2
+#define MAIN_WIDTH   1088
+#define MAIN_HEIGHT  1920
+#define MAIN_FORMAT  V4L2_PIX_FMT_MJPEG
+#define SUB_WIDTH    544
+#define SUB_HEIGHT   1281
+#define SUB_FORMAT   V4L2_PIX_FMT_GREY
+#define DEPTH_WIDTH  544
+#define DEPTH_HEIGHT 642
+#define DEPTH_FORMAT V4L2_PIX_FMT_Z16
+#define FRAME_RATE 30
+#define BUFFER_COUNT 8
+#define MAX_PATH 1024
+#define METADATA_SIZE 258
+
+struct buffer {
+    void *start;
+    size_t length;
+};
+
+struct uvc_frame_info {
+    unsigned int width;
+    unsigned int height;
+    unsigned int intervals[8];
+};
+
+struct uvc_format_info {
+    unsigned int fcc;
+    int frames_num;
+    struct uvc_frame_info *frames;
+};
+
+struct cam_ctx {
+    int fd;
+    struct buffer *buffers;
+    int meta_fd;
+    struct buffer *meta_buffers;
+    int meta_buffer_count;
+    int buffer_count;
+    pthread_t tid;
+    int cam_id;
+    int width;
+    int height;
+    int fps;
+    unsigned int format;
+    int format_num;
+    struct uvc_format_info *formats_info;
+    uint64_t last_timestamp;
+    pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
+};
+
 
 #pragma pack(push, 1)
 typedef struct {
@@ -158,6 +219,38 @@ typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint64_t timestamp, void *userdata);
 
+
+typedef struct {
+    // Cameras
+    struct cam_ctx cams[CAM_NUM];
+    char metadata_devs[CAM_NUM][MAX_PATH];
+    char metadata_usb_paths[CAM_NUM][MAX_PATH];
+    char video_devs[CAM_NUM][MAX_PATH];   // Dynamically resolved video device paths
+    char video_usb_paths[CAM_NUM][MAX_PATH]; // Matching USB root paths, used for rediscovery after reconnect
+    // HID devices (only two are used: 0=IMU, 1=VIO)
+    char hid_devs[HID_NUM][MAX_PATH];           // Dynamically resolved hidraw device paths
+    char hid_usb_paths[HID_NUM][MAX_PATH];   // Matching HID USB root paths, used for rediscovery after reconnect
+    pthread_t hid_tids[HID_NUM];
+    // Callbacks
+    image_callback img_cb;
+    void *img_userdata;
+    imu_callback imu_cb;
+    void *imu_userdata;
+    vio_callback vio_cb;
+    void *vio_userdata;
+    // Running flag
+    std::atomic<bool> running;
+    insight9_config_t config;
+    std::atomic<bool> cam_running[CAM_NUM];
+    pthread_t video_tids[CAM_NUM];
+    struct timespec last_frame_time[CAM_NUM];
+    bool first_frame_received[CAM_NUM];
+    // Initialization flag
+    int initialized;
+    viewer::UvcExtensionUnit *xu_control;
+    std::atomic<bool> xu_ready;
+} sdk_ctx_t;
+
 /**
  * @brief Initialize the SDK with custom configuration.
  * @param config Configuration structure containing resolution, fps, and pixel format for each camera.
@@ -220,7 +313,7 @@ int insight9_receive_start_camera(int cam_id);
  * @brief Stop a specific camera.
  * @param cam_id Camera ID.
  */
-void insight9_receive_stop_camera(int cam_id);
+void insight9_receive_all_stop_camera(int cam_id);
 
 /**
  * @brief Restart a specific camera (stop and start again).
@@ -251,7 +344,7 @@ int insight9_receive_is_camera_running(int cam_id);
 /**
  * @brief Stop all capture threads.
  */
-void insight9_receive_stop(void);
+void insight9_receive_all_stop(void);
 
 /**
  * @brief Release all resources. Must be called after stopping.
@@ -406,6 +499,8 @@ int insight9_receive_get_vio_status(int* status);
  * @return Hardware type/model string, or "unknown" on failure.
  */
 const char* insight9_receive_get_hardware_type(void);
+
+int insight9_receive_switch_camera_fps(int cam_id, int fps);
 
 #ifdef __cplusplus
 }

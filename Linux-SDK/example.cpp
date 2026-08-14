@@ -22,7 +22,7 @@ static pthread_mutex_t g_sdk_op_lock = PTHREAD_MUTEX_INITIALIZER;
 void sigint_handler(int sig) {
     printf("\n[Signal] Received SIGINT, stopping...\n");
     keep_running = 0;
-    insight9_receive_stop();
+    insight9_receive_all_stop();
 }
 
 struct cam_stats {
@@ -202,19 +202,19 @@ static void maybe_print_hid_stats_locked(void) {
     if (elapsed < 0.5) {
         return;
     }
-    printf("\n========= HID Callbacks : 0.5/s =========\n");
+    // printf("\n========= HID Callbacks : 0.5/s =========\n");
 
-    printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
-           g_imu_stats.cb_count / elapsed,
-           g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
-           g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
-           (unsigned long)g_imu_stats.last_ts);
+    // printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
+    //        g_imu_stats.cb_count / elapsed,
+    //        g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
+    //        g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
+    //        (unsigned long)g_imu_stats.last_ts);
 
-    printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
-           g_vio_stats.cb_count / elapsed,
-           g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
-           g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
-           (unsigned long)g_vio_stats.last_ts);
+    // printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
+    //        g_vio_stats.cb_count / elapsed,
+    //        g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
+    //        g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
+    //        (unsigned long)g_vio_stats.last_ts);
     fflush(stdout);
 
     if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
@@ -434,7 +434,7 @@ void* reconnect_worker(void* arg) {
             } else {
                 printf("Failed to get current FPS for gray camera\n");
             }
-            insight9_receive_stop();
+            insight9_receive_all_stop();
             insight9_receive_cleanup();
            
             insight9_config_t config_reinit;
@@ -468,7 +468,7 @@ void* reconnect_worker(void* arg) {
         }
         pthread_mutex_unlock(&g_sdk_op_lock);
     }
-    insight9_receive_stop();
+    insight9_receive_all_stop();
     insight9_receive_cleanup();
     return NULL;
 }
@@ -492,7 +492,7 @@ void toggle_gray_camera_fps() {
 
 void* fps_switch_worker(void* arg) {
     while (keep_running) {
-        sleep(10);
+        sleep(15);
         if (!keep_running) break;
         toggle_gray_camera_fps();
     }
@@ -701,7 +701,7 @@ int main() {
     pthread_join(reconnect_thread, NULL);
     pthread_join(fps_switch_thread, NULL);
 
-    insight9_receive_stop();
+    insight9_receive_all_stop();
     insight9_receive_cleanup();
     printf("Program exited.\n");
     return 0;

@@ -19,19 +19,8 @@
 #include <assert.h>
 #include <ctype.h>
 #include "UvcExtensionUnit.hpp"
-#include <atomic>
-#include <cmath>
+#include <math.h>
 #include <vector>
-
-#ifndef V4L2_META_FMT_UVC
-#define V4L2_META_FMT_UVC v4l2_fourcc('U', 'V', 'C', 'H')
-#endif
-
-#define FRAME_RATE 30
-#define BUFFER_COUNT 8
-#define METADATA_SIZE 258
-
-sdk_ctx_t g_ctx = {0};
 
 // ==================== Reconnect Backoff / Retry Limits ====================
 // Rationale: repeatedly opening / S_FMT-ing a device that is in a bad state
@@ -47,8 +36,9 @@ sdk_ctx_t g_ctx = {0};
 // still wakes periodically so a recovered device can be picked back up.
 #define RECONNECT_MAX_ATTEMPTS    30
 
-// ==================== Data Structures ====================
-#define MAX_PATH 1024
+
+
+sdk_ctx_t g_ctx = {0};
 
 // Compute the exponential backoff delay (ms) for the Nth consecutive failure
 // (attempt counted from 1), capped at RECONNECT_BACKOFF_MAX_MS.
@@ -272,6 +262,7 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
     return count;
 }
 
+// 获取单个分辨率的帧率列表
 int get_frame_intervals(int fd, uint32_t pixelformat, 
                         uint32_t width, uint32_t height,
                         unsigned int *intervals, int max_count) {
@@ -286,15 +277,18 @@ int get_frame_intervals(int fd, uint32_t pixelformat,
     while (count < max_count && 
            ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
         if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+            // 计算帧率（denominator/numerator）
             intervals[count] = frmival.discrete.denominator / 
                               frmival.discrete.numerator;
             count++;
         } else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
+            // 步进范围：取最大值
             intervals[count] = frmival.stepwise.max.denominator / 
                               frmival.stepwise.max.numerator;
             count++;
         } else if (frmival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
-            intervals[count++] = 30;
+            // 连续范围，取常见值
+            intervals[count++] = 30;  // 默认
             intervals[count++] = 25;
             intervals[count++] = 15;
         }
@@ -320,6 +314,7 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
     memset(&fmtdesc, 0, sizeof(fmtdesc));
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     
+    // 第一遍：统计格式数量
     while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
         format_count++;
         fmtdesc.index++;
@@ -336,6 +331,7 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
         return -1;
     }
     
+    // 第二遍：填充数据
     memset(&fmtdesc, 0, sizeof(fmtdesc));
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmtdesc.index = 0;
@@ -346,6 +342,7 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
         formats[fmt_idx].frames_num = 0;
         formats[fmt_idx].frames = NULL;
         
+        // 枚举该格式下的所有分辨率
         memset(&frmsize, 0, sizeof(frmsize));
         frmsize.pixel_format = fmtdesc.pixelformat;
         frmsize.index = 0;
@@ -354,11 +351,13 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
         struct uvc_frame_info *frames = NULL;
         
         while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+            // 只处理离散分辨率
             if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
                 frame_count++;
                 frames = (struct uvc_frame_info*)realloc(frames, frame_count * sizeof(struct uvc_frame_info));
                 if (!frames) {
                     fprintf(stderr, "[CAM] Failed to allocate frames memory\n");
+                    // 清理已分配的内存
                     for (int i = 0; i < fmt_idx; i++) {
                         if (formats[i].frames) free(formats[i].frames);
                     }
@@ -371,15 +370,17 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
                 memset(frames[frame_count - 1].intervals, 0, 
                        sizeof(frames[frame_count - 1].intervals));
                 
+                // 获取该分辨率的帧率
                 int interval_count = get_frame_intervals(
                     fd,
                     fmtdesc.pixelformat,
                     frmsize.discrete.width,
                     frmsize.discrete.height,
                     frames[frame_count - 1].intervals,
-                    8
+                    8  // 最多8个帧率
                 );
                 
+                // 如果没获取到帧率，使用默认值
                 if (interval_count == 0) {
                     frames[frame_count - 1].intervals[0] = 30;
                     interval_count = 1;
@@ -503,12 +504,14 @@ static int set_framerate(int fd, int framerate) {
     return 0;
 }
 
+// 获取摄像头所有格式信息并写入 cam_ctx
 static int get_camera_formats_info(struct cam_ctx *ctx) {
     if (!ctx || ctx->fd < 0) {
         fprintf(stderr, "[CAM] Invalid context or file descriptor\n");
         return -1;
     }
 
+    // 获取所有格式信息
     struct uvc_format_info *formats = NULL;
     int format_num = 0;
     
@@ -522,6 +525,7 @@ static int get_camera_formats_info(struct cam_ctx *ctx) {
     
     printf("[CAM%d] Got %d formats info\n", ctx->cam_id, format_num);
     
+    // 打印调试信息
     for (int i = 0; i < format_num; i++) {
         printf("  Format %d: 0x%08X (%c%c%c%c), frames=%d\n", 
                i,
@@ -548,10 +552,12 @@ static int get_camera_formats_info(struct cam_ctx *ctx) {
     return 0;
 }
 
+// 获取设备默认格式
 static int get_default_format(int fd, struct v4l2_format *fmt) {
     memset(fmt, 0, sizeof(*fmt));
     fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     
+    // 先尝试获取当前设备正在使用的格式
     if (ioctl(fd, VIDIOC_G_FMT, fmt) == 0) {
         printf("[CAM] Got current format: %dx%d, pixelformat=0x%x\n",
                fmt->fmt.pix.width, fmt->fmt.pix.height, fmt->fmt.pix.pixelformat);
@@ -561,12 +567,13 @@ static int get_default_format(int fd, struct v4l2_format *fmt) {
     return -1;
 }
 
+// 初始化捕获（从设备获取默认格式或使用指定格式）
 static int init_capture(struct cam_ctx *ctx) {
     struct v4l2_format fmt;
     int use_default_format = 0;
-    printf("init capture %d %d %d\n", ctx->width, ctx->height, ctx->format);
 
-    if (ctx->width == 0 || ctx->height == 0 || ctx->format == 0) {
+    if (1) {
+    // if (ctx->width == 0 || ctx->height == 0 || ctx->format == 0) {
         use_default_format = 1;
         printf("[CAM%d] Using default format from device\n", ctx->cam_id);
         if (get_default_format(ctx->fd, &fmt) < 0) {
@@ -576,6 +583,7 @@ static int init_capture(struct cam_ctx *ctx) {
         ctx->width = fmt.fmt.pix.width;
         ctx->height = fmt.fmt.pix.height;
         ctx->format = fmt.fmt.pix.pixelformat;
+        printf("init capture %d %d %d\n", ctx->width, ctx->height, ctx->format);
     } else {
         memset(&fmt, 0, sizeof(fmt));
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -622,6 +630,14 @@ static int init_capture(struct cam_ctx *ctx) {
     }
 
     set_framerate(ctx->fd, ctx->fps);
+    int cam_id = ctx->cam_id;
+    if (cam_id == 0) {
+        set_framerate(ctx->fd, g_ctx.config.rgb_config.fps);
+    } else if (cam_id == 1) {
+        set_framerate(ctx->fd, g_ctx.config.gray_config.fps);
+    } else if (cam_id == 2) {
+        set_framerate(ctx->fd, g_ctx.config.depth_config.fps);
+    }
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
@@ -629,9 +645,23 @@ static int init_capture(struct cam_ctx *ctx) {
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
 
-    if (ioctl(ctx->fd, VIDIOC_REQBUFS, &req) < 0) {
-        fprintf(stderr, "[CAM%d][ERR] VIDIOC_REQBUFS: %s\n", ctx->cam_id, strerror(errno));
-        return -1;
+    int retries = 0;
+    int ret;
+    while (retries < 50) {
+        ret = ioctl(ctx->fd, VIDIOC_REQBUFS, &req);
+        if (ret == 0) {
+            break;
+        }
+
+        if (errno == EBUSY) {
+            retries++;
+            fprintf(stderr, "[CAM%d][WARN] VIDIOC_REQBUFS忙，重试 %d...\n", ctx->cam_id, retries);
+            usleep(100000); 
+        } else {
+            // 其他错误则直接退出
+            fprintf(stderr, "[CAM%d][ERR] VIDIOC_REQBUFS失败: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
     }
 
     if (req.count < 2) {
@@ -687,6 +717,7 @@ err_cleanup:
     return -1;
 }
 
+// 获取摄像头当前格式
 int insight9_receive_get_current_format(int cam_id, int *width, int *height, unsigned int *format) {
     if (!g_ctx.initialized) {
         fprintf(stderr, "[SDK][ERR] not initialized\n");
@@ -703,6 +734,7 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
     
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
     
+    // 如果设备已打开，直接从设备查询
     if (ctx->fd >= 0) {
         struct v4l2_format fmt;
         memset(&fmt, 0, sizeof(fmt));
@@ -716,6 +748,7 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
         }
     }
     
+    // 如果设备未打开，尝试打开并获取格式
     int fd = open(g_ctx.video_devs[cam_id], O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
@@ -733,12 +766,14 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
         return 0;
     }
     
+    // 如果获取失败，返回ctx中保存的值
     *width = ctx->width;
     *height = ctx->height;
     *format = ctx->format;
     return 0;
 }
 
+// 获取设备支持的格式列表
 int insight9_receive_enum_formats(int cam_id, int index, struct v4l2_fmtdesc *desc) {
     if (!g_ctx.initialized) {
         fprintf(stderr, "[SDK][ERR] not initialized\n");
@@ -769,6 +804,7 @@ int insight9_receive_enum_formats(int cam_id, int index, struct v4l2_fmtdesc *de
     return ret < 0 ? -1 : 0;
 }
 
+// 枚举帧大小
 int insight9_receive_enum_frame_sizes(int cam_id, unsigned int pixelformat, int index, struct v4l2_frmsizeenum *frmsize) {
     if (!g_ctx.initialized) {
         fprintf(stderr, "[SDK][ERR] not initialized\n");
@@ -817,6 +853,172 @@ static int stop_capture(int fd) {
     return 0;
 }
 
+static void free_buffer_array(struct buffer **buffers, int *buffer_count) {
+    if (!buffers || !*buffers) return;
+    for (int i = 0; i < *buffer_count; i++) {
+        if ((*buffers)[i].start) {
+            munmap((*buffers)[i].start, (*buffers)[i].length);
+            (*buffers)[i].start = NULL;
+        }
+    }
+    free(*buffers);
+    *buffers = NULL;
+    *buffer_count = 0;
+}
+
+static uint32_t read_le32(const uint8_t *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t parse_uvc_metadata_timestamp(const uint8_t *data, size_t size) {
+    if (!data || size < 10) return 0;
+
+    // Firmware writes the low 32 bits of ts_us into the UVC payload header:
+    // bytes 2..5 are PTS, bytes 6..9 are the low SCR bytes.
+    //
+    // Linux UVC metadata nodes usually prepend struct uvc_meta_buf:
+    //   u64 ns, u16 sof, u8 length, u8 flags, then the UVC payload header.
+    // In that common layout, the device header "f8 8e ..." starts at data + 12.
+    if (size >= 22 && data[10] >= 10 && data[10] <= size - 12) {
+        const uint8_t *uvc_header = data + 12;
+        uint32_t pts = read_le32(uvc_header + 2);
+        if (pts != 0) return pts;
+        uint32_t scr_low = read_le32(uvc_header + 6);
+        if (scr_low != 0) return scr_low;
+    }
+
+    // Fallback for drivers that expose the UVC payload header directly.
+    uint32_t pts = read_le32(data + 12);
+    if (pts != 0) return pts;
+
+    return 0;
+}
+
+static int init_metadata_capture(struct cam_ctx *ctx) {
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_META_CAPTURE;
+    fmt.fmt.meta.dataformat = V4L2_META_FMT_UVC;
+    fmt.fmt.meta.buffersize = METADATA_SIZE;
+
+    if (ioctl(ctx->meta_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        fprintf(stderr, "[CAM%d][META][WARN] VIDIOC_S_FMT: %s\n", ctx->cam_id, strerror(errno));
+    }
+
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = BUFFER_COUNT;
+    req.type = V4L2_BUF_TYPE_META_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(ctx->meta_fd, VIDIOC_REQBUFS, &req) < 0) {
+        fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_REQBUFS: %s\n", ctx->cam_id, strerror(errno));
+        return -1;
+    }
+
+    if (req.count < 2) {
+        fprintf(stderr, "[CAM%d][META][ERR] insufficient buffers (%u)\n", ctx->cam_id, req.count);
+        return -1;
+    }
+
+    ctx->meta_buffers = (buffer*)calloc(req.count, sizeof(struct buffer));
+    if (!ctx->meta_buffers) {
+        fprintf(stderr, "[CAM%d][META][ERR] calloc: %s\n", ctx->cam_id, strerror(errno));
+        return -1;
+    }
+    ctx->meta_buffer_count = req.count;
+
+    for (int i = 0; i < ctx->meta_buffer_count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_META_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if (ioctl(ctx->meta_fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_QUERYBUF: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
+
+        ctx->meta_buffers[i].length = buf.length;
+        ctx->meta_buffers[i].start = mmap(NULL, buf.length,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, ctx->meta_fd, buf.m.offset);
+        if (ctx->meta_buffers[i].start == MAP_FAILED) {
+            fprintf(stderr, "[CAM%d][META][ERR] mmap: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
+
+        if (ioctl(ctx->meta_fd, VIDIOC_QBUF, &buf) < 0) {
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int start_metadata_capture(int fd) {
+    int type = V4L2_BUF_TYPE_META_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        fprintf(stderr, "[META][ERR] VIDIOC_STREAMON: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int stop_metadata_capture(int fd) {
+    int type = V4L2_BUF_TYPE_META_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
+        fprintf(stderr, "[META][ERR] VIDIOC_STREAMOFF: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static uint64_t read_latest_metadata_timestamp(struct cam_ctx *ctx) {
+    if (ctx->meta_fd < 0 || !ctx->meta_buffers) return 0;
+
+    uint64_t latest_ts = 0;
+    while (1) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_META_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(ctx->meta_fd, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN) break;
+            if (errno == ENODEV) {
+                fprintf(stderr, "[CAM%d][META][WARN] metadata device removed\n", ctx->cam_id);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+                break;
+            }
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_DQBUF: %s\n", ctx->cam_id, strerror(errno));
+            break;
+        }
+
+        uint64_t ts = parse_uvc_metadata_timestamp(
+            (uint8_t*)ctx->meta_buffers[buf.index].start,
+            buf.bytesused);
+        if (ts != 0) latest_ts = ts;
+
+        if (ioctl(ctx->meta_fd, VIDIOC_QBUF, &buf) < 0) {
+            fprintf(stderr, "[CAM%d][META][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+            close(ctx->meta_fd);
+            ctx->meta_fd = -1;
+            free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+            break;
+        }
+    }
+
+    return latest_ts;
+}
+
 static void safe_cleanup_camera(struct cam_ctx *ctx) {
     if (!ctx) return;
     pthread_mutex_lock(&ctx->fd_lock);
@@ -849,6 +1051,13 @@ static void safe_cleanup_camera(struct cam_ctx *ctx) {
     close(ctx->fd);
     ctx->fd = -1;
     ctx->last_timestamp = 0;
+
+    if (ctx->meta_fd >= 0) {
+        close(ctx->meta_fd);
+        ctx->meta_fd = -1;
+    }
+    free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+
     pthread_mutex_unlock(&ctx->fd_lock);
 }
 
@@ -1125,6 +1334,7 @@ static void *capture_thread(void *arg) {
     unsigned long frame_count = 0;
     int reconnect_fails = 0;
 
+
     printf("[CAM%d] capture thread started, dev=%s meta=%s\n",
            ctx->cam_id, g_ctx.video_devs[ctx->cam_id], g_ctx.metadata_devs[ctx->cam_id]);
 
@@ -1167,7 +1377,7 @@ static void *capture_thread(void *arg) {
                 usleep(500000);
                 continue;
             }
-            
+
             printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
             ctx->fd = open(dev_path, O_RDWR);
             if (ctx->fd < 0) {
@@ -1180,7 +1390,10 @@ static void *capture_thread(void *arg) {
                 pthread_mutex_unlock(&ctx->fd_lock);
                 reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "open failed",
                                          &g_ctx.cam_running[ctx->cam_id]);
-                usleep(1000000);
+                stop_metadata_capture(ctx->meta_fd);
+                close(ctx->meta_fd);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 continue;
             }
             if (init_capture(ctx) < 0) {
@@ -1188,17 +1401,15 @@ static void *capture_thread(void *arg) {
                 ctx->fd = -1;
                 stop_metadata_capture(ctx->meta_fd);
                 close(ctx->meta_fd);
-                ctx->meta_fd = -1;
-                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 pthread_mutex_unlock(&ctx->fd_lock);
                 reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "init_capture failed",
                                          &g_ctx.cam_running[ctx->cam_id]);
-                usleep(1000000);
+                ctx->meta_fd = -1;
+                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 continue;
             }
             
             if (start_capture(ctx->fd) < 0) {
-                fprintf(stderr, "[CAM%d][ERR] failed to start stream\n", ctx->cam_id);
                 stop_metadata_capture(ctx->meta_fd);
                 close(ctx->meta_fd);
                 ctx->meta_fd = -1;
@@ -1285,6 +1496,7 @@ static void *capture_thread(void *arg) {
         }
 
         uint64_t timestamp = read_latest_metadata_timestamp(ctx);
+        uint64_t right_timestamp = 0;
         if (ctx->meta_fd < 0) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
@@ -1292,7 +1504,6 @@ static void *capture_thread(void *arg) {
             close(ctx->fd);
             ctx->fd = -1;
             free_buffer_array(&ctx->buffers, &ctx->buffer_count);
-            safe_cleanup_camera(ctx);
             continue;
         }
 
@@ -1344,18 +1555,10 @@ static void *capture_thread(void *arg) {
         }
     }
 
-    if (ctx->fd >= 0) {
-        stop_capture(ctx->fd);
-        close(ctx->fd);
-        ctx->fd = -1;
-    }
-    if (ctx->meta_fd >= 0) {
-        stop_metadata_capture(ctx->meta_fd);
-        close(ctx->meta_fd);
-        ctx->meta_fd = -1;
-    }
-    free_buffer_array(&ctx->buffers, &ctx->buffer_count);
-    free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+    // Same cleanup as the mid-loop error paths, just done once on exit;
+    // routing through safe_cleanup_camera() keeps it lock-protected and
+    // avoids duplicating the close/munmap/REQBUFS(0) sequence here.
+    safe_cleanup_camera(ctx);
 
     printf("[CAM%d] capture thread exited\n", ctx->cam_id);
     return NULL;
@@ -1526,6 +1729,10 @@ int insight9_receive_init_default(void) {
         clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
     }
 
+    g_ctx.config.rgb_config.fps = 30;
+    g_ctx.config.gray_config.fps = 30;
+    g_ctx.config.depth_config.fps = 30;
+
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count < 6) {
@@ -1644,38 +1851,40 @@ int insight9_receive_start_camera(int cam_id) {
                 pthread_mutex_unlock(&ctx->fd_lock);
                 return -1;
             }
-
-            if (cam_id == 0) {
-                ctx->width = g_ctx.config.depth_config.width;
-                ctx->height = g_ctx.config.depth_config.height;
-                ctx->format = g_ctx.config.depth_config.pixel_format;
-            } else if (cam_id == 1) {
-                ctx->width = g_ctx.config.gray_config.width;
-                ctx->height = g_ctx.config.gray_config.height;
-                ctx->format = g_ctx.config.gray_config.pixel_format;
-            } else {
-                ctx->width = g_ctx.config.rgb_config.width;
-                ctx->height = g_ctx.config.rgb_config.height;
-                ctx->format = g_ctx.config.rgb_config.pixel_format;
-            }
-
-            if (init_capture(ctx) < 0) {
-                close(ctx->fd);
-                ctx->fd = -1;
-                pthread_mutex_unlock(&ctx->fd_lock);
-                return -1;
-            }
-
-            if (start_capture(ctx->fd) < 0) {
-                close(ctx->fd);
-                ctx->fd = -1;
-                pthread_mutex_unlock(&ctx->fd_lock);
-                return -1;
-            }
-
-            ctx->last_timestamp = 0;
-            pthread_mutex_unlock(&ctx->fd_lock);
         }
+
+        if (cam_id == 0) {
+            ctx->width = g_ctx.config.depth_config.width;
+            ctx->height = g_ctx.config.depth_config.height;
+            ctx->format = g_ctx.config.depth_config.pixel_format;
+        } else if (cam_id == 1) {
+            ctx->width = g_ctx.config.gray_config.width;
+            ctx->height = g_ctx.config.gray_config.height;
+            ctx->format = g_ctx.config.gray_config.pixel_format;
+        } else {
+            ctx->width = g_ctx.config.rgb_config.width;
+            ctx->height = g_ctx.config.rgb_config.height;
+            ctx->format = g_ctx.config.rgb_config.pixel_format;
+        }
+
+        if (init_capture(ctx) < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            pthread_mutex_unlock(&ctx->fd_lock);
+            return -1;
+        }
+
+        if (start_capture(ctx->fd) < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            pthread_mutex_unlock(&ctx->fd_lock);
+            return -1;
+        }
+
+        ctx->last_timestamp = 0;
+        pthread_mutex_unlock(&ctx->fd_lock);
+
+        ctx->last_timestamp = 0;
     }
 
     g_ctx.cam_running[cam_id] = true;
@@ -1749,11 +1958,12 @@ int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp) {
     return *timestamp != 0 ? 0 : -1;
 }
 
-void insight9_receive_stop_camera(int cam_id) {
+void insight9_receive_all_stop_camera(int cam_id) {
     if (cam_id < 0 || cam_id >= CAM_NUM) return;
     
     g_ctx.cam_running[cam_id] = false;
-    
+
+    usleep(200000);  // 200ms
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
     if (ctx->fd >= 0) {
         stop_capture(ctx->fd);
@@ -1783,7 +1993,7 @@ int insight9_receive_restart_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
     
-    insight9_receive_stop_camera(cam_id);
+    insight9_receive_all_stop_camera(cam_id);
     usleep(100000);
     return insight9_receive_start_camera(cam_id);
 }
@@ -1795,9 +2005,11 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
 
     printf("[SDK] Switching camera %d to %d fps...\n", cam_id, fps);
 
-    insight9_receive_stop_camera(cam_id);
+    // 1. 停止相机（使用安全清理）
+    insight9_receive_all_stop_camera(cam_id);
     
-    usleep(200000);  // 200ms
+    // 2. 等待设备完全释放
+    usleep(1000000);  // 200ms
     
     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
         fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
@@ -1819,7 +2031,7 @@ int insight9_receive_is_camera_running(int cam_id) {
     return g_ctx.cam_running[cam_id] ? 1 : 0;
 }
 
-void insight9_receive_stop(void) {
+void insight9_receive_all_stop(void) {
     if (!g_ctx.running) return;
     g_ctx.running = false;
 
@@ -1861,7 +2073,7 @@ void insight9_receive_cleanup(void) {
     printf("[SDK] Cleaning up...\n");
 
     if (g_ctx.running) {
-        insight9_receive_stop();
+        insight9_receive_all_stop();
     }
 
     for (int i = 0; i < CAM_NUM; i++) {

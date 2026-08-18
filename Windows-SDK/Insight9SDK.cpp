@@ -46,6 +46,20 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "propsys.lib")
 
+// ==================== Logging Macros ====================
+// Always print errors and warnings
+#define SDK_LOG_ERROR(fmt, ...)   fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+#define SDK_LOG_WARN(fmt, ...)    fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__)
+
+// Info and debug are controlled by DEBUG macro
+#ifdef DEBUG
+    #define SDK_LOG_INFO(fmt, ...)  printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+    #define SDK_LOG_DEBUG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+    #define SDK_LOG_INFO(fmt, ...)  ((void)0)
+    #define SDK_LOG_DEBUG(fmt, ...) ((void)0)
+#endif
+
 // ==================== Define The Missing Media Foundation GUID ====================
 extern "C" {
 // Y800 - 8-bit grayscale
@@ -282,7 +296,7 @@ static bool joinWithTimeout(std::thread& t, DWORD timeoutMs, const char* label) 
         t.join();
         return true;
     }
-    fprintf(stderr,
+    SDK_LOG_INFO(
             "[SDK][WARN] Thread '%s' did not exit within %lu ms "
             "(likely stuck in ReadSample/blocking I/O). Detaching instead of waiting forever.\n",
             label, timeoutMs);
@@ -295,7 +309,7 @@ public:
     MFVideoSource() {
         HRESULT hr = MFStartup(MF_VERSION);
         if (FAILED(hr)) {
-            printf("[MFVideoSource] MFStartup failed: 0x%08lx\n", hr);
+            SDK_LOG_ERROR("[MFVideoSource] MFStartup failed: 0x%08lx\n", hr);
         }
     }
     
@@ -326,7 +340,7 @@ public:
         if (deviceIndex_ == 0)
         {
             if (!configureStream(0, fmt, width, height, fps)) {
-                printf("RGB stream configure failed.\n");
+                SDK_LOG_ERROR("RGB stream configure failed.\n");
                 return false;
             }
         }
@@ -336,7 +350,7 @@ public:
         else
         {
             if (!configureStream(0, fmt, width, height, fps)) {
-                printf("Depth stream configure failed.\n");
+                SDK_LOG_ERROR("Depth stream configure failed.\n");
                 return false;
             }
 
@@ -344,7 +358,7 @@ public:
             if (!configureStream(1, grayFmt, width, height, fps)) {
                 grayFmt = PixelFormat::GREY;
                 if (!configureStream(1, grayFmt, width, height, fps)) {
-                    printf("IR stream configure failed.\n");
+                    SDK_LOG_ERROR("IR stream configure failed.\n");
                     return false;
                 }
             }
@@ -376,12 +390,12 @@ public:
             return false;
 
         if (!configureStream(0, fmt0, width, height, fps0)) {
-            printf("Stream 0 configure failed.\n");
+            SDK_LOG_ERROR("Stream 0 configure failed.\n");
             return false;
         }
 
         if (!configureStream(1, fmt1, width, height, fps1)) {
-            printf("Stream 1 configure failed.\n");
+            SDK_LOG_ERROR("Stream 1 configure failed.\n");
             return false;
         }
 
@@ -437,11 +451,11 @@ public:
         HRESULT hr = sourceReader_->ReadSample(requestedStream, 0, &actualStream, &flags, &ts, &sample);
         if (FAILED(hr)) {
             if (hr == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED) {
-                printf("[MFVideoSource] Device disconnected (stream=%lu)\n", requestedStream);
+                SDK_LOG_ERROR("[MFVideoSource] Device disconnected (stream=%lu)\n", requestedStream);
                 running_ = false;
                 return false;
             }
-            // printf("[MFVideoSource] ReadSample(stream=%lu) FAILED hr=0x%08lx flags=0x%08lx actual=%lu\n",
+            // SDK_LOG_DEBUG("[MFVideoSource] ReadSample(stream=%lu) FAILED hr=0x%08lx flags=0x%08lx actual=%lu\n",
             //     requestedStream, hr, flags, actualStream);
             if (sample) sample->Release();
             return false;
@@ -454,23 +468,23 @@ public:
         }
 
         if (flags & MF_SOURCE_READERF_ERROR) {
-            // printf("[MFVideoSource] Stream %lu ERROR flags=0x%08lx\n", streamIndex, flags);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu ERROR flags=0x%08lx\n", requestedStream, flags);
             if (sample) sample->Release();
             return false;
         }
 
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-            // printf("[MFVideoSource] Stream %lu END_OF_STREAM\n", streamIndex);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu END_OF_STREAM\n", requestedStream);
             if (sample) sample->Release();
             return false;
         }
 
         if (flags & MF_SOURCE_READERF_STREAMTICK) {
-            // printf("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n", streamIndex, ts, sample);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n", requestedStream, ts, sample);
         }
 
         if (!sample) {
-            // printf("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n", streamIndex, flags);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n", requestedStream, flags);
             return false;
         }
         
@@ -510,15 +524,15 @@ public:
         }
 
 #if defined(INSIGHT9_MD_DEBUG)
-printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
-       streamIndex, (int)mdValid, mdFrameCounter, (unsigned long long)mdTimeUs64);
+SDK_LOG_INFO("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
+       requestedStream, (int)mdValid, mdFrameCounter, (unsigned long long)mdTimeUs64);
 #endif
 
         IMFMediaBuffer* buffer = nullptr;
         hr = sample->ConvertToContiguousBuffer(&buffer);
         if (FAILED(hr) || !buffer) {
-            printf("[MFVideoSource] Stream %lu ConvertToContiguousBuffer failed hr=0x%08lx\n",
-                actualStream, hr);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu ConvertToContiguousBuffer failed hr=0x%08lx\n",
+                requestedStream, hr);
             sample->Release();
             return false;
         }
@@ -531,8 +545,8 @@ printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
         hr = buffer->Lock(&ptr, &maxLen, &curLen);
 
         if (FAILED(hr) || !ptr || curLen == 0) {
-            printf("[MFVideoSource] Stream %lu Buffer Lock failed hr=0x%08lx curLen=%lu\n",
-                actualStream, hr, curLen);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu Buffer Lock failed hr=0x%08lx curLen=%lu\n",
+                requestedStream, hr, curLen);
 
             buffer->Release();
             sample->Release();
@@ -578,7 +592,7 @@ printf("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
         }
 
         if (lastTimestamp_[actualStream] != 0 && lastTimestamp_[actualStream] == info.timestamp) {
-            printf("[MFVideoSource] Stream %lu duplicate timestamp=%llu\n", actualStream, info.timestamp);
+            SDK_LOG_ERROR("[MFVideoSource] Stream %lu duplicate timestamp=%llu\n", requestedStream, info.timestamp);
             delete[] data;
             data = nullptr;
             size = 0;
@@ -787,7 +801,7 @@ private:
             char fourcc[5] = {0};
 
             memcpy(fourcc, &subtype.Data1, 4);
-            // printf("[Stream%u] [%02u] %ux%u %u/%u %s\n", streamIndex, index, w, h, num, den, fourcc);
+            SDK_LOG_DEBUG("[Stream%u] [%02u] %ux%u %u/%u %s\n", streamIndex, index, w, h, num, den, fourcc);
 
             double rate = den ? (double)num / den : 0.0;
             if (IsEqualGUID(subtype, targetSubtype) && w == (UINT32)width && h == (UINT32)height && fabs(rate - fps) < 0.1) {
@@ -800,7 +814,7 @@ private:
         }
 
         if(bestType==nullptr) {
-            printf("Cannot find media type for stream %u\n", streamIndex);
+            SDK_LOG_ERROR("Cannot find media type for stream %u\n", streamIndex);
             return false;
         }
 
@@ -809,7 +823,7 @@ private:
         bestType->Release();
 
         if(FAILED(hr)) {
-            printf("SetCurrentMediaType stream %u failed 0x%08lx\n", streamIndex, hr);
+            SDK_LOG_ERROR("SetCurrentMediaType stream %u failed 0x%08lx\n", streamIndex, hr);
             return false;
         }
 
@@ -902,7 +916,7 @@ private:
         IMFPresentationDescriptor* pd = nullptr;
         HRESULT hr = mediaSource_->CreatePresentationDescriptor(&pd);
         if (FAILED(hr) || !pd) {
-            printf("[Probe] CreatePresentationDescriptor failed: 0x%08lx\n", hr);
+            SDK_LOG_ERROR("[Probe] CreatePresentationDescriptor failed: 0x%08lx\n", hr);
             return false;
         }
 
@@ -917,7 +931,7 @@ private:
             if (SUCCEEDED(pd->GetStreamDescriptorByIndex(i, &selected, &sd)) && sd) {
                 DWORD streamId = 0;
                 sd->GetStreamIdentifier(&streamId);
-                // printf("[Probe] stream[%lu] id=%lu selected=%d\n", i, streamId, selected);
+                SDK_LOG_DEBUG("[Probe] stream[%lu] id=%lu selected=%d\n", i, streamId, selected);
 
                 IMFMediaTypeHandler* handler = nullptr;
                 if (SUCCEEDED(sd->GetMediaTypeHandler(&handler)) && handler) {
@@ -940,7 +954,7 @@ private:
                             MFGetAttributeRatio(mt, MF_MT_FRAME_RATE, &num, &den);
                             char fourcc[5] = {0};
                             memcpy(fourcc, &subtype.Data1, 4);
-                            // printf("    [type %lu] %ux%u %u/%u subtype=%s\n", t, w, h, num, den, fourcc);
+                            SDK_LOG_DEBUG("    [type %lu] %ux%u %u/%u subtype=%s\n", t, w, h, num, den, fourcc);
                             mt->Release();
                         }
                     }
@@ -956,7 +970,7 @@ private:
     bool createMediaSource(const std::string& devicePath) {
         std::string symbolicLink = getSymbolicLink(devicePath);
         if (symbolicLink.empty()) {
-            printf("[MFVideoSource] Failed to get symbolic link\n");
+            SDK_LOG_ERROR("[MFVideoSource] Failed to get symbolic link\n");
             return false;
         }
         
@@ -965,7 +979,7 @@ private:
         IMFAttributes* pAttributes = nullptr;
         HRESULT hr = MFCreateAttributes(&pAttributes, 2);
         if (FAILED(hr)) {
-            printf("[MFVideoSource] MFCreateAttributes failed: 0x%08lx\n", hr);
+            SDK_LOG_ERROR("[MFVideoSource] MFCreateAttributes failed: 0x%08lx\n", hr);
             return false;
         }
         
@@ -979,7 +993,7 @@ private:
         pAttributes->Release();
         
         if (FAILED(hr)) {
-            printf("[MFVideoSource] MFCreateDeviceSource failed: 0x%08lx\n", hr);
+            SDK_LOG_ERROR("[MFVideoSource] MFCreateDeviceSource failed: 0x%08lx\n", hr);
             return false;
         }
         
@@ -1004,7 +1018,7 @@ private:
         if(attr) attr->Release();
 
         if(FAILED(hr)) {
-            printf("[MFVideoSource] MFCreateSourceReaderFromMediaSource failed: 0x%08lX\n", hr);
+            SDK_LOG_ERROR("[MFVideoSource] MFCreateSourceReaderFromMediaSource failed: 0x%08lX\n", hr);
             return false;
         }
         //------------------------------------------
@@ -1060,7 +1074,7 @@ private:
         IMFMediaType* pType = nullptr;
         HRESULT hr = sourceReader_->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &pType);
         if (FAILED(hr) || !pType) {
-            printf("[MFVideoSource] GetCurrentMediaType failed: 0x%08lx\n", hr);
+            SDK_LOG_ERROR("[MFVideoSource] GetCurrentMediaType failed: 0x%08lx\n", hr);
             return false;
         }
         
@@ -1069,7 +1083,7 @@ private:
         pType->Release();
         
         if (majorType != MFMediaType_Video) {
-            printf("[MFVideoSource] Not a video stream\n");
+            SDK_LOG_INFO("[MFVideoSource] Not a video stream\n");
             return false;
         }
         
@@ -1218,7 +1232,7 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
                             pMoniker->Release();
                             pEnum->Release();
                             pDevEnum->Release();
-                            printf("[SDK] Matched device: %s -> FriendlyName: %s\n", 
+                            SDK_LOG_INFO("[SDK] Matched device: %s -> FriendlyName: %s\n", 
                                    devicePath.c_str(), name.c_str());
                             return name;
                         }
@@ -1331,7 +1345,7 @@ static bool reopenXUControlLocked(const char* reason) {
     }
 
     if (path.empty()) {
-        fprintf(stderr, "[XU][ERR] Cannot reopen XU: RGB UVC path unavailable (%s)\n",
+        SDK_LOG_ERROR("[XU][ERR] Cannot reopen XU: RGB UVC path unavailable (%s)\n",
                 reason ? reason : "unknown");
         return false;
     }
@@ -1343,16 +1357,16 @@ static bool reopenXUControlLocked(const char* reason) {
 
     auto* xu = new (std::nothrow) viewer::ExtensionUnitControl();
     if (!xu) {
-        fprintf(stderr, "[XU][ERR] Allocation failed while reopening XU (%s)\n",
+        SDK_LOG_ERROR("[XU][ERR] Allocation failed while reopening XU (%s)\n",
                 reason ? reason : "unknown");
         return false;
     }
 
-    printf("[XU] Reopening XU on RGB UVC: %s (%s)\n",
+    SDK_LOG_INFO("[XU] Reopening XU on RGB UVC: %s (%s)\n",
            path.c_str(), reason ? reason : "unknown");
 
     if (!xu->open(path)) {
-        fprintf(stderr, "[XU][WARN] Reopen failed on path: %s\n", path.c_str());
+        SDK_LOG_ERROR("[XU][WARN] Reopen failed on path: %s\n", path.c_str());
         delete xu;
         return false;
     }
@@ -1374,9 +1388,7 @@ static bool callXUWithRetry(const char* op,
         return true;
     }
 
-    fprintf(stderr,
-            "[XU][WARN] Operation '%s' failed; reopening XU and retrying once\n",
-            op ? op : "unknown");
+    SDK_LOG_ERROR("[XU][WARN] Operation '%s' failed; reopening XU and retrying once\n", op ? op : "unknown");
 
     if (!reopenXUControlLocked(op)) {
         return false;
@@ -1408,10 +1420,10 @@ static void reconnect_backoff_apply(const char* tag, int id, int* fails, const c
     (*fails)++;
     int delay = reconnect_backoff_ms(*fails);
     if (RECONNECT_MAX_ATTEMPTS <= 0 || *fails <= RECONNECT_MAX_ATTEMPTS) {
-        fprintf(stderr, "[%s%d][ERR] %s, retry in %dms (attempt %d)\n", tag, id, reason, delay, *fails);
+        SDK_LOG_ERROR("[%s%d][ERR] %s, retry in %dms (attempt %d)\n", tag, id, reason, delay, *fails);
     } else if (*fails == RECONNECT_MAX_ATTEMPTS + 1) {
-        fprintf(stderr, "[%s%d][ERR] %s failed %d times, slowing to %ds retry\n",
-                tag, id, reason, RECONNECT_MAX_ATTEMPTS, RECONNECT_BACKOFF_MAX_MS / 1000);
+        SDK_LOG_ERROR("[%s%d][ERR] %s failed %d times, slowing to %ds retry\n",
+                      tag, id, reason, RECONNECT_MAX_ATTEMPTS, RECONNECT_BACKOFF_MAX_MS / 1000);
     }
     interruptible_sleep_ms(delay, extraStop);
 }
@@ -1473,7 +1485,7 @@ static bool probeDeviceCapabilities(const std::string& devicePath, int deviceInd
     }
     
     if (!opened) {
-        printf("[Probe] Failed to open device\n");
+        SDK_LOG_ERROR("[Probe] Failed to open device\n");
         delete probeSource;
         return false;
     }
@@ -1521,7 +1533,7 @@ static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid) {
     std::map<int, std::string> interfaceMap;
     for (cur = devs; cur; cur = cur->next) {
         if (cur->interface_number >= 0) {
-            // printf("[HID] Interface %d: %s\n", cur->interface_number, cur->path);
+            SDK_LOG_DEBUG("[HID] Interface %d: %s\n", cur->interface_number, cur->path);
             interfaceMap[cur->interface_number] = cur->path;
         }
     }
@@ -1608,7 +1620,7 @@ public:
     HRESULT STDMETHODCALLTYPE OnEvent(ISensor*, REFGUID, IPortableDeviceValues*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnLeave(REFSENSOR_ID sensorID) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnStateChanged(ISensor* pSensor, SensorState state) override {
-        printf("[IMU] sensor state changed: %d (isAccel=%d)\n", (int)state, isAccel_);
+        SDK_LOG_INFO("[IMU] sensor state changed: %d (isAccel=%d)\n", (int)state, isAccel_);
         return S_OK;
     }
 
@@ -1717,7 +1729,7 @@ static void imuSensorThreadFunc() {
     // disappear or GetState() fails.
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hrCo) && hrCo != S_FALSE) {
-        fprintf(stderr, "[IMU] CoInitializeEx(STA) failed hr=0x%08lx\n", hrCo);
+        SDK_LOG_ERROR("[IMU] CoInitializeEx(STA) failed hr=0x%08lx\n", hrCo);
         return;
     }
 
@@ -1759,7 +1771,7 @@ static void imuSensorThreadFunc() {
         HRESULT hr = CoCreateInstance(CLSID_SensorManager, nullptr, CLSCTX_INPROC_SERVER,
                                        IID_PPV_ARGS(&pManager));
         if (FAILED(hr) || !pManager) {
-            fprintf(stderr, "[IMU][WARN] SensorManager unavailable hr=0x%08lx, retrying\n", hr);
+            SDK_LOG_ERROR("[IMU][WARN] SensorManager unavailable hr=0x%08lx, retrying\n", hr);
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
@@ -1814,13 +1826,13 @@ static void imuSensorThreadFunc() {
                                      &pGyro, &pGyroEvents);
 
         if (!hasAccel && !hasGyro) {
-            fprintf(stderr, "[IMU][WARN] No accelerometer/gyrometer currently available, retrying...\n");
+            SDK_LOG_ERROR("[IMU][WARN] No accelerometer/gyrometer currently available, retrying...\n");
             cleanupBinding(pAccel, pGyro, pAccelEvents, pGyroEvents, pManager);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5000));
             continue;
         }
 
-        printf("[IMU] Sensor API bound/rebound: accel=%d gyro=%d\n", hasAccel, hasGyro);
+        SDK_LOG_DEBUG("[IMU] Sensor API bound/rebound: accel=%d gyro=%d\n", hasAccel, hasGyro);
 
         bool lost = false;
         ULONGLONG lastHealthCheck = GetTickCount64();
@@ -1844,12 +1856,12 @@ static void imuSensorThreadFunc() {
                 SensorState state = SENSOR_STATE_NOT_AVAILABLE;
                 HRESULT h = sensor->GetState(&state);
                 if (FAILED(h)) {
-                    fprintf(stderr, "[IMU][WARN] %s GetState failed hr=0x%08lx\n", name, h);
+                    SDK_LOG_ERROR("[IMU][WARN] %s GetState failed hr=0x%08lx\n", name, h);
                     return false;
                 }
                 if (state == SENSOR_STATE_NOT_AVAILABLE ||
                     state == SENSOR_STATE_NO_DATA) {
-                    fprintf(stderr, "[IMU][WARN] %s state=%d, rebinding\n",
+                    SDK_LOG_ERROR("[IMU][WARN] %s state=%d, rebinding\n",
                             name, static_cast<int>(state));
                     return false;
                 }
@@ -1869,13 +1881,13 @@ static void imuSensorThreadFunc() {
 
         if (!g_ctx.running) break;
         if (lost) {
-            fprintf(stderr, "[IMU][WARN] Sensor binding lost; rebuilding SensorManager/ISensor objects\n");
+            SDK_LOG_ERROR("[IMU][WARN] Sensor binding lost; rebuilding SensorManager/ISensor objects\n");
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
     }
 
     CoUninitialize();
-    printf("[IMU] sensor thread exited\n");
+    SDK_LOG_INFO("[IMU] sensor thread exited\n");
 }
 
 static int streamToLogicalCamId(int uvcId, DWORD streamIndex) {
@@ -1896,7 +1908,7 @@ static void deliverFrame(int uvcId, uint8_t* data, size_t size, const FrameInfo&
     
     int callbackCamId = streamToLogicalCamId(uvcId, info.streamIndex);
     if (callbackCamId < 0 || callbackCamId >= LOGICAL_CAM_NUM) {
-        printf("[SDK] Invalid frame mapping: uvc=%d stream=%lu\n", uvcId, info.streamIndex);
+        SDK_LOG_ERROR("[SDK] Invalid frame mapping: uvc=%d stream=%lu\n", uvcId, info.streamIndex);
         return;
     }
 
@@ -1933,14 +1945,14 @@ static void videoThreadFunc(int uvcId) {
                 continue;
             }
             reconnect_fails = 0;
-            printf("[SDK] Video device %d (re)connected\n", uvcId);
+            SDK_LOG_INFO("[SDK] Video device %d (re)connected\n", uvcId);
 
             // The KS/XU handle belongs to the old USB device instance.
             // Rebind it after RGB UVC is recreated.
             if (uvcId == RGB_UVC_ID) {
                 std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
                 if (!reopenXUControlLocked("RGB video reconnect")) {
-                    fprintf(stderr, "[XU][WARN] RGB video recovered but XU is not available yet\n");
+                    SDK_LOG_INFO("[XU][WARN] RGB video recovered but XU is not available yet\n");
                 }
             }
         }
@@ -1987,7 +1999,7 @@ static void videoThreadFunc(int uvcId) {
     }
 
     CoUninitialize();
-    printf("[SDK] Video thread exited: UVC=%d\n", uvcId);
+    SDK_LOG_INFO("[SDK] Video thread exited: UVC=%d\n", uvcId);
 }
 
 static bool hidPathStillPresent(const std::string& path) {
@@ -2008,8 +2020,8 @@ static bool reopenHidDeviceForThread(int idx, int& failCount) {
     if (paths.empty()) {
         ++failCount;
         int delay = reconnect_backoff_ms(failCount);
-        fprintf(stderr, "[HID%d][ERR] No HID device found, retry in %dms (attempt %d)\n",
-                idx, delay, failCount);
+        SDK_LOG_ERROR("[HID%d][ERR] No HID device found, retry in %dms (attempt %d)",
+                      idx, delay, failCount);
         interruptible_sleep_ms(delay);
         return false;
     }
@@ -2039,15 +2051,15 @@ static bool reopenHidDeviceForThread(int idx, int& failCount) {
     if (!g_ctx.hidDevs[idx]->open(path)) {
         ++failCount;
         int delay = reconnect_backoff_ms(failCount);
-        fprintf(stderr, "[HID%d][ERR] Failed to open %s, retry in %dms (attempt %d)\n",
-                idx, path.c_str(), delay, failCount);
+        SDK_LOG_ERROR("[HID%d][ERR] Failed to open %s, retry in %dms (attempt %d)",
+                      idx, path.c_str(), delay, failCount);
         interruptible_sleep_ms(delay);
         return false;
     }
 
     g_ctx.hidPaths[idx] = path;
     failCount = 0;
-    printf("[HID%d] Reconnected: %s\n", idx, path.c_str());
+    SDK_LOG_INFO("[HID%d] Reconnected: %s", idx, path.c_str());
     return true;
 }
 
@@ -2079,7 +2091,7 @@ static void hidThreadFunc(int idx) {
         if (now - lastEnumCheck >= HID_ENUM_CHECK_MS) {
             lastEnumCheck = now;
             if (!hidPathStillPresent(g_ctx.hidPaths[idx])) {
-                fprintf(stderr, "[HID%d][WARN] HID path disappeared from enumeration, reopening...\n", idx);
+                SDK_LOG_WARN("[HID%d][WARN] HID path disappeared from enumeration, reopening...", idx);
                 g_ctx.hidDevs[idx]->close();
                 g_ctx.hidPaths[idx].clear();
                 last_vio_ts = 0;
@@ -2093,7 +2105,7 @@ static void hidThreadFunc(int idx) {
         HidDevice* dev = g_ctx.hidDevs[idx];
         if (!dev || !dev->read(buf, len, &disconnected)) {
             if (disconnected) {
-                fprintf(stderr, "[HID%d][WARN] hid_read reports device error, reopening...\n", idx);
+                SDK_LOG_WARN("[HID%d][WARN] hid_read reports device error, reopening...", idx);
                 if (dev) dev->close();
                 g_ctx.hidPaths[idx].clear();
                 last_vio_ts = 0;
@@ -2102,10 +2114,9 @@ static void hidThreadFunc(int idx) {
 
             if (lastDataTick == 0) lastDataTick = now;
             if (now - lastDataTick > HID_NO_DATA_TIMEOUT_MS) {
-                fprintf(stderr,
-                        "[HID%d][WARN] HID has produced no data for %llums, reopening...\n",
-                        idx,
-                        static_cast<unsigned long long>(now - lastDataTick));
+                SDK_LOG_WARN("[HID%d][WARN] HID has produced no data for %llums, reopening...",
+                             idx,
+                             static_cast<unsigned long long>(now - lastDataTick));
                 if (dev) dev->close();
                 g_ctx.hidPaths[idx].clear();
                 last_vio_ts = 0;
@@ -2132,19 +2143,19 @@ static void hidThreadFunc(int idx) {
 // ==================== SDK API ====================
 int insight9_receive_init(const insight9_config_t* config) {
     if (g_ctx.initialized) {
-        fprintf(stderr, "[SDK] Already initialized\n");
+        SDK_LOG_ERROR("[SDK] Already initialized");
         return -1;
     }
 
     if (!config) {
-        fprintf(stderr, "[SDK] Config is NULL, using default\n");
+        SDK_LOG_ERROR("[SDK] Config is NULL, using default");
         return insight9_receive_init_default();
     }
 
     if (config->rgb_config.width <= 0 || config->rgb_config.height <= 0 ||
         config->gray_config.width <= 0 || config->gray_config.height <= 0 ||
         config->depth_config.width <= 0 || config->depth_config.height <= 0) {
-        fprintf(stderr, "[SDK] Invalid resolution in config\n");
+        SDK_LOG_ERROR("[SDK] Invalid resolution in config");
         return -1;
     }
 
@@ -2189,13 +2200,13 @@ int insight9_receive_init(const insight9_config_t* config) {
 
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
     if (uvcPaths.size() < 2) {
-        fprintf(stderr, "[SDK] Need at least 2 UVC devices, found %zu\n", uvcPaths.size());
+        SDK_LOG_ERROR("[SDK] Need at least 2 UVC devices, found %zu", uvcPaths.size());
         return -1;
     }
     
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE) {
-        fprintf(stderr, "[SDK] CoInitializeEx failed, hr=0x%08lx\n", hr);
+        SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
         CoUninitialize();
         return -1;
     }
@@ -2212,7 +2223,7 @@ int insight9_receive_init(const insight9_config_t* config) {
             int depthW = config->depth_config.width, depthH = config->depth_config.height;
             int grayW  = config->gray_config.width,  grayH  = config->gray_config.height;
             if (depthW != grayW || depthH != grayH) {
-                printf("[SDK] Warning: composite streams size mismatch, using Gray size for both.\n");
+                SDK_LOG_WARN("[SDK] Warning: composite streams size mismatch, using Gray size for both.");
                 depthW = grayW; depthH = grayH;
             }
             opened = g_ctx.videos[i]->openWithTwoStreams(uvcPaths[i], i,
@@ -2220,46 +2231,46 @@ int insight9_receive_init(const insight9_config_t* config) {
                         config->gray_config.pixel_format, config->gray_config.fps);
         }
         if (!opened) {
-            fprintf(stderr, "[SDK] Failed to open video device %d: %s\n", i, uvcPaths[i].c_str());
+            SDK_LOG_ERROR("[SDK] Failed to open video device %d: %s", i, uvcPaths[i].c_str());
             return -1;
         }
     }
     
     auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
     if (hidPaths.size() < 1) {
-        fprintf(stderr, "[SDK] VIO device not found (found %zu HID devices)\n", hidPaths.size());
+        SDK_LOG_ERROR("[SDK] VIO device not found (found %zu HID devices)", hidPaths.size());
         return -1;
     }
     g_ctx.hidPaths[0] = hidPaths[0];
     // g_ctx.hidPaths[1] = hidPaths[1];
-    // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
-    printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
+    // SDK_LOG_INFO("[HID] IMU device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
+    SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+        SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
         return -1;
     }
     // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
-    //     fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+    //     SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
     //     return -1;
     // }
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
         if (!reopenXUControlLocked("initialization")) {
-            fprintf(stderr, "[SDK][WARN] XU control unavailable during initialization; video can still run\n");
+            SDK_LOG_WARN("[SDK][WARN] XU control unavailable during initialization; video can still run");
         }
     }
 
     g_ctx.initialized = true;
-    printf("[SDK] Initialized successfully with config:\n");
-    printf("  RGB: %dx%d@%d, fourcc=0x%08x\n", 
+    SDK_LOG_INFO("[SDK] Initialized successfully with config:");
+    SDK_LOG_INFO("  RGB: %dx%d@%d, fourcc=0x%08x", 
            config->rgb_config.width, config->rgb_config.height,
            config->rgb_config.fps, config->rgb_config.pixel_format);
-    printf("  Gray: %dx%d@%d, fourcc=0x%08x\n",
+    SDK_LOG_INFO("  Gray: %dx%d@%d, fourcc=0x%08x",
            config->gray_config.width, config->gray_config.height,
            config->gray_config.fps, config->gray_config.pixel_format);
-    printf("  Depth: %dx%d@%d, fourcc=0x%08x\n",
+    SDK_LOG_INFO("  Depth: %dx%d@%d, fourcc=0x%08x",
            config->depth_config.width, config->depth_config.height,
            config->depth_config.fps, config->depth_config.pixel_format);
     
@@ -2268,13 +2279,13 @@ int insight9_receive_init(const insight9_config_t* config) {
 
 int insight9_receive_init_default() {
     if (g_ctx.initialized) {
-        fprintf(stderr, "[SDK] Already initialized\n");
+        SDK_LOG_ERROR("[SDK] Already initialized");
         return -1;
     }
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE) {
-        fprintf(stderr, "[SDK] CoInitializeEx failed, hr=0x%08lx\n", hr);
+        SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
         CoUninitialize();
         return -1;
     }
@@ -2320,11 +2331,11 @@ int insight9_receive_init_default() {
 
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
     if (uvcPaths.size() < 2) {
-        fprintf(stderr, "[SDK] Need at least 2 UVC devices, found %zu\n", uvcPaths.size());
+        SDK_LOG_ERROR("[SDK] Need at least 2 UVC devices, found %zu", uvcPaths.size());
         return -1;
     }
 
-    printf("[SDK] Probing device capabilities...\n");
+    SDK_LOG_INFO("[SDK] Probing device capabilities...");
     
     if (uvcPaths.size() > 0) {
         probeDeviceCapabilities(uvcPaths[0], 0, g_ctx.device_caps);
@@ -2424,17 +2435,15 @@ int insight9_receive_init_default() {
             int grayFps = g_ctx.config.gray_config.fps;
             PixelFormat grayFmt = g_ctx.config.gray_config.pixel_format;
             if (depthW != grayW || depthH != grayH) {
-                printf("[SDK] Warning: Composite streams have different configured sizes. "
-                    "Using Gray resolution for both because the current UVC device requires one shared media type size.\n"
-                );
+                SDK_LOG_WARN("[SDK] Warning: Composite streams have different configured sizes. Using Gray resolution for both because the current UVC device requires one shared media type size.");
 
                 depthW = grayW;
                 depthH = grayH;
             }
 
-            printf("[SDK] Opening Composite UVC %d:\n"
-                "        Stream0 Depth: %dx%d@%d fmt=%d\n"
-                "        Stream1 Gray : %dx%d@%d fmt=%d\n",
+            SDK_LOG_INFO("[SDK] Opening Composite UVC %d:"
+                "        Stream0 Depth: %dx%d@%d fmt=%d"
+                "        Stream1 Gray : %dx%d@%d fmt=%d",
                 i, depthW, depthH, depthFps, (int)depthFmt,
                 grayW, grayH, grayFps, (int)grayFmt
             );
@@ -2445,7 +2454,7 @@ int insight9_receive_init_default() {
                 );
         }
         if (!opened) {
-            fprintf(stderr, "[SDK] Failed to open physical UVC %d: %s\n", i, uvcPaths[i].c_str());
+            SDK_LOG_ERROR("[SDK] Failed to open physical UVC %d: %s", i, uvcPaths[i].c_str());
             delete g_ctx.videos[i];
             g_ctx.videos[i] = nullptr;
             return -1;
@@ -2454,27 +2463,27 @@ int insight9_receive_init_default() {
 
     auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
     if (hidPaths.size() < 1) {
-        fprintf(stderr, "[SDK] VIO device not found (found %zu HID devices)\n", hidPaths.size());
+        SDK_LOG_ERROR("[SDK] VIO device not found (found %zu HID devices)", hidPaths.size());
         return -1;
     }
     g_ctx.hidPaths[0] = hidPaths[0];
     // g_ctx.hidPaths[1] = hidPaths[1];
-    // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
-    printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
+    // SDK_LOG_INFO("[HID] IMU device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
+    SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+        SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
         return -1;
     }
     // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
-    //     fprintf(stderr, "[SDK] Failed to open VIO HID\n");
+    //     SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
     //     return -1;
     // }
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
         if (!reopenXUControlLocked("initialization")) {
-            fprintf(stderr, "[SDK][WARN] XU control unavailable during initialization; video can still run\n");
+            SDK_LOG_WARN("[SDK][WARN] XU control unavailable during initialization; video can still run");
         }
     }
 
@@ -2495,7 +2504,7 @@ int insight9_receive_start() {
         }
 
         if (!g_ctx.videos[uvcId]->start()) {
-            fprintf(stderr, "[SDK] Failed to start UVC %d\n", uvcId);
+            SDK_LOG_ERROR("[SDK] Failed to start UVC %d", uvcId);
             g_ctx.running = false;
             return -1;
         }
@@ -2563,7 +2572,7 @@ void insight9_receive_stop_camera(int cam_id) {
     if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) {
         return;
     }
-    printf("[SDK] Stop logical camera %d\n", cam_id);
+    SDK_LOG_INFO("[SDK] Stop logical camera %d", cam_id);
 
     if (cam_id == RGB_CAM_ID) {
         g_ctx.cam_running[RGB_CAM_ID] = false;
@@ -2588,7 +2597,7 @@ void insight9_receive_stop_camera(int cam_id) {
             !joinWithTimeout(g_ctx.videoThreads[COMPOSITE_UVC_ID], 1000, "video[Composite]");
 
         if (g_ctx.videoThreadStuck[COMPOSITE_UVC_ID]) {
-            fprintf(stderr, "[SDK][WARN] Composite video source leaked intentionally\n");
+            SDK_LOG_WARN("[SDK][WARN] Composite video source leaked intentionally");
         } else {
             delete g_ctx.videos[COMPOSITE_UVC_ID];
         }
@@ -2615,14 +2624,14 @@ int insight9_receive_restart_camera(int cam_id) {
         return -1;
     }
 
-    printf( "[SDK] Restart logical camera %d (physical UVC %d)\n", cam_id, uvcId);
+    SDK_LOG_INFO("[SDK] Restart logical camera %d (physical UVC %d)", cam_id, uvcId);
 
     if (cam_id == RGB_CAM_ID) {
         insight9_receive_stop_camera(RGB_CAM_ID);
 
         if (g_ctx.videoThreadStuck[RGB_UVC_ID]) {
-            fprintf(stderr, "[SDK][WARN] RGB video source leaked intentionally "
-                            "(stuck thread may still reference it)\n");
+            SDK_LOG_WARN("[SDK][WARN] RGB video source leaked intentionally "
+                         "(stuck thread may still reference it)");
         } else {
             delete g_ctx.videos[RGB_UVC_ID];
         }
@@ -2697,21 +2706,21 @@ int insight9_receive_restart_camera(int cam_id) {
 int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= UVC_NUM || fps <= 0) return -1;
 
-    printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, fps);
+    SDK_LOG_INFO("[SDK] Switching camera %d to %d FPS...", cam_id, fps);
 
     insight9_receive_stop_camera(cam_id);
     Sleep(3000);
 
     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
-        fprintf(stderr, "[SDK] Failed to set camera %d FPS to %d\n", cam_id, fps);
+        SDK_LOG_ERROR("[SDK] Failed to set camera %d FPS to %d", cam_id, fps);
         return -1;
     }
 
     int ret = insight9_receive_restart_camera(cam_id);
     if (ret == 0) {
-        printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, fps);
+        SDK_LOG_INFO("[SDK] Camera %d switched to %d FPS successfully", cam_id, fps);
     } else {
-        fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
+        SDK_LOG_ERROR("[SDK] Failed to restart camera %d after FPS switch", cam_id);
     }
     return ret;
 }
@@ -2747,8 +2756,8 @@ void insight9_receive_cleanup() {
 
     for (int i = 0; i < UVC_NUM; ++i) {
         if (g_ctx.videoThreadStuck[i]) {
-            fprintf(stderr, "[SDK][WARN] Video source leaked intentionally "
-                            "(stuck thread may still reference it)\n");
+            SDK_LOG_WARN("[SDK][WARN] Video source leaked intentionally "
+                         "(stuck thread may still reference it)");
         } else {
             delete g_ctx.videos[i];
         }
@@ -2758,8 +2767,8 @@ void insight9_receive_cleanup() {
     for (int i = 0; i < HID_NUM; ++i) {
         if (g_ctx.hidDevs[i]) {
             if (g_ctx.hidThreadStuck[i]) {
-                fprintf(stderr, "[SDK][WARN] HID device %d leaked intentionally "
-                                "(stuck thread may still reference it)\n", i);
+                SDK_LOG_WARN("[SDK][WARN] HID device %d leaked intentionally "
+                             "(stuck thread may still reference it)", i);
             } else {
                 g_ctx.hidDevs[i]->close();
                 delete g_ctx.hidDevs[i];
@@ -2812,10 +2821,10 @@ int insight9_receive_set_camera_fps(int cam_id, int fps) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id > 2) return -1;
     if (cam_id == 0) {
         g_ctx.config.rgb_config.fps = fps;
-        printf("[SDK] Set RGB FPS to %d\n", fps);
+        SDK_LOG_INFO("[SDK] Set RGB FPS to %d", fps);
     } else {
         g_ctx.config.gray_config.fps = fps;
-        printf("[SDK] Set Gray/Depth composite FPS to %d\n", fps);
+        SDK_LOG_INFO("[SDK] Set Gray/Depth composite FPS to %d", fps);
     }
     return 0;
 }
@@ -2837,7 +2846,7 @@ void insight9_receive_register_vio_callback(vio_callback cb, void *user) {
 
 const DeviceCapabilities_t* insight9_receive_get_device_capabilities_ptr(void) {
     if (!g_ctx.initialized) {
-        fprintf(stderr, "[SDK] Not initialized\n");
+        SDK_LOG_ERROR("[SDK] Not initialized");
         return nullptr;
     }
     return &g_ctx.device_caps;
@@ -2845,12 +2854,12 @@ const DeviceCapabilities_t* insight9_receive_get_device_capabilities_ptr(void) {
 
 int insight9_receive_get_device_default_capability(int cam_id, DeviceCapability* cap) {
     if (!g_ctx.initialized) {
-        fprintf(stderr, "[SDK] Not initialized\n");
+        SDK_LOG_ERROR("[SDK] Not initialized");
         return -1;
     }
     
     if (!cap) {
-        fprintf(stderr, "[SDK] Invalid cap parameter\n");
+        SDK_LOG_ERROR("[SDK] Invalid cap parameter");
         return -1;
     }
     
@@ -2860,12 +2869,12 @@ int insight9_receive_get_device_default_capability(int cam_id, DeviceCapability*
         case 1: target = &g_ctx.device_caps.gray_default; break;
         case 2: target = &g_ctx.device_caps.depth_default; break;
         default:
-            fprintf(stderr, "[SDK] Invalid cam_id: %d (must be 0, 1, or 2)\n", cam_id);
+            SDK_LOG_ERROR("[SDK] Invalid cam_id: %d (must be 0, 1, or 2)", cam_id);
             return -1;
     }
     
     if (!target->valid) {
-        fprintf(stderr, "[SDK] No default capability found for cam_id %d\n", cam_id);
+        SDK_LOG_ERROR("[SDK] No default capability found for cam_id %d", cam_id);
         return -1;
     }
     
@@ -2875,12 +2884,12 @@ int insight9_receive_get_device_default_capability(int cam_id, DeviceCapability*
 
 int insight9_receive_get_device_capability_count(int cam_id, int* count) {
     if (!g_ctx.initialized) {
-        fprintf(stderr, "[SDK] Not initialized\n");
+        SDK_LOG_ERROR("[SDK] Not initialized");
         return -1;
     }
     
     if (!count) {
-        fprintf(stderr, "[SDK] Invalid count parameter\n");
+        SDK_LOG_ERROR("[SDK] Invalid count parameter");
         return -1;
     }
     
@@ -2890,7 +2899,7 @@ int insight9_receive_get_device_capability_count(int cam_id, int* count) {
         case 1: vec = &g_ctx.device_caps.gray_capabilities; break;
         case 2: vec = &g_ctx.device_caps.depth_capabilities; break;
         default:
-            fprintf(stderr, "[SDK] Invalid cam_id: %d (must be 0, 1, or 2)\n", cam_id);
+            SDK_LOG_ERROR("[SDK] Invalid cam_id: %d (must be 0, 1, or 2)", cam_id);
             return -1;
     }
     
@@ -2900,17 +2909,17 @@ int insight9_receive_get_device_capability_count(int cam_id, int* count) {
 
 int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap) {
     if (!g_ctx.initialized) {
-        fprintf(stderr, "[SDK] Not initialized\n");
+        SDK_LOG_ERROR("[SDK] Not initialized");
         return -1;
     }
     
     if (!cap) {
-        fprintf(stderr, "[SDK] Invalid cap parameter\n");
+        SDK_LOG_ERROR("[SDK] Invalid cap parameter");
         return -1;
     }
     
     if (index < 0) {
-        fprintf(stderr, "[SDK] Invalid index: %d (must be >= 0)\n", index);
+        SDK_LOG_ERROR("[SDK] Invalid index: %d (must be >= 0)", index);
         return -1;
     }
     
@@ -2920,12 +2929,12 @@ int insight9_receive_get_device_capability_by_index(int cam_id, int index, Devic
         case 1: vec = &g_ctx.device_caps.gray_capabilities; break;
         case 2: vec = &g_ctx.device_caps.depth_capabilities; break;
         default:
-            fprintf(stderr, "[SDK] Invalid cam_id: %d (must be 0, 1, or 2)\n", cam_id);
+            SDK_LOG_ERROR("[SDK] Invalid cam_id: %d (must be 0, 1, or 2)", cam_id);
             return -1;
     }
     
     if (index >= (int)vec->size()) {
-        fprintf(stderr, "[SDK] Index %d out of range (size: %zu)\n", index, vec->size());
+        SDK_LOG_ERROR("[SDK] Index %d out of range (size: %zu)", index, vec->size());
         return -1;
     }
     
@@ -3012,7 +3021,7 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
 int insight9_receive_reset_camera_params(int) { 
    // Reading factory defaults from the device requires additional implementation. A simple approach is to read
    // and save the current values during initialization, then write them back when a reset is needed.
-   fprintf(stderr, "[XU][ERR] reset_camera_params not implemented, use set_camera_params with saved defaults\n");
+   SDK_LOG_ERROR("[XU][ERR] reset_camera_params not implemented, use set_camera_params with saved defaults");
    return -1;
 }
 

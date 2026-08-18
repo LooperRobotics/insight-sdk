@@ -327,7 +327,7 @@ bool ExtensionUnitControl::bindFilterByDevicePath(const std::string& devicePath)
 
     enumMoniker->Release();
     devEnum->Release();
-    printf("[XU] DevicePath not found in DirectShow enumeration: %s\n", devicePath.c_str());
+    // printf("[XU] DevicePath not found in DirectShow enumeration: %s\n", devicePath.c_str());
     return false;
 }
 

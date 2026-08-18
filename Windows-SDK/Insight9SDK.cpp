@@ -18,6 +18,8 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <functional>
+#include <new>
 #include <cctype>
 #include <cmath>
 #include <vector>
@@ -1139,6 +1141,8 @@ struct sdk_ctx_t {
     std::string hidPaths[HID_NUM];
     std::thread hidThreads[HID_NUM];
     viewer::ExtensionUnitControl* xu;
+    // Serialize all access/recreation of the KS Extension Unit object.
+    std::recursive_mutex xuMutex;
     // =====================================================
     std::atomic<bool> running;
     image_callback imgCb;
@@ -1316,6 +1320,71 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     return paths;
 }
 
+static bool reopenXUControlLocked(const char* reason) {
+    std::string path = g_ctx.videoPaths[RGB_UVC_ID];
+    if (path.empty()) {
+        auto paths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+        if (!paths.empty()) {
+            path = paths[RGB_UVC_ID];
+            g_ctx.videoPaths[RGB_UVC_ID] = path;
+        }
+    }
+
+    if (path.empty()) {
+        fprintf(stderr, "[XU][ERR] Cannot reopen XU: RGB UVC path unavailable (%s)\n",
+                reason ? reason : "unknown");
+        return false;
+    }
+
+    if (g_ctx.xu) {
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
+    }
+
+    auto* xu = new (std::nothrow) viewer::ExtensionUnitControl();
+    if (!xu) {
+        fprintf(stderr, "[XU][ERR] Allocation failed while reopening XU (%s)\n",
+                reason ? reason : "unknown");
+        return false;
+    }
+
+    printf("[XU] Reopening XU on RGB UVC: %s (%s)\n",
+           path.c_str(), reason ? reason : "unknown");
+
+    if (!xu->open(path)) {
+        fprintf(stderr, "[XU][WARN] Reopen failed on path: %s\n", path.c_str());
+        delete xu;
+        return false;
+    }
+
+    g_ctx.xu = xu;
+    printf("[XU] Reopen success\n");
+    return true;
+}
+
+static bool callXUWithRetry(const char* op,
+                            const std::function<bool(viewer::ExtensionUnitControl&)>& fn) {
+    std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
+
+    if (!g_ctx.xu && !reopenXUControlLocked(op)) {
+        return false;
+    }
+
+    if (fn(*g_ctx.xu)) {
+        return true;
+    }
+
+    fprintf(stderr,
+            "[XU][WARN] Operation '%s' failed; reopening XU and retrying once\n",
+            op ? op : "unknown");
+
+    if (!reopenXUControlLocked(op)) {
+        return false;
+    }
+
+    return fn(*g_ctx.xu);
+}
+
 static int reconnect_backoff_ms(int attempt) {
     if (attempt < 1) attempt = 1;
     long delay = RECONNECT_BACKOFF_BASE_MS;
@@ -1452,7 +1521,7 @@ static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid) {
     std::map<int, std::string> interfaceMap;
     for (cur = devs; cur; cur = cur->next) {
         if (cur->interface_number >= 0) {
-            printf("[HID] Interface %d: %s\n", cur->interface_number, cur->path);
+            // printf("[HID] Interface %d: %s\n", cur->interface_number, cur->path);
             interfaceMap[cur->interface_number] = cur->path;
         }
     }
@@ -1470,25 +1539,42 @@ class HidDevice {
 public:
     bool open(const std::string& path) {
         close();
+        path_ = path;
         dev_ = hid_open_path(path.c_str());
-        if (dev_) hid_set_nonblocking(dev_, 1);
+        if (dev_) {
+            hid_set_nonblocking(dev_, 1);
+        }
         return dev_ != nullptr;
     }
     void close() {
-        if (dev_) hid_close(dev_);
-        dev_ = nullptr;
+        if (dev_) {
+            hid_close(dev_);
+            dev_ = nullptr;
+        }
     }
-    bool read(uint8_t* buf, size_t& len) {
-        if (!dev_) return false;
+    // Returns true when a report is available.
+    // disconnected is set only when hidapi reports a real read error (ret < 0);
+    // ret == 0 is just the normal non-blocking "no data yet" case.
+    bool read(uint8_t* buf, size_t& len, bool* disconnected = nullptr) {
+        if (disconnected) *disconnected = false;
+        if (!dev_) {
+            if (disconnected) *disconnected = true;
+            return false;
+        }
         int ret = hid_read(dev_, buf, (size_t)len);
         if (ret > 0) {
-            len = ret;
+            len = static_cast<size_t>(ret);
             return true;
+        }
+        if (ret < 0 && disconnected) {
+            *disconnected = true;
         }
         return false;
     }
+    const std::string& path() const { return path_; }
 private:
     hid_device* dev_ = nullptr;
+    std::string path_;
 };
 
 class ImuSensorEvents : public ISensorEvents {
@@ -1624,77 +1710,170 @@ private:
 
 // ============ IMU Thread：STA Message Pump ============
 static void imuSensorThreadFunc() {
+    // The Windows Sensor API objects are tied to the current USB device instance.
+    // After a USB disconnect/re-enumeration, keeping the old ISensorManager/ISensor
+    // objects alive can leave us with a permanently silent stream.  Therefore this
+    // thread deliberately rebuilds the entire Sensor API binding when the sensors
+    // disappear or GetState() fails.
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hrCo) && hrCo != S_FALSE) {
         fprintf(stderr, "[IMU] CoInitializeEx(STA) failed hr=0x%08lx\n", hrCo);
         return;
     }
 
-    ISensorManager* pManager = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_SensorManager, nullptr, CLSCTX_INPROC_SERVER,
-                                   IID_PPV_ARGS(&pManager));
-    if (FAILED(hr)) {
-        fprintf(stderr, "[IMU] CoCreateInstance(SensorManager) failed hr=0x%08lx\n", hr);
-        CoUninitialize();
-        return;
-    }
-
-    ISensor *pAccel = nullptr, *pGyro = nullptr;
-    ImuSensorEvents *pAccelEvents = nullptr, *pGyroEvents = nullptr;
-
-    auto bindOne = [&](REFSENSOR_TYPE_ID typeId, bool isAccel, ISensor** outSensor, ImuSensorEvents** outEvents) {
-        ISensorCollection* pColl = nullptr;
-        if (FAILED(pManager->GetSensorsByType(typeId, &pColl)) || !pColl) return false;
-        ULONG count = 0;
-        pColl->GetCount(&count);
-        if (count == 0) { pColl->Release(); return false; }
-        ISensor* pSensor = nullptr;
-        pColl->GetAt(0, &pSensor);
-        pColl->Release();
-        if (!pSensor) return false;
-
-        IPortableDeviceKeyCollection* pAllKeys = nullptr;
-        pSensor->GetSupportedDataFields(&pAllKeys);
-
-        auto* events = new ImuSensorEvents(isAccel, pAllKeys);
-        if (pAllKeys) pAllKeys->Release();
-        if (FAILED(pSensor->SetEventSink(events))) {
-            events->Release();
-            pSensor->Release();
-            return false;
+    auto cleanupBinding = [](ISensor*& pAccel, ISensor*& pGyro,
+                             ImuSensorEvents*& pAccelEvents,
+                             ImuSensorEvents*& pGyroEvents,
+                             ISensorManager*& pManager) {
+        if (pAccel) {
+            pAccel->SetEventSink(nullptr);
+            pAccel->Release();
+            pAccel = nullptr;
         }
-        *outSensor = pSensor;
-        *outEvents = events;
-        return true;
+        if (pGyro) {
+            pGyro->SetEventSink(nullptr);
+            pGyro->Release();
+            pGyro = nullptr;
+        }
+        if (pAccelEvents) {
+            pAccelEvents->Release();
+            pAccelEvents = nullptr;
+        }
+        if (pGyroEvents) {
+            pGyroEvents->Release();
+            pGyroEvents = nullptr;
+        }
+        if (pManager) {
+            pManager->Release();
+            pManager = nullptr;
+        }
     };
 
-    bool hasAccel = bindOne(SENSOR_TYPE_ACCELEROMETER_3D, true, &pAccel, &pAccelEvents);
-    bool hasGyro  = bindOne(SENSOR_TYPE_GYROMETER_3D, false, &pGyro, &pGyroEvents);
-
-    if (!hasAccel && !hasGyro) {
-        fprintf(stderr, "[IMU] No accelerometer/gyrometer sensor found via Sensor API\n");
-        pManager->Release();
-        CoUninitialize();
-        return;
-    }
-    printf("[IMU] Sensor API bound: accel=%d gyro=%d\n", hasAccel, hasGyro);
-
-    // STA Message Pump
-    MSG msg;
     while (g_ctx.running) {
-        DWORD ret = MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+        ISensorManager* pManager = nullptr;
+        ISensor* pAccel = nullptr;
+        ISensor* pGyro = nullptr;
+        ImuSensorEvents* pAccelEvents = nullptr;
+        ImuSensorEvents* pGyroEvents = nullptr;
+
+        HRESULT hr = CoCreateInstance(CLSID_SensorManager, nullptr, CLSCTX_INPROC_SERVER,
+                                       IID_PPV_ARGS(&pManager));
+        if (FAILED(hr) || !pManager) {
+            fprintf(stderr, "[IMU][WARN] SensorManager unavailable hr=0x%08lx, retrying\n", hr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            continue;
+        }
+
+        auto bindOne = [&](REFSENSOR_TYPE_ID typeId, bool isAccel,
+                           ISensor** outSensor, ImuSensorEvents** outEvents) -> bool {
+            if (!outSensor || !outEvents) return false;
+            *outSensor = nullptr;
+            *outEvents = nullptr;
+
+            ISensorCollection* pColl = nullptr;
+            HRESULT h = pManager->GetSensorsByType(typeId, &pColl);
+            if (FAILED(h) || !pColl) return false;
+
+            ULONG count = 0;
+            pColl->GetCount(&count);
+            if (count == 0) {
+                pColl->Release();
+                return false;
+            }
+
+            ISensor* pSensor = nullptr;
+            h = pColl->GetAt(0, &pSensor);
+            pColl->Release();
+            if (FAILED(h) || !pSensor) return false;
+
+            IPortableDeviceKeyCollection* pAllKeys = nullptr;
+            pSensor->GetSupportedDataFields(&pAllKeys);
+
+            auto* events = new (std::nothrow) ImuSensorEvents(isAccel, pAllKeys);
+            if (pAllKeys) pAllKeys->Release();
+            if (!events) {
+                pSensor->Release();
+                return false;
+            }
+
+            h = pSensor->SetEventSink(events);
+            if (FAILED(h)) {
+                events->Release();
+                pSensor->Release();
+                return false;
+            }
+
+            *outSensor = pSensor;
+            *outEvents = events;
+            return true;
+        };
+
+        const bool hasAccel = bindOne(SENSOR_TYPE_ACCELEROMETER_3D, true,
+                                      &pAccel, &pAccelEvents);
+        const bool hasGyro = bindOne(SENSOR_TYPE_GYROMETER_3D, false,
+                                     &pGyro, &pGyroEvents);
+
+        if (!hasAccel && !hasGyro) {
+            fprintf(stderr, "[IMU][WARN] No accelerometer/gyrometer currently available, retrying...\n");
+            cleanupBinding(pAccel, pGyro, pAccelEvents, pGyroEvents, pManager);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            continue;
+        }
+
+        printf("[IMU] Sensor API bound/rebound: accel=%d gyro=%d\n", hasAccel, hasGyro);
+
+        bool lost = false;
+        ULONGLONG lastHealthCheck = GetTickCount64();
+        MSG msg;
+
+        while (g_ctx.running && !lost) {
+            DWORD ret = MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+            if (!g_ctx.running) break;
+
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            const ULONGLONG now = GetTickCount64();
+            if (now - lastHealthCheck < 500) continue;
+            lastHealthCheck = now;
+
+            auto sensorHealthy = [](ISensor* sensor, const char* name) -> bool {
+                if (!sensor) return true;
+                SensorState state = SENSOR_STATE_NOT_AVAILABLE;
+                HRESULT h = sensor->GetState(&state);
+                if (FAILED(h)) {
+                    fprintf(stderr, "[IMU][WARN] %s GetState failed hr=0x%08lx\n", name, h);
+                    return false;
+                }
+                if (state == SENSOR_STATE_NOT_AVAILABLE ||
+                    state == SENSOR_STATE_NO_DATA) {
+                    fprintf(stderr, "[IMU][WARN] %s state=%d, rebinding\n",
+                            name, static_cast<int>(state));
+                    return false;
+                }
+                return true;
+            };
+
+            // A failed GetState is much more reliable than waiting for callbacks to
+            // arrive: after USB re-enumeration the old sensor can remain registered
+            // while silently producing no data.
+            if (!sensorHealthy(pAccel, "accel") ||
+                !sensorHealthy(pGyro, "gyro")) {
+                lost = true;
+            }
+        }
+
+        cleanupBinding(pAccel, pGyro, pAccelEvents, pGyroEvents, pManager);
+
         if (!g_ctx.running) break;
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+        if (lost) {
+            fprintf(stderr, "[IMU][WARN] Sensor binding lost; rebuilding SensorManager/ISensor objects\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
     }
 
-    if (pAccel) { pAccel->SetEventSink(nullptr); pAccel->Release(); }
-    if (pGyro)  { pGyro->SetEventSink(nullptr);  pGyro->Release(); }
-    if (pAccelEvents) pAccelEvents->Release();
-    if (pGyroEvents)  pGyroEvents->Release();
-    pManager->Release();
     CoUninitialize();
     printf("[IMU] sensor thread exited\n");
 }
@@ -1755,6 +1934,15 @@ static void videoThreadFunc(int uvcId) {
             }
             reconnect_fails = 0;
             printf("[SDK] Video device %d (re)connected\n", uvcId);
+
+            // The KS/XU handle belongs to the old USB device instance.
+            // Rebind it after RGB UVC is recreated.
+            if (uvcId == RGB_UVC_ID) {
+                std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
+                if (!reopenXUControlLocked("RGB video reconnect")) {
+                    fprintf(stderr, "[XU][WARN] RGB video recovered but XU is not available yet\n");
+                }
+            }
         }
 
         // ---- 正常读帧循环（跟原来一样，只是把"检测到设备断开"的处理方式从
@@ -1802,24 +1990,133 @@ static void videoThreadFunc(int uvcId) {
     printf("[SDK] Video thread exited: UVC=%d\n", uvcId);
 }
 
+static bool hidPathStillPresent(const std::string& path) {
+    if (path.empty()) return false;
+    auto paths = findHidDevices(VENDOR_ID, PRODUCT_ID);
+    for (const auto& p : paths) {
+        if (p == path) return true;
+    }
+    return false;
+}
+
+static bool reopenHidDeviceForThread(int idx, int& failCount) {
+    if (idx < 0 || idx >= HID_NUM) return false;
+
+    // Always enumerate again.  This is important because the path can change after
+    // USB device-instance re-enumeration even when the interface number stays the same.
+    auto paths = findHidDevices(VENDOR_ID, PRODUCT_ID);
+    if (paths.empty()) {
+        ++failCount;
+        int delay = reconnect_backoff_ms(failCount);
+        fprintf(stderr, "[HID%d][ERR] No HID device found, retry in %dms (attempt %d)\n",
+                idx, delay, failCount);
+        interruptible_sleep_ms(delay);
+        return false;
+    }
+
+    std::string path;
+
+    // Prefer the old path when it still exists; otherwise fall back to a stable
+    // enumeration slot.  For this device there is normally one HID interface used
+    // by the VIO payload.
+    for (const auto& p : paths) {
+        if (p == g_ctx.hidPaths[idx]) {
+            path = p;
+            break;
+        }
+    }
+    if (path.empty()) {
+        const size_t wanted = static_cast<size_t>((std::max)(idx, 0));
+        path = paths[(std::min)(wanted, paths.size() - 1)];
+    }
+
+    if (!g_ctx.hidDevs[idx]) {
+        g_ctx.hidDevs[idx] = new (std::nothrow) HidDevice();
+        if (!g_ctx.hidDevs[idx]) return false;
+    }
+
+    g_ctx.hidDevs[idx]->close();
+    if (!g_ctx.hidDevs[idx]->open(path)) {
+        ++failCount;
+        int delay = reconnect_backoff_ms(failCount);
+        fprintf(stderr, "[HID%d][ERR] Failed to open %s, retry in %dms (attempt %d)\n",
+                idx, path.c_str(), delay, failCount);
+        interruptible_sleep_ms(delay);
+        return false;
+    }
+
+    g_ctx.hidPaths[idx] = path;
+    failCount = 0;
+    printf("[HID%d] Reconnected: %s\n", idx, path.c_str());
+    return true;
+}
+
 static void hidThreadFunc(int idx) {
-    auto* dev = g_ctx.hidDevs[idx];
-    if (!dev) return;
+    if (idx < 0 || idx >= HID_NUM) return;
 
-    uint64_t last_accel_ts = 0, last_gyro_ts = 0, last_vio_ts = 0;
-    float last_ax = 0, last_ay = 0, last_az = 0;
-    float last_gx = 0, last_gy = 0, last_gz = 0;
+    constexpr ULONGLONG HID_NO_DATA_TIMEOUT_MS = 4000;
+    constexpr ULONGLONG HID_ENUM_CHECK_MS = 500;
 
+    int reconnectFails = 0;
+    uint64_t last_vio_ts = 0;
+    ULONGLONG lastDataTick = 0;
+    ULONGLONG lastEnumCheck = 0;
     uint8_t buf[64];
+
     while (g_ctx.running) {
+        if (!g_ctx.hidDevs[idx] || g_ctx.hidPaths[idx].empty()) {
+            if (!reopenHidDeviceForThread(idx, reconnectFails)) continue;
+            lastDataTick = GetTickCount64();
+            lastEnumCheck = lastDataTick;
+            last_vio_ts = 0;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+
+        // Do not rely solely on hid_read() returning an error.  Some HID backends keep
+        // a stale handle alive after the USB instance disappears.  Periodically check
+        // whether that exact path is still enumerated by Windows.
+        if (now - lastEnumCheck >= HID_ENUM_CHECK_MS) {
+            lastEnumCheck = now;
+            if (!hidPathStillPresent(g_ctx.hidPaths[idx])) {
+                fprintf(stderr, "[HID%d][WARN] HID path disappeared from enumeration, reopening...\n", idx);
+                g_ctx.hidDevs[idx]->close();
+                g_ctx.hidPaths[idx].clear();
+                last_vio_ts = 0;
+                lastDataTick = now;
+                continue;
+            }
+        }
+
+        bool disconnected = false;
         size_t len = sizeof(buf);
-        if (!dev->read(buf, len)) {
+        HidDevice* dev = g_ctx.hidDevs[idx];
+        if (!dev || !dev->read(buf, len, &disconnected)) {
+            if (disconnected) {
+                fprintf(stderr, "[HID%d][WARN] hid_read reports device error, reopening...\n", idx);
+                if (dev) dev->close();
+                g_ctx.hidPaths[idx].clear();
+                last_vio_ts = 0;
+                continue;
+            }
+
+            if (lastDataTick == 0) lastDataTick = now;
+            if (now - lastDataTick > HID_NO_DATA_TIMEOUT_MS) {
+                fprintf(stderr,
+                        "[HID%d][WARN] HID has produced no data for %llums, reopening...\n",
+                        idx,
+                        static_cast<unsigned long long>(now - lastDataTick));
+                if (dev) dev->close();
+                g_ctx.hidPaths[idx].clear();
+                last_vio_ts = 0;
+                continue;
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
 
-        uint8_t report_id = buf[0];
-
+        lastDataTick = now;
         if (len >= sizeof(vio_hid_payload)) {
             auto* p = reinterpret_cast<vio_hid_payload*>(buf);
             if (p->timestamp != 0 && p->timestamp == last_vio_ts) continue;
@@ -1851,7 +2148,33 @@ int insight9_receive_init(const insight9_config_t* config) {
         return -1;
     }
 
-    memset(&g_ctx, 0, sizeof(g_ctx));
+    // sdk_ctx_t contains std::thread/std::mutex/std::string; never memset it.
+    g_ctx.config = {};
+    g_ctx.running = false;
+    g_ctx.initialized = false;
+    g_ctx.singleNodeMode = false;
+    g_ctx.xu = nullptr;
+    g_ctx.device_caps = {};
+    for (int i = 0; i < UVC_NUM; ++i) {
+        g_ctx.videos[i] = nullptr;
+        g_ctx.videoPaths[i].clear();
+        g_ctx.videoThreadStuck[i] = false;
+    }
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+        g_ctx.last_img_timestamp[i] = 0;
+    }
+    for (int i = 0; i < HID_NUM; ++i) {
+        g_ctx.hidDevs[i] = nullptr;
+        g_ctx.hidPaths[i].clear();
+        g_ctx.hidThreadStuck[i] = false;
+    }
+    g_ctx.imgCb = nullptr;
+    g_ctx.imgUser = nullptr;
+    g_ctx.imuCb = nullptr;
+    g_ctx.imuUser = nullptr;
+    g_ctx.vioCb = nullptr;
+    g_ctx.vioUser = nullptr;
     g_ctx.running = false;
     for (int i = 0; i < UVC_NUM; ++i) {
         g_ctx.videos[i] = nullptr;
@@ -1911,10 +2234,9 @@ int insight9_receive_init(const insight9_config_t* config) {
     // g_ctx.hidPaths[1] = hidPaths[1];
     // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
     printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
-    g_ctx.hidDevs[1] = new HidDevice();
-    // g_ctx.hidDevs[1] = new HidDevice();
-    if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open IMU HID\n");
+    g_ctx.hidDevs[0] = new HidDevice();
+    if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
+        fprintf(stderr, "[SDK] Failed to open VIO HID\n");
         return -1;
     }
     // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
@@ -1922,11 +2244,11 @@ int insight9_receive_init(const insight9_config_t* config) {
     //     return -1;
     // }
 
-    g_ctx.xu = new viewer::ExtensionUnitControl();
-    if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open XU control\n");
-        delete g_ctx.xu;
-        g_ctx.xu = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
+        if (!reopenXUControlLocked("initialization")) {
+            fprintf(stderr, "[SDK][WARN] XU control unavailable during initialization; video can still run\n");
+        }
     }
 
     g_ctx.initialized = true;
@@ -1957,7 +2279,33 @@ int insight9_receive_init_default() {
         return -1;
     }
 
-    memset(&g_ctx, 0, sizeof(g_ctx));
+    // sdk_ctx_t contains std::thread/std::mutex/std::string; never memset it.
+    g_ctx.config = {};
+    g_ctx.running = false;
+    g_ctx.initialized = false;
+    g_ctx.singleNodeMode = false;
+    g_ctx.xu = nullptr;
+    g_ctx.device_caps = {};
+    for (int i = 0; i < UVC_NUM; ++i) {
+        g_ctx.videos[i] = nullptr;
+        g_ctx.videoPaths[i].clear();
+        g_ctx.videoThreadStuck[i] = false;
+    }
+    for (int i = 0; i < LOGICAL_CAM_NUM; ++i) {
+        g_ctx.cam_running[i] = false;
+        g_ctx.last_img_timestamp[i] = 0;
+    }
+    for (int i = 0; i < HID_NUM; ++i) {
+        g_ctx.hidDevs[i] = nullptr;
+        g_ctx.hidPaths[i].clear();
+        g_ctx.hidThreadStuck[i] = false;
+    }
+    g_ctx.imgCb = nullptr;
+    g_ctx.imgUser = nullptr;
+    g_ctx.imuCb = nullptr;
+    g_ctx.imuUser = nullptr;
+    g_ctx.vioCb = nullptr;
+    g_ctx.vioUser = nullptr;
     g_ctx.running = false;
     
     for (int i = 0; i < UVC_NUM; ++i) {
@@ -2114,7 +2462,6 @@ int insight9_receive_init_default() {
     // printf("[HID] IMU device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
     printf("[HID] VIO device (interface %d): %s\n", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
-    // g_ctx.hidDevs[1] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
         fprintf(stderr, "[SDK] Failed to open VIO HID\n");
         return -1;
@@ -2124,11 +2471,11 @@ int insight9_receive_init_default() {
     //     return -1;
     // }
 
-    g_ctx.xu = new viewer::ExtensionUnitControl();
-    if (!g_ctx.xu->open(g_ctx.videoPaths[0])) {
-        fprintf(stderr, "[SDK] Failed to open XU control\n");
-        delete g_ctx.xu;
-        g_ctx.xu = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
+        if (!reopenXUControlLocked("initialization")) {
+            fprintf(stderr, "[SDK][WARN] XU control unavailable during initialization; video can still run\n");
+        }
     }
 
     g_ctx.initialized = true;
@@ -2421,9 +2768,11 @@ void insight9_receive_cleanup() {
         }
     }
 
-    delete g_ctx.xu;
-
-    g_ctx.xu = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
+        delete g_ctx.xu;
+        g_ctx.xu = nullptr;
+    }
     g_ctx.initialized = false;
     g_ctx.running = false;
 
@@ -2603,48 +2952,59 @@ int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t* timestamp) {
 }
 
 int insight9_receive_set_active_camera(int cam_id) {
-    if (!g_ctx.xu) return -1;
-    return g_ctx.xu->setActiveCamera((uint8_t)cam_id) ? 0 : -1;
+    return callXUWithRetry("setActiveCamera", [cam_id](viewer::ExtensionUnitControl& xu) {
+        return xu.setActiveCamera((uint8_t)cam_id);
+    }) ? 0 : -1;
 }
 
 int insight9_receive_get_active_camera(int *cam_id) {
-    if (!g_ctx.xu || !cam_id) return -1;
-    uint8_t val;
-    if (!g_ctx.xu->getActiveCamera(val)) return -1;
+    if (!cam_id) return -1;
+    uint8_t val = 0;
+    if (!callXUWithRetry("getActiveCamera", [&val](viewer::ExtensionUnitControl& xu) {
+            return xu.getActiveCamera(val);
+        })) return -1;
     *cam_id = val;
     return 0;
 }
 
 int insight9_receive_set_camera_params(const camera_params *params) {
-    if (!g_ctx.xu || !params) return -1;
+    if (!params) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
-    return g_ctx.xu->writeCurrentCameraParams(xuParams) ? 0 : -1;
+    return callXUWithRetry("writeCurrentCameraParams", [xuParams](viewer::ExtensionUnitControl& xu) {
+        return xu.writeCurrentCameraParams(xuParams);
+    }) ? 0 : -1;
 }
 
 int insight9_receive_get_camera_params(camera_params *params) {
-    if (!g_ctx.xu || !params) return -1;
+    if (!params) return -1;
     viewer::camera_params xuParams;
-    if (!g_ctx.xu->readCurrentCameraParams(xuParams)) return -1;
+    if (!callXUWithRetry("readCurrentCameraParams", [&xuParams](viewer::ExtensionUnitControl& xu) {
+            return xu.readCurrentCameraParams(xuParams);
+        })) return -1;
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
 
 int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
-    if (!g_ctx.xu || !params) return -1;
+    if (!params) return -1;
     int mapped = mapCompositeCamId(cam_id);
     if (mapped < 0) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
-    return g_ctx.xu->writeCameraParams((uint8_t)mapped, xuParams) ? 0 : -1;
+    return callXUWithRetry("writeCameraParams", [mapped, xuParams](viewer::ExtensionUnitControl& xu) {
+        return xu.writeCameraParams((uint8_t)mapped, xuParams);
+    }) ? 0 : -1;
 }
 
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
-    if (!g_ctx.xu || !params) return -1;
+    if (!params) return -1;
     int mapped = mapCompositeCamId(cam_id);
     if (mapped < 0) return -1;
     viewer::camera_params xuParams;
-    if (!g_ctx.xu->readCameraParams((uint8_t)mapped, xuParams)) return -1;
+    if (!callXUWithRetry("readCameraParams", [mapped, &xuParams](viewer::ExtensionUnitControl& xu) {
+            return xu.readCameraParams((uint8_t)mapped, xuParams);
+        })) return -1;
     memcpy(params, &xuParams, sizeof(camera_params));
     return 0;
 }
@@ -2664,13 +3024,13 @@ void insight9_receive_print_camera_params(const camera_params *params) {
 }
 
 int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib) {
-    if (!g_ctx.xu || !calib) return -1;
+    if (!calib) return -1;
     if (cam_idx < 0 || cam_idx >= viewer::kCalibCamCount) return -1;
-    
+
     viewer::camera_calib xu_calib;
-    if (!g_ctx.xu->readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib)) {
-        return -1;
-    }
+    if (!callXUWithRetry("readCameraCalib", [cam_idx, &xu_calib](viewer::ExtensionUnitControl& xu) {
+            return xu.readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib);
+        })) return -1;
     memcpy(calib, &xu_calib, sizeof(camera_calib));
     return 0;
 }
@@ -2826,11 +3186,13 @@ int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
 }
 
 int insight9_receive_get_current_fps(int* fps) {
-    if (!g_ctx.xu || !fps) return -1;
-    uint8_t val;
-    if (!g_ctx.xu->readCurrentFps(val)) return -1;
+    if (!fps) return -1;
+    uint8_t val = 0;
+    if (!callXUWithRetry("readCurrentFps", [&val](viewer::ExtensionUnitControl& xu) {
+            return xu.readCurrentFps(val);
+        })) return -1;
     const int validFps[] = {0, 20, 30, 40, 50};
-    if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+    if (val < (uint8_t)(sizeof(validFps) / sizeof(validFps[0]))) {
         *fps = validFps[val];
     } else {
         *fps = 0;
@@ -2839,9 +3201,11 @@ int insight9_receive_get_current_fps(int* fps) {
 }
 
 int insight9_receive_get_vio_status(int* status) {
-    if (!g_ctx.xu || !status) return -1;
-    uint8_t val;
-    if (!g_ctx.xu->readVioStatus(val)) return -1;
+    if (!status) return -1;
+    uint8_t val = 0;
+    if (!callXUWithRetry("readVioStatus", [&val](viewer::ExtensionUnitControl& xu) {
+            return xu.readVioStatus(val);
+        })) return -1;
     *status = val;
     return 0;
 }

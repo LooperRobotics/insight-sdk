@@ -16,6 +16,7 @@
 
 static volatile BOOL keep_running = TRUE;
 static volatile LONGLONG last_image_time = 0;
+static volatile LONGLONG last_image_time_per_cam[3] = {0, 0, 0};
 static CRITICAL_SECTION g_sdk_op_lock;
 
 BOOL WINAPI console_handler(DWORD dwCtrlType) {
@@ -380,6 +381,7 @@ void my_image_cb(int cam_id, uint8_t* data, size_t size,
                  uint64_t timestamp, void* userdata) {
     if (cam_id < 0 || cam_id >= 3) return;
     InterlockedExchange64(&last_image_time, GetTickCount64());
+    InterlockedExchange64(&last_image_time_per_cam[cam_id], GetTickCount64());
 
     EnterCriticalSection(&g_stats_lock);
     ensure_img_stats_initialized_locked();
@@ -566,22 +568,16 @@ static void camera_worker(int cam_id) {
     }
 }
 
-void reconnect_worker() {
-    while (keep_running) {
-        Sleep(1000);
-        if (!keep_running) break;
-
-        LONGLONG now = GetTickCount64();
-        LONGLONG last = last_image_time;
-        if (last != 0 && (now - last) > 5000) {
-            EnterCriticalSection(&g_sdk_op_lock);
-            printf("[Reconnect] No image received for 5 seconds, attempting reconnect...\n");
-            LeaveCriticalSection(&g_sdk_op_lock);
-        }
-    }
-}
-
 void toggle_gray_camera_fps() {
+    LONGLONG now = GetTickCount64();
+    LONGLONG grayLast = last_image_time_per_cam[1];
+    constexpr LONGLONG kGrayStreamTimeoutMs = 3000;   // 阈值可以按实际需要调，跟 reconnect 那边的 5000ms 不用完全一致
+
+    if (grayLast == 0 || (now - grayLast) > kGrayStreamTimeoutMs) {
+        printf("[FPS] Gray camera has no active video stream, skip FPS switch\n");
+        return;   // 直接跳过，不进入下面真正切换 fps 的逻辑
+    }
+    
     int new_fps = GRAY_FPS_VALUES[gray_fps_state];
     printf("new_fps = %d | gray_fps_state = %d\n", new_fps, gray_fps_state);
     gray_fps_state = (gray_fps_state + 1) % 5;
@@ -772,7 +768,6 @@ int main() {
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
     InterlockedExchange64(&last_image_time, GetTickCount64());
 
-    std::thread reconnect_thread(reconnect_worker);
     std::thread fps_switch_thread([]() {
         while (keep_running) {
             Sleep(10000);
@@ -852,54 +847,6 @@ int main() {
         if (key == 'q' || key == 27) {
             keep_running = FALSE;
         }
-
-        // Check for camera timeout and reconnect
-        LONGLONG now = GetTickCount64();
-        LONGLONG last = last_image_time;
-        if (last != 0 && (now - last) > 5000) {
-            printf("[Reconnect] No image received for 5 seconds, attempting reconnect...\n");
-
-            insight9_receive_stop();
-            insight9_receive_cleanup();
-
-            // Wait a bit for cleanup
-            Sleep(1000);
-
-            insight9_config_t config_reinit;
-            config_reinit.rgb_config.width = 1088;
-            config_reinit.rgb_config.height = 1920;
-            config_reinit.rgb_config.fps = 30;
-            config_reinit.rgb_config.pixel_format = PixelFormat::MJPEG;
-            config_reinit.gray_config.width = 544;
-            config_reinit.gray_config.height = 1281;
-            config_reinit.gray_config.fps = GRAY_FPS_VALUES[gray_fps_state];
-            config_reinit.gray_config.pixel_format = PixelFormat::GREY;
-            config_reinit.depth_config.width = 544;
-            config_reinit.depth_config.height = 642;
-            config_reinit.depth_config.fps = 30;
-            config_reinit.depth_config.pixel_format = PixelFormat::Z16;
-
-            if (insight9_receive_init(&config_reinit) != 0) {
-                printf("[Reconnect] SDK init failed\n");
-            } else {
-                insight9_receive_register_image_callback(my_image_cb, NULL);
-                insight9_receive_register_imu_callback(my_imu_cb, NULL);
-                insight9_receive_register_vio_callback(my_vio_cb, NULL);
-
-                if (insight9_receive_start() != 0) {
-                    printf("[Reconnect] SDK start failed\n");
-                    insight9_receive_cleanup();
-                } else {
-                    printf("[Reconnect] SDK restarted successfully\n");
-                    // Re-read calibration after reconnect
-                    if (insight9_receive_get_camera_calib(INSIGHT9_CALIB_CAM_LEFT, &g_left_calib) == 0 &&
-                        insight9_receive_get_camera_calib(INSIGHT9_CALIB_CAM_RGB, &g_rgb_calib) == 0) {
-                        g_calib_ready = true;
-                    }
-                }
-            }
-            InterlockedExchange64(&last_image_time, GetTickCount64());
-        }
     }
 
     // Wake and join the worker threads.
@@ -909,7 +856,6 @@ int main() {
     }
     cv::destroyAllWindows();
     if (fps_switch_thread.joinable()) fps_switch_thread.join();
-    if (reconnect_thread.joinable()) reconnect_thread.join();
 
     insight9_receive_stop();
     insight9_receive_cleanup();

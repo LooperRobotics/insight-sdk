@@ -120,6 +120,10 @@ struct MsMetadataHeader {
 };
 #pragma pack(pop)
 
+#define RECONNECT_BACKOFF_BASE_MS 1000
+#define RECONNECT_BACKOFF_MAX_MS  30000
+#define RECONNECT_MAX_ATTEMPTS    30
+
 static constexpr size_t MS_HEADER_SIZE = 40;
 static constexpr size_t UVC_HEADER_SIZE = 12;
 
@@ -430,8 +434,13 @@ public:
 
         HRESULT hr = sourceReader_->ReadSample(requestedStream, 0, &actualStream, &flags, &ts, &sample);
         if (FAILED(hr)) {
-            printf("[MFVideoSource] ReadSample(stream=%lu) FAILED hr=0x%08lx flags=0x%08lx actual=%lu\n",
-                requestedStream, hr, flags, actualStream);
+            if (hr == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED) {
+                printf("[MFVideoSource] Device disconnected (stream=%lu)\n", requestedStream);
+                running_ = false;
+                return false;
+            }
+            // printf("[MFVideoSource] ReadSample(stream=%lu) FAILED hr=0x%08lx flags=0x%08lx actual=%lu\n",
+            //     requestedStream, hr, flags, actualStream);
             if (sample) sample->Release();
             return false;
         }
@@ -1144,6 +1153,7 @@ struct sdk_ctx_t {
     bool initialized;
     uint64_t last_img_timestamp[LOGICAL_CAM_NUM];
     DeviceCapabilities_t device_caps;
+    bool singleNodeMode = false;
 };
 
 static sdk_ctx_t g_ctx;
@@ -1304,6 +1314,76 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     }
 
     return paths;
+}
+
+static int reconnect_backoff_ms(int attempt) {
+    if (attempt < 1) attempt = 1;
+    long delay = RECONNECT_BACKOFF_BASE_MS;
+    for (int i = 1; i < attempt && delay < RECONNECT_BACKOFF_MAX_MS; ++i) delay <<= 1;
+    if (delay > RECONNECT_BACKOFF_MAX_MS) delay = RECONNECT_BACKOFF_MAX_MS;
+    return (int)delay;
+}
+
+static void interruptible_sleep_ms(int total_ms, std::atomic<bool>* extraStop = nullptr) {
+    int slept = 0;
+    while (slept < total_ms && g_ctx.running) {
+        if (extraStop && !extraStop->load()) break;
+        int chunk = (total_ms - slept) > 200 ? 200 : (total_ms - slept);
+        std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
+        slept += chunk;
+    }
+}
+
+static void reconnect_backoff_apply(const char* tag, int id, int* fails, const char* reason,
+                                     std::atomic<bool>* extraStop = nullptr) {
+    (*fails)++;
+    int delay = reconnect_backoff_ms(*fails);
+    if (RECONNECT_MAX_ATTEMPTS <= 0 || *fails <= RECONNECT_MAX_ATTEMPTS) {
+        fprintf(stderr, "[%s%d][ERR] %s, retry in %dms (attempt %d)\n", tag, id, reason, delay, *fails);
+    } else if (*fails == RECONNECT_MAX_ATTEMPTS + 1) {
+        fprintf(stderr, "[%s%d][ERR] %s failed %d times, slowing to %ds retry\n",
+                tag, id, reason, RECONNECT_MAX_ATTEMPTS, RECONNECT_BACKOFF_MAX_MS / 1000);
+    }
+    interruptible_sleep_ms(delay, extraStop);
+}
+
+static bool openVideoSourceForSlot(int uvcId) {
+    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+    std::string path;
+    if (uvcId == RGB_UVC_ID) {
+        if (uvcPaths.empty()) return false;
+        path = uvcPaths[0];
+    } else {
+        if (uvcPaths.size() < 2 && !g_ctx.singleNodeMode) return false;
+        path = g_ctx.singleNodeMode ? uvcPaths[0] : uvcPaths[COMPOSITE_UVC_ID];
+    }
+
+    MFVideoSource* src = new MFVideoSource();
+    bool opened = false;
+    if (uvcId == RGB_UVC_ID) {
+        opened = src->open(path, uvcId,
+                    g_ctx.config.rgb_config.width, g_ctx.config.rgb_config.height,
+                    g_ctx.config.rgb_config.pixel_format, g_ctx.config.rgb_config.fps);
+    } else {
+        opened = src->openWithTwoStreams(path, uvcId,
+                    g_ctx.config.depth_config.width, g_ctx.config.depth_config.height,
+                    g_ctx.config.depth_config.pixel_format, g_ctx.config.depth_config.fps,
+                    g_ctx.config.gray_config.pixel_format, g_ctx.config.gray_config.fps);
+    }
+
+    if (!opened) {
+        delete src;
+        return false;
+    }
+    
+    if (!src->start()) {          // ← 补上这一步，之前漏掉了
+        delete src;
+        return false;
+    }
+
+    g_ctx.videoPaths[uvcId] = path;
+    g_ctx.videos[uvcId] = src;
+    return true;
 }
 
 static bool probeDeviceCapabilities(const std::string& devicePath, int deviceIndex, 
@@ -1656,68 +1736,70 @@ static void deliverFrame(int uvcId, uint8_t* data, size_t size, const FrameInfo&
 
 static void videoThreadFunc(int uvcId) {
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hrCo) && hrCo != S_FALSE) {
-        printf("[SDK] videoThreadFunc(%d): CoInitializeEx failed hr=0x%08lx\n", uvcId, hrCo);
-        return;
-    }
-    if (uvcId < 0 || uvcId >= UVC_NUM) {
-        return;
-    }
+    if (FAILED(hrCo) && hrCo != S_FALSE) return;
 
-    MFVideoSource* src = g_ctx.videos[uvcId];
+    int reconnect_fails = 0;
 
-    if (!src) {
-        return;
-    }
+    auto stillWanted = [&]() -> bool {
+        if (!g_ctx.running) return false;
+        if (uvcId == RGB_UVC_ID) return g_ctx.cam_running[RGB_CAM_ID];
+        return g_ctx.cam_running[GRAY_CAM_ID] || g_ctx.cam_running[DEPTH_CAM_ID];
+    };
 
-    printf("[SDK] Video thread started: UVC=%d path=%s\n", uvcId, g_ctx.videoPaths[uvcId].c_str());
-    // =====================================================
-    // RGB UVC
-    // =====================================================
-    if (uvcId == RGB_UVC_ID) {
-        while (g_ctx.running && g_ctx.cam_running[RGB_CAM_ID] && src->isRunning()) {
-            uint8_t* data = nullptr;
-            size_t size = 0;
-            FrameInfo info{};
-
-            if (src->readFrame(0, data, size, info)) {
-                deliverFrame( uvcId, data, size, info);
-                delete[] data;
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    while (stillWanted()) {
+        // ---- 设备没打开 / 上次断开了：尝试（重新）打开 ----
+        if (!g_ctx.videos[uvcId]) {
+            if (!openVideoSourceForSlot(uvcId)) {
+                reconnect_backoff_apply("VIDEO", uvcId, &reconnect_fails, "open failed");
+                continue;
             }
+            reconnect_fails = 0;
+            printf("[SDK] Video device %d (re)connected\n", uvcId);
         }
-    }
-    // =====================================================
-    // MI_00 Composite UVC
-    //
-    // Stream 0 = Depth
-    // Stream 1 = Gray
-    // =====================================================
-    else if (uvcId == COMPOSITE_UVC_ID) {
-        while (g_ctx.running && (g_ctx.cam_running[GRAY_CAM_ID] || g_ctx.cam_running[DEPTH_CAM_ID]) && src->isRunning()) {
+
+        // ---- 正常读帧循环（跟原来一样，只是把"检测到设备断开"的处理方式从
+        //      "线程退出"改成"清理掉 source、break 回外层重连循环"）----
+        MFVideoSource* src = g_ctx.videos[uvcId];
+        while (stillWanted() && src->isRunning()) {
             uint8_t* data = nullptr;
             size_t size = 0;
             FrameInfo info{};
-            DWORD actualStream = MF_SOURCE_READER_ANY_STREAM;
 
-            bool gotFrame = src->readFrame(MF_SOURCE_READER_ANY_STREAM, data, size, info, &actualStream);
-
-            if (gotFrame) {
-                if (actualStream == DEPTH_STREAM_ID && g_ctx.cam_running[DEPTH_CAM_ID]) {
+            if (uvcId == RGB_UVC_ID) {
+                if (src->readFrame(0, data, size, info)) {
                     deliverFrame(uvcId, data, size, info);
-                } else if (actualStream == GRAY_STREAM_ID && g_ctx.cam_running[GRAY_CAM_ID]) {
-                    deliverFrame(uvcId, data, size, info);
+                    delete[] data;
+                } else if (!src->isRunning()) {
+                    break;   // readFrame 内部检测到设备已失效（running_=false），跳出内层循环去重连
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
-                delete[] data;
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                DWORD actualStream = MF_SOURCE_READER_ANY_STREAM;
+                if (src->readFrame(MF_SOURCE_READER_ANY_STREAM, data, size, info, &actualStream)) {
+                    if ((actualStream == DEPTH_STREAM_ID && g_ctx.cam_running[DEPTH_CAM_ID]) ||
+                        (actualStream == GRAY_STREAM_ID && g_ctx.cam_running[GRAY_CAM_ID])) {
+                        deliverFrame(uvcId, data, size, info);
+                    }
+                    delete[] data;
+                } else if (!src->isRunning()) {
+                    break;
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
             }
+        }
+
+        // ---- 走到这里说明内层循环退出了：要么是用户主动停止（stillWanted()==false，
+        //      外层 while 也会退出），要么是设备掉线（src->isRunning()==false，需要清掉重连）----
+        if (g_ctx.videos[uvcId]) {
+            delete g_ctx.videos[uvcId];
+            g_ctx.videos[uvcId] = nullptr;
         }
     }
 
-    printf("[SDK] Video thread stopped: UVC=%d\n", uvcId);
     CoUninitialize();
+    printf("[SDK] Video thread exited: UVC=%d\n", uvcId);
 }
 
 static void hidThreadFunc(int idx) {

@@ -1241,10 +1241,10 @@ static void *capture_thread(void *arg) {
                 pthread_mutex_unlock(&ctx->fd_lock);
                 reconnect_backoff_apply("CAM", ctx->cam_id, &reconnect_fails, "open failed",
                                          &g_ctx.cam_running[ctx->cam_id]);
-                stop_metadata_capture(ctx->meta_fd);
-                close(ctx->meta_fd);
-                ctx->meta_fd = -1;
-                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
+                // stop_metadata_capture(ctx->meta_fd);
+                // close(ctx->meta_fd);
+                // ctx->meta_fd = -1;
+                // free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 continue;
             }
             if (init_capture(ctx) < 0) {

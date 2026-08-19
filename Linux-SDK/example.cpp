@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <thread>
 #include <vector>
+#include <time.h>
 
 static volatile int keep_running = 1;
 static pthread_mutex_t g_sdk_op_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -72,6 +73,8 @@ static int vio_status_raw = -1;
 
 static int gray_fps_state = 0;
 static const int GRAY_FPS_VALUES[] = {20, 30, 40, 50, 60};
+
+static volatile uint64_t last_image_time_per_cam[3] = {0, 0, 0};
 
 // ==================== Display / depth-to-RGB alignment ====================
 // Grid layout (single fixed window):
@@ -166,6 +169,12 @@ static const char* vio_status_to_string(VioStatus status) {
     }
 }
 
+static uint64_t get_tick_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
 static void maybe_print_img_stats_locked(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -236,6 +245,8 @@ static void update_hid_stats(struct hid_stats *s, uint64_t ts) {
 void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
                  unsigned int fmt, uint64_t ts, void *user) {
     if (cam_id < 0 || cam_id >= 3) return;
+
+    __sync_lock_test_and_set(&last_image_time_per_cam[cam_id], get_tick_ms());
 
     pthread_mutex_lock(&g_stats_lock);
     ensure_img_stats_initialized_locked();
@@ -432,62 +443,16 @@ static void camera_worker(int cam_id) {
     }
 }
 
-void* reconnect_worker(void* arg) {
-    while (keep_running) {
-        sleep(10);
-        if (!keep_running) break;
-        
-        pthread_mutex_lock(&g_sdk_op_lock);
-        if (insight9_receive_is_camera_running(0) == 0 &&
-            insight9_receive_is_camera_running(1) == 0 &&
-            insight9_receive_is_camera_running(2) == 0) {
-            printf("[ReconnectWorker] All cameras stopped, attempting reconnect...\n");
-            int fps = 0;
-            if (insight9_receive_get_current_fps(&fps) == 0) {
-                printf("Current FPS for gray camera: %d\n", fps);
-            } else {
-                printf("Failed to get current FPS for gray camera\n");
-            }
-            insight9_receive_stop();
-            insight9_receive_cleanup();
-           
-            insight9_config_t config_reinit;
-            config_reinit.rgb_config.width = 1088;
-            config_reinit.rgb_config.height = 1920;
-            config_reinit.rgb_config.fps = 30;
-            config_reinit.rgb_config.pixel_format = V4L2_PIX_FMT_MJPEG;
-            config_reinit.gray_config.width = 544;
-            config_reinit.gray_config.height = 1281;
-            config_reinit.gray_config.fps = fps;
-            config_reinit.gray_config.pixel_format = V4L2_PIX_FMT_GREY;
-            config_reinit.depth_config.width = 544;
-            config_reinit.depth_config.height = 642;
-            config_reinit.depth_config.fps = 30;
-            config_reinit.depth_config.pixel_format = V4L2_PIX_FMT_Z16;
-            
-            if (insight9_receive_init(&config_reinit) != 0) {
-                printf("[ReconnectWorker] SDK init failed\n");
-            } else {
-                insight9_receive_register_image_callback(my_image_cb, NULL);
-                insight9_receive_register_imu_callback(my_imu_cb, NULL);
-                insight9_receive_register_vio_callback(my_vio_cb, NULL);
-                
-                if (insight9_receive_start() != 0) {
-                    printf("[ReconnectWorker] SDK start failed\n");
-                    insight9_receive_cleanup();
-                } else {
-                    printf("[ReconnectWorker] SDK restarted successfully\n");
-                }
-            }
-        }
-        pthread_mutex_unlock(&g_sdk_op_lock);
-    }
-    insight9_receive_stop();
-    insight9_receive_cleanup();
-    return NULL;
-}
-
 void toggle_gray_camera_fps() {
+    uint64_t now = get_tick_ms();
+    uint64_t grayLast = last_image_time_per_cam[1];
+    const uint64_t kGrayStreamTimeoutMs = 3000;
+
+    if (grayLast == 0 || (now - grayLast) > kGrayStreamTimeoutMs) {
+        printf("[FPS] Gray camera has no active video stream, skip FPS switch\n");
+        return;
+    }
+
     int new_fps = GRAY_FPS_VALUES[gray_fps_state];
     printf("new_fps = %d | gray_fps_state = %d\n", new_fps, gray_fps_state);
     gray_fps_state = (gray_fps_state + 1) % 5;
@@ -630,8 +595,6 @@ int main() {
 
     printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type());
     
-    pthread_t reconnect_thread;
-    pthread_create(&reconnect_thread, NULL, reconnect_worker, NULL);
     pthread_t fps_switch_thread;
     pthread_create(&fps_switch_thread, NULL, fps_switch_worker, NULL);
 
@@ -712,7 +675,6 @@ int main() {
     }
     cv::destroyAllWindows();
 
-    pthread_join(reconnect_thread, NULL);
     pthread_join(fps_switch_thread, NULL);
 
     insight9_receive_stop();

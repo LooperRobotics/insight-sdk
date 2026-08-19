@@ -154,6 +154,8 @@ static std::mutex g_imuStateMutex;
 static float g_lastAx = 0, g_lastAy = 0, g_lastAz = 0;
 static float g_lastGx = 0, g_lastGy = 0, g_lastGz = 0;
 static uint64_t g_lastAccelTs = 0, g_lastGyroTs = 0;
+static bool g_accelDirty = false;
+static bool g_gyroDirty = false;
 
 // ==================== HID Report Structures ====================
 #pragma pack(push, 1)
@@ -1648,6 +1650,8 @@ public:
             ts_device = unwrapImuDeviceTimestamp(isAccel_, tick32);
         }
 
+        std::lock_guard<std::mutex> lk(g_imuStateMutex);
+
         if (isAccel_) {
             double ax = 0, ay = 0, az = 0;
             if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ACCELERATION_X_G, &var))) {
@@ -1660,11 +1664,12 @@ public:
                 PropVariantToDouble(var, &az); PropVariantClear(&var);
             }
             constexpr double G_TO_MS2 = 9.80665;
-            std::lock_guard<std::mutex> lk(g_imuStateMutex);
+            // std::lock_guard<std::mutex> lk(g_imuStateMutex);
             g_lastAx = (float)(ax * G_TO_MS2);
             g_lastAy = (float)(ay * G_TO_MS2);
             g_lastAz = (float)(az * G_TO_MS2);
             g_lastAccelTs = ts_device;
+            g_accelDirty = true;
         } else {
             double gx = 0, gy = 0, gz = 0;
             if (SUCCEEDED(pReport->GetSensorValue(SENSOR_DATA_TYPE_ANGULAR_VELOCITY_X_DEGREES_PER_SECOND, &var))) {
@@ -1677,19 +1682,23 @@ public:
                 PropVariantToDouble(var, &gz); PropVariantClear(&var);
             }
             constexpr double DEG_TO_RAD = 3.14159265358979 / 180.0;
-            std::lock_guard<std::mutex> lk(g_imuStateMutex);
+            // std::lock_guard<std::mutex> lk(g_imuStateMutex);
             g_lastGx = (float)(gx * DEG_TO_RAD);
             g_lastGy = (float)(gy * DEG_TO_RAD);
             g_lastGz = (float)(gz * DEG_TO_RAD);
             g_lastGyroTs = ts_device;
+            g_gyroDirty = true;
         }
 
-        if (g_ctx.imuCb) {
-            std::lock_guard<std::mutex> lk(g_imuStateMutex);
-            g_ctx.imuCb(g_lastAx, g_lastAy, g_lastAz,
-                        g_lastGx, g_lastGy, g_lastGz,
-                        isAccel_ ? g_lastAccelTs : g_lastGyroTs,
-                        g_ctx.imuUser);
+        if (g_accelDirty && g_gyroDirty) {
+            if (g_ctx.imuCb) {
+                g_ctx.imuCb(g_lastAx, g_lastAy, g_lastAz,
+                            g_lastGx, g_lastGy, g_lastGz,
+                            (g_lastAccelTs > g_lastGyroTs) ? g_lastAccelTs : g_lastGyroTs,
+                            g_ctx.imuUser);
+            }
+            g_accelDirty = false;
+            g_gyroDirty = false;
         }
         return S_OK;
     }

@@ -422,16 +422,12 @@ static void refresh_video_device_path(int cam_id) {
     if (cam_id < 0 || cam_id >= CAM_NUM) return;
     printf("[CAM%d] Current device path: %s\n", cam_id, g_ctx.video_devs[cam_id]);
 
+    char new_dev[MAX_PATH] = {0};
     char uvc_list[10][MAX_PATH] = {{0}};
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
-    if (uvc_count < CAM_NUM) {
-        printf("[CAM%d] Found %d UVC devices, fewer than %d; skipping reconnect\n", cam_id, uvc_count, CAM_NUM);
-        return;
-    } else {
-        printf("[CAM%d] Found %d UVC devices, trying to match...\n", cam_id, uvc_count);
-        for (int i = 0; i < uvc_count; ++i) {
-            printf("  [%d] %s\n", i, uvc_list[i]);
-        }
+    if (cam_id >= uvc_count) {
+        printf("[CAM%d] Not enumerated yet (found %d), skip this round\n", cam_id, uvc_count);
+        return;   // 只是这一路暂时还没找到，不代表别的路也不能重连，保留旧路径等下一次重试
     }
 
     // Prefer format-based matching and choose the first device that supports the current camera format.
@@ -439,7 +435,19 @@ static void refresh_video_device_path(int cam_id) {
         if (video_device_supports_format(uvc_list[i], g_ctx.cams[cam_id].width,
                                          g_ctx.cams[cam_id].height,
                                          g_ctx.cams[cam_id].format)) {
+            strcpy(new_dev, uvc_list[i]);
             if (strcmp(uvc_list[i], g_ctx.video_devs[cam_id]) != 0) {
+                if (cam_id == 0) {
+                    pthread_mutex_lock(&g_ctx.xu_mutex);
+                    if (g_ctx.xu_control) {
+                        g_ctx.xu_control->close();
+                        delete g_ctx.xu_control;
+                        g_ctx.xu_control = nullptr;
+                        g_ctx.xu_ready = false;
+                        g_ctx.xu_dev_path[0] = '\0';
+                    }
+                    pthread_mutex_unlock(&g_ctx.xu_mutex);
+                }
                 printf("[CAM%d] Rematched device path: %s -> %s (format match)\n", cam_id,
                        g_ctx.video_devs[cam_id], uvc_list[i]);
                 strcpy(g_ctx.video_devs[cam_id], uvc_list[i]);
@@ -466,6 +474,29 @@ static void refresh_video_device_path(int cam_id) {
         return;
     }
 
+    // 使用 uvc_list[index] 作为新路径
+    const char *new_path = uvc_list[index];
+    if (cam_id == 0 && strcmp(new_path, g_ctx.video_devs[0]) != 0) {
+        pthread_mutex_lock(&g_ctx.xu_mutex);
+        if (g_ctx.xu_control) {
+            g_ctx.xu_control->close();
+            delete g_ctx.xu_control;
+            g_ctx.xu_control = nullptr;
+            g_ctx.xu_ready = false;
+            g_ctx.xu_dev_path[0] = '\0';
+        }
+        pthread_mutex_unlock(&g_ctx.xu_mutex);
+    }
+
+    if (strcmp(new_path, g_ctx.video_devs[cam_id]) != 0) {
+        printf("[CAM%d] Rematched device path: %s -> %s (index fallback)\n", cam_id,
+            g_ctx.video_devs[cam_id], new_path);
+        strcpy(g_ctx.video_devs[cam_id], new_path);
+        if (get_video_usb_device_path(g_ctx.video_devs[cam_id], g_ctx.video_usb_paths[cam_id], MAX_PATH) < 0) {
+            g_ctx.video_usb_paths[cam_id][0] = '\0';
+        }
+    }
+
     if (strcmp(uvc_list[index], g_ctx.video_devs[cam_id]) != 0) {
         printf("[CAM%d] Rematched device path: %s -> %s (index fallback)\n", cam_id, 
                g_ctx.video_devs[cam_id], uvc_list[index]);
@@ -486,6 +517,65 @@ static void refresh_video_device_path(int cam_id) {
     }
 }
 
+static bool reopenXUControlLocked(const char* reason) {
+    const char* dev_path = g_ctx.video_devs[0];  // RGB 视频节点
+    if (dev_path[0] == '\0') {
+        fprintf(stderr, "[XU][ERR] Cannot reopen XU: RGB UVC path unavailable (%s)\n",
+                reason ? reason : "unknown");
+        return false;
+    }
+
+    if (g_ctx.xu_control) {
+        g_ctx.xu_control->close();
+        delete g_ctx.xu_control;
+        g_ctx.xu_control = nullptr;
+    }
+
+    g_ctx.xu_control = new viewer::UvcExtensionUnit();
+    if (!g_ctx.xu_control->open(dev_path)) {
+        fprintf(stderr, "[XU][WARN] Reopen failed on path: %s (%s)\n", dev_path, reason ? reason : "unknown");
+        delete g_ctx.xu_control;
+        g_ctx.xu_control = nullptr;
+        g_ctx.xu_dev_path[0] = '\0';
+        g_ctx.xu_ready = false;
+        return false;
+    }
+
+    strcpy(g_ctx.xu_dev_path, dev_path);
+    g_ctx.xu_ready = true;
+    printf("[XU] Reopen success on %s (%s)\n", dev_path, reason ? reason : "unknown");
+    return true;
+}
+
+template<typename Func>
+static bool callXUWithRetry(const char* op, Func fn) {
+    pthread_mutex_lock(&g_ctx.xu_mutex);
+
+    // 若 XU 未就绪，先重建
+    if (!g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
+        if (!reopenXUControlLocked(op)) {
+            pthread_mutex_unlock(&g_ctx.xu_mutex);
+            return false;
+        }
+    }
+
+    bool success = fn(*g_ctx.xu_control);
+    if (success) {
+        pthread_mutex_unlock(&g_ctx.xu_mutex);
+        return true;
+    }
+
+    // 失败后重开并重试一次
+    fprintf(stderr, "[XU][WARN] Operation '%s' failed; reopening XU and retrying once\n", op ? op : "unknown");
+    if (!reopenXUControlLocked(op)) {
+        pthread_mutex_unlock(&g_ctx.xu_mutex);
+        return false;
+    }
+
+    success = fn(*g_ctx.xu_control);
+    pthread_mutex_unlock(&g_ctx.xu_mutex);
+    return success;
+}
 
 // ==================== V4L2 Operations ====================
 static void print_camera_info(int fd) {
@@ -1079,29 +1169,29 @@ static void safe_cleanup_camera(struct cam_ctx *ctx) {
 }
 
 // ==================== Extension Unit Helpers ====================
-static int ensure_xu_available() {
-    if (!g_ctx.xu_control) {
-        // Try to recreate the extension unit.
-        if (g_ctx.video_devs[0][0] == '\0') return -1;
-        g_ctx.xu_control = new viewer::UvcExtensionUnit();
-        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-            delete g_ctx.xu_control;
-            g_ctx.xu_control = nullptr;
-            g_ctx.xu_ready = false;
-            return -1;
-        }
-        g_ctx.xu_ready = true;
-    } else if (!g_ctx.xu_control->isOpen()) {
-        // The extension unit exists but is closed; try to reopen it because the path may have changed.
-        g_ctx.xu_control->close();
-        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-            g_ctx.xu_ready = false;
-            return -1;
-        }
-        g_ctx.xu_ready = true;
-    }
-    return 0;
-}
+// static int ensure_xu_available() {
+//     if (!g_ctx.xu_control) {
+//         // Try to recreate the extension unit.
+//         if (g_ctx.video_devs[0][0] == '\0') return -1;
+//         g_ctx.xu_control = new viewer::UvcExtensionUnit();
+//         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+//             delete g_ctx.xu_control;
+//             g_ctx.xu_control = nullptr;
+//             g_ctx.xu_ready = false;
+//             return -1;
+//         }
+//         g_ctx.xu_ready = true;
+//     } else if (!g_ctx.xu_control->isOpen()) {
+//         // The extension unit exists but is closed; try to reopen it because the path may have changed.
+//         g_ctx.xu_control->close();
+//         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
+//             g_ctx.xu_ready = false;
+//             return -1;
+//         }
+//         g_ctx.xu_ready = true;
+//     }
+//     return 0;
+// }
 
 static int is_camera_params_valid(const camera_params *params) {
     // Validate resolution index. RGB uses 0-3 and grayscale uses 0-1; the SDK uses the more permissive 0-3 range.
@@ -1218,6 +1308,7 @@ static void *capture_thread(void *arg) {
             ctx->meta_fd = open(g_ctx.metadata_devs[ctx->cam_id], O_RDWR | O_NONBLOCK);
             if (ctx->meta_fd < 0) {
                 fprintf(stderr, "[CAM%d][META][ERR] open failed: %s\n", ctx->cam_id, strerror(errno));
+                pthread_mutex_unlock(&ctx->fd_lock);
                 usleep(500000);
                 continue;
             }
@@ -1225,6 +1316,7 @@ static void *capture_thread(void *arg) {
                 fprintf(stderr, "[CAM%d][META][ERR] init/start failed\n", ctx->cam_id);
                 close(ctx->meta_fd);
                 ctx->meta_fd = -1;
+                pthread_mutex_unlock(&ctx->fd_lock);
                 usleep(500000);
                 continue;
             }
@@ -1277,6 +1369,11 @@ static void *capture_thread(void *arg) {
             reconnect_fails = 0;   // reconnected successfully; reset backoff
             pthread_mutex_unlock(&ctx->fd_lock);
             printf("[CAM%d] device reinitialized\n", ctx->cam_id);
+            if (ctx->cam_id == 0) {
+                pthread_mutex_lock(&g_ctx.xu_mutex);
+                reopenXUControlLocked("RGB video reconnect");
+                pthread_mutex_unlock(&g_ctx.xu_mutex);
+            }
             frame_count = 0;
         }
 
@@ -1545,6 +1642,9 @@ int insight9_receive_init(const insight9_config_t* config) {
         }
     }
 
+    pthread_mutex_init(&g_ctx.xu_mutex, NULL);
+    g_ctx.xu_dev_path[0] = '\0';
+
     if (g_ctx.video_devs[0][0] != '\0') {
         g_ctx.xu_control = new viewer::UvcExtensionUnit();
         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
@@ -1633,6 +1733,9 @@ int insight9_receive_init_default(void) {
         g_ctx.cams[i].fd = -1;
     }
 
+    pthread_mutex_init(&g_ctx.xu_mutex, NULL);
+    g_ctx.xu_dev_path[0] = '\0';
+
     if (g_ctx.video_devs[0][0] != '\0') {
         g_ctx.xu_control = new viewer::UvcExtensionUnit();
         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
@@ -1672,6 +1775,10 @@ int insight9_receive_start(void) {
         clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
         pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
     }
+
+    pthread_mutex_lock(&g_ctx.xu_mutex);
+    reopenXUControlLocked("camera start");
+    pthread_mutex_unlock(&g_ctx.xu_mutex);
 
     hid_init();
 
@@ -1950,11 +2057,14 @@ void insight9_receive_cleanup(void) {
         }
     }
 
+    pthread_mutex_lock(&g_ctx.xu_mutex);
     if (g_ctx.xu_control) {
         g_ctx.xu_control->close();
         delete g_ctx.xu_control;
         g_ctx.xu_control = nullptr;
     }
+    pthread_mutex_unlock(&g_ctx.xu_mutex);
+    pthread_mutex_destroy(&g_ctx.xu_mutex);
 
     g_ctx.initialized = 0;
     printf("[SDK] cleaned up\n");
@@ -2049,49 +2159,55 @@ int insight9_receive_get_device_capability_by_index(int cam_id, int index, Devic
 extern "C" {
 
 int insight9_receive_set_active_camera(int cam_id) {
-    if (ensure_xu_available() != 0) return -1;
-    return g_ctx.xu_control->setActiveCamera(static_cast<uint8_t>(cam_id)) ? 0 : -1;
+    return callXUWithRetry("setActiveCamera", [cam_id](viewer::UvcExtensionUnit& xu) {
+        return xu.setActiveCamera(static_cast<uint8_t>(cam_id));
+    }) ? 0 : -1;
 }
 
 int insight9_receive_get_active_camera(int *cam_id) {
     if (!cam_id) return -1;
-    if (ensure_xu_available() != 0) return -1;
-    uint8_t val;
-    if (!g_ctx.xu_control->getActiveCamera(val)) return -1;
+    uint8_t val = 0;
+    if (!callXUWithRetry("getActiveCamera", [&val](viewer::UvcExtensionUnit& xu) {
+            return xu.getActiveCamera(val);
+        })) return -1;
     *cam_id = val;
     return 0;
 }
 
 int insight9_receive_set_camera_params(const camera_params *params) {
     if (!params || !is_camera_params_valid(params)) return -1;
-    if (ensure_xu_available() != 0) return -1;
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(viewer::camera_params));
-    return g_ctx.xu_control->writeCurrentCameraParams(xu_params) ? 0 : -1;
+    return callXUWithRetry("writeCurrentCameraParams", [xu_params](viewer::UvcExtensionUnit& xu) {
+        return xu.writeCurrentCameraParams(xu_params);
+    }) ? 0 : -1;
 }
 
 int insight9_receive_get_camera_params(camera_params *params) {
     if (!params) return -1;
-    if (ensure_xu_available() != 0) return -1;
     viewer::camera_params xu_params;
-    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) return -1;
+    if (!callXUWithRetry("readCurrentCameraParams", [&xu_params](viewer::UvcExtensionUnit& xu) {
+            return xu.readCurrentCameraParams(xu_params);
+        })) return -1;
     memcpy(params, &xu_params, sizeof(viewer::camera_params));
     return 0;
 }
 
 int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
     if (!params || !is_camera_params_valid(params)) return -1;
-    if (ensure_xu_available() != 0) return -1;
     viewer::camera_params xu_params;
     memcpy(&xu_params, params, sizeof(viewer::camera_params));
-    return g_ctx.xu_control->writeCameraParams(static_cast<uint8_t>(cam_id), xu_params) ? 0 : -1;
+    return callXUWithRetry("writeCameraParams", [cam_id, xu_params](viewer::UvcExtensionUnit& xu) {
+        return xu.writeCameraParams(static_cast<uint8_t>(cam_id), xu_params);
+    }) ? 0 : -1;
 }
 
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
     if (!params) return -1;
-    if (ensure_xu_available() != 0) return -1;
     viewer::camera_params xu_params;
-    if (!g_ctx.xu_control->readCameraParams(static_cast<uint8_t>(cam_id), xu_params)) return -1;
+    if (!callXUWithRetry("readCameraParams", [cam_id, &xu_params](viewer::UvcExtensionUnit& xu) {
+            return xu.readCameraParams(static_cast<uint8_t>(cam_id), xu_params);
+        })) return -1;
     memcpy(params, &xu_params, sizeof(viewer::camera_params));
     return 0;
 }
@@ -2114,9 +2230,10 @@ int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib) {
     static_assert(sizeof(camera_calib) == sizeof(viewer::camera_calib),
                   "camera_calib layout mismatch between C API and UVC payload");
     if (!calib || cam_idx < 0 || cam_idx >= viewer::kCalibCamCount) return -1;
-    if (ensure_xu_available() != 0) return -1;
     viewer::camera_calib xu_calib;
-    if (!g_ctx.xu_control->readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib)) return -1;
+    if (!callXUWithRetry("readCameraCalib", [cam_idx, &xu_calib](viewer::UvcExtensionUnit& xu) {
+            return xu.readCameraCalib(static_cast<uint8_t>(cam_idx), xu_calib);
+        })) return -1;
     memcpy(calib, &xu_calib, sizeof(camera_calib));
     return 0;
 }
@@ -2271,9 +2388,10 @@ int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
 
 int insight9_receive_get_current_fps(int* fps) {
     if (!fps) return -1;
-    if (ensure_xu_available() != 0) return -1;
-    uint8_t val;
-    if (!g_ctx.xu_control->readCurrentFps(val)) return -1;
+    uint8_t val = 0;
+    if (!callXUWithRetry("readCurrentFps", [&val](viewer::UvcExtensionUnit& xu) {
+            return xu.readCurrentFps(val);
+        })) return -1;
     const int validFps[] = {0, 20, 30, 40, 50};
     if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
         *fps = validFps[val];
@@ -2285,9 +2403,10 @@ int insight9_receive_get_current_fps(int* fps) {
 
 int insight9_receive_get_vio_status(int* status) {
     if (!status) return -1;
-    if (ensure_xu_available() != 0) return -1;
-    uint8_t val;
-    if (!g_ctx.xu_control->readVioStatus(val)) return -1;
+    uint8_t val = 0;
+    if (!callXUWithRetry("readVioStatus", [&val](viewer::UvcExtensionUnit& xu) {
+            return xu.readVioStatus(val);
+        })) return -1;
     *status = val;
     return 0;
 }
@@ -2295,15 +2414,10 @@ int insight9_receive_get_vio_status(int* status) {
 const char* insight9_receive_get_hardware_type(void) {
     static std::string result;
     viewer::camera_params xu_params;
-    
-    if (!g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
-        return "unknown";
-    }
-    
-    if (!g_ctx.xu_control->readCurrentCameraParams(xu_params)) {
-        return "unknown";
-    }
-    
+    bool ok = callXUWithRetry("getHardwareType", [&xu_params](viewer::UvcExtensionUnit& xu) {
+        return xu.readCurrentCameraParams(xu_params);
+    });
+    if (!ok) return "unknown";
     uint8_t model = xu_params.hardware_model;
     const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
     if (model < 4) {

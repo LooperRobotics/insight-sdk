@@ -19,6 +19,9 @@
 #define GYRO_SCALE_LOOPERHUB 0.00106526
 #define ACCEL_SCALE_LOOPERHUB 0.0035913
 
+#define HID_RECONNECT_BACKOFF_BASE_MS 500
+#define HID_RECONNECT_BACKOFF_MAX_MS  10000
+
 extern sdk_ctx_t g_ctx;
 
 static void trim_newline(char *str) {
@@ -221,9 +224,7 @@ void refresh_hid_device_path(int idx) {
 
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
-    if (hid_count < HID_NUM) {
-        fprintf(stderr, "[HID%d][WARN] found %d HID devices (< %d), skip reconnect\n",
-                idx, hid_count, HID_NUM);
+    if (idx >= hid_count) {
         return;
     }
 
@@ -237,10 +238,19 @@ void refresh_hid_device_path(int idx) {
     }
 }
 
+static int hid_reconnect_backoff_ms(int attempt) {
+    if (attempt < 1) attempt = 1;
+    long delay = HID_RECONNECT_BACKOFF_BASE_MS;
+    for (int i = 1; i < attempt && delay < HID_RECONNECT_BACKOFF_MAX_MS; ++i) delay <<= 1;
+    if (delay > HID_RECONNECT_BACKOFF_MAX_MS) delay = HID_RECONNECT_BACKOFF_MAX_MS;
+    return (int)delay;
+}
+
 void *hid_thread(void *arg) {
     int idx = (int)(intptr_t)arg;
     const char *device = g_ctx.hid_devs[idx];
     int fd = -1;
+    int reconnect_fails = 0;
     uint64_t accel_ts = 0;
     uint64_t gyro_ts = 0;
     uint64_t last_accel_ts = 0;
@@ -248,24 +258,40 @@ void *hid_thread(void *arg) {
     uint64_t last_imu_ts = 0;
     float last_ax = 0, last_ay = 0, last_az = 0;
     float last_gx = 0, last_gy = 0, last_gz = 0;
+    int accel_dirty = 0;
+    int gyro_dirty = 0;
 
     printf("[HID%d] thread started, dev=%s\n", idx, g_ctx.hid_devs[idx]);
-    while (!g_ctx.running) {usleep(100 * 000);}
+    while (!g_ctx.running) {usleep(100 * 1000);}
     while (g_ctx.running) {
         device = g_ctx.hid_devs[idx];
         if (fd < 0) {
             refresh_hid_device_path(idx);
             device = g_ctx.hid_devs[idx];
+
+            if (device[0] == '\0') {
+                int delay = hid_reconnect_backoff_ms(++reconnect_fails);
+                fprintf(stderr, "[HID%d][WARN] device not enumerated yet, retry in %dms (attempt %d)\n",
+                        idx, delay, reconnect_fails);
+                usleep(delay * 1000);
+                continue;
+            }
+
             fd = open(device, O_RDONLY | O_NONBLOCK);
             if (fd < 0) {
+                int delay = hid_reconnect_backoff_ms(++reconnect_fails);
                 if (errno != ENOENT)
-                    fprintf(stderr, "[HID%d][ERR] open %s: %s\n", idx, device, strerror(errno));
-                usleep(1000000);
+                    fprintf(stderr, "[HID%d][ERR] open %s: %s, retry in %dms (attempt %d)\n",
+                            idx, device, strerror(errno), delay, reconnect_fails);
+                usleep(delay * 1000);
                 continue;
             }
             printf("[HID%d] opened %s\n", idx, device);
+            reconnect_fails = 0;
             last_accel_ts = 0;
             last_gyro_ts = 0;
+            accel_dirty = 0;
+            gyro_dirty = 0;
         }
 
         if (!g_ctx.running) break;
@@ -314,12 +340,7 @@ void *hid_thread(void *arg) {
                 last_ax = (float)accel->accel_x / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
                 last_ay = (float)accel->accel_y / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
                 last_az = (float)accel->accel_z / ACCEL_SCALE_FACTOR * ACCEL_SCALE_LOOPERHUB;
-                if (g_ctx.imu_cb) {
-                    g_ctx.imu_cb(last_ax, last_ay, last_az,
-                                 last_gx, last_gy, last_gz,
-                                 accel_ts,
-                                 g_ctx.imu_userdata);
-                }
+                accel_dirty = 1;
             } else if (report_id == 0x02 && n >= (int)sizeof(struct imu_gyro_report_t)) {
                 struct imu_gyro_report_t *gyro = (struct imu_gyro_report_t*)buf;
                 gyro_ts = ((uint64_t)(gyro->timestamp_h & 0xffffffff) << 32) | 
@@ -331,12 +352,16 @@ void *hid_thread(void *arg) {
                 last_gx = (float)gyro->gyro_x / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
                 last_gy = (float)gyro->gyro_y / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
                 last_gz = (float)gyro->gyro_z / GYRO_SCALE_FACTOR * GYRO_SCALE_LOOPERHUB;
+                gyro_dirty = 1;
+            }
+
+            if (accel_dirty && gyro_dirty) {
                 if (g_ctx.imu_cb) {
-                    g_ctx.imu_cb(last_ax, last_ay, last_az,
-                                 last_gx, last_gy, last_gz,
-                                 gyro_ts,
-                                 g_ctx.imu_userdata);
+                    uint64_t ts = (last_accel_ts > last_gyro_ts) ? last_accel_ts : last_gyro_ts;
+                    g_ctx.imu_cb(last_ax, last_ay, last_az, last_gx, last_gy, last_gz, ts, g_ctx.imu_userdata);
                 }
+                accel_dirty = 0;
+                gyro_dirty = 0;
             }
         } else {
             struct vio_hid_payload payload;

@@ -32,6 +32,8 @@ typedef struct {
     // Initialization flag
     int initialized;
     viewer::UvcExtensionUnit *xu_control;
+    char xu_dev_path[MAX_PATH];
+    pthread_mutex_t xu_mutex;
     std::atomic<bool> xu_ready;
 } sdk_ctx_t;
 

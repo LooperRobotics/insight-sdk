@@ -2712,6 +2712,18 @@ int insight9_receive_restart_camera(int cam_id) {
     return 0;
 }
 
+int insight9_receive_set_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id > 2) return -1;
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.fps = fps;
+        SDK_LOG_INFO("[SDK] Set RGB FPS to %d", fps);
+    } else {
+        g_ctx.config.gray_config.fps = fps;
+        SDK_LOG_INFO("[SDK] Set Gray/Depth composite FPS to %d", fps);
+    }
+    return 0;
+}
+
 int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= UVC_NUM || fps <= 0) return -1;
 
@@ -2730,6 +2742,58 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
         SDK_LOG_INFO("[SDK] Camera %d switched to %d FPS successfully", cam_id, fps);
     } else {
         SDK_LOG_ERROR("[SDK] Failed to restart camera %d after FPS switch", cam_id);
+    }
+    return ret;
+}
+
+int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format) {
+    if (!g_ctx.initialized) return -1;
+    if (width <= 0 || height <= 0) return -1;
+
+    if (cam_id == RGB_CAM_ID) {
+        g_ctx.config.rgb_config.width = width;
+        g_ctx.config.rgb_config.height = height;
+        g_ctx.config.rgb_config.pixel_format = format;
+    } else if (cam_id == GRAY_CAM_ID || cam_id == DEPTH_CAM_ID) {
+        // Depth/Gray 共享同一组 width/height（MF 驱动限制），这里统一写两边，
+        // 避免下次 restart 时又触发"composite streams size mismatch"的兜底逻辑
+        g_ctx.config.gray_config.width = width;
+        g_ctx.config.gray_config.height = height;
+        g_ctx.config.depth_config.width = width;
+        g_ctx.config.depth_config.height = height;
+
+        if (cam_id == GRAY_CAM_ID) {
+            g_ctx.config.gray_config.pixel_format = format;
+        } else {
+            g_ctx.config.depth_config.pixel_format = format;
+        }
+    } else {
+        return -1;
+    }
+
+    SDK_LOG_INFO("[SDK] Set camera %d format to %dx%d", cam_id, width, height);
+    return 0;
+}
+
+int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+    if (width <= 0 || height <= 0) return -1;
+
+    SDK_LOG_INFO("[SDK] Switching camera %d to %dx%d...", cam_id, width, height);
+
+    insight9_receive_stop_camera(cam_id);
+    Sleep(3000);
+
+    if (insight9_receive_set_camera_format(cam_id, width, height, format) != 0) {
+        SDK_LOG_ERROR("[SDK] Failed to set camera %d format", cam_id);
+        return -1;
+    }
+
+    int ret = insight9_receive_restart_camera(cam_id);
+    if (ret == 0) {
+        SDK_LOG_INFO("[SDK] Camera %d switched to %dx%d successfully", cam_id, width, height);
+    } else {
+        SDK_LOG_ERROR("[SDK] Failed to restart camera %d after format switch", cam_id);
     }
     return ret;
 }
@@ -2824,18 +2888,6 @@ static int mapCamIdToStreamIndex(int cam_id) {
 const char* insight9_receive_get_video_dev(int cam_id) {
     int mapped = mapCompositeCamId(cam_id);
     return (mapped >= 0 && mapped < UVC_NUM) ? g_ctx.videoPaths[mapped].c_str() : nullptr;
-}
-
-int insight9_receive_set_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id > 2) return -1;
-    if (cam_id == 0) {
-        g_ctx.config.rgb_config.fps = fps;
-        SDK_LOG_INFO("[SDK] Set RGB FPS to %d", fps);
-    } else {
-        g_ctx.config.gray_config.fps = fps;
-        SDK_LOG_INFO("[SDK] Set Gray/Depth composite FPS to %d", fps);
-    }
-    return 0;
 }
 
 void insight9_receive_register_image_callback(image_callback cb, void *user) { 

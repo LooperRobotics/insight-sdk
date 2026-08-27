@@ -179,6 +179,31 @@ static int video_device_supports_format(const char *dev, int width, int height, 
     return fmt.fmt.pix.width == width && fmt.fmt.pix.height == height && fmt.fmt.pix.pixelformat == format;
 }
 
+static const char* pixel_format_to_string(PixelFormat pf) {
+    switch (pf) {
+        case PixelFormat::MJPEG: return "MJPEG";
+        case PixelFormat::GREY:  return "GREY";
+        case PixelFormat::Z16:   return "Z16";
+        case PixelFormat::YUYV:  return "YUYV";
+        case PixelFormat::NV12:  return "NV12";
+        case PixelFormat::Y8I:   return "Y8I";
+        case PixelFormat::RGB8:  return "RGB8";
+        default:                 return "Unknown";
+    }
+}
+
+static unsigned int pixelFormatToFourcc(PixelFormat pf) {
+    switch (pf) {
+        case PixelFormat::MJPEG: return V4L2_PIX_FMT_MJPEG;
+        case PixelFormat::GREY:  return V4L2_PIX_FMT_GREY;
+        case PixelFormat::Z16:   return V4L2_PIX_FMT_Z16;
+        case PixelFormat::YUYV:  return V4L2_PIX_FMT_YUYV;
+        case PixelFormat::NV12:  return V4L2_PIX_FMT_NV12;
+        case PixelFormat::Y8I:   return V4L2_PIX_FMT_Y8I;
+        default:                 return 0;
+    }
+}
+
 static int is_uvc_device(const char *video_dev) {
     int fd = open(video_dev, O_RDWR);
     if (fd < 0) return 0;
@@ -672,6 +697,22 @@ static int get_default_format(int fd, struct v4l2_format *fmt) {
     }
     printf("[CAM] VIDIOC_G_FMT failed\n");
     return -1;
+}
+
+static int find_default_fps_for(struct cam_ctx *ctx, uint32_t fourcc, int width, int height, int fallback_fps) {
+    if (!ctx->formats_info) return fallback_fps;
+    for (int f = 0; f < ctx->format_num; ++f) {
+        struct uvc_format_info *fmt = &ctx->formats_info[f];
+        if (fmt->fcc != fourcc) continue;
+        for (int r = 0; r < fmt->frames_num; ++r) {
+            struct uvc_frame_info *frame = &fmt->frames[r];
+            if (frame->width != (unsigned)width || frame->height != (unsigned)height) continue;
+            for (int iv = 0; iv < 8; ++iv) {
+                if (frame->intervals[iv] != 0) return (int)frame->intervals[iv];
+            }
+        }
+    }
+    return fallback_fps;
 }
 
 // 初始化捕获（从设备获取默认格式或使用指定格式）
@@ -1630,15 +1671,15 @@ int insight9_receive_init(const insight9_config_t* config) {
         if (i == 0) {
             g_ctx.cams[i].width = config->depth_config.width;
             g_ctx.cams[i].height = config->depth_config.height;
-            g_ctx.cams[i].format = config->depth_config.pixel_format;
+            g_ctx.cams[i].format = pixelFormatToFourcc(config->depth_config.pixel_format);
         } else if (i == 1) {
             g_ctx.cams[i].width = config->gray_config.width;
             g_ctx.cams[i].height = config->gray_config.height;
-            g_ctx.cams[i].format = config->gray_config.pixel_format;
+            g_ctx.cams[i].format = pixelFormatToFourcc(config->gray_config.pixel_format);
         } else if (i == 2) {
             g_ctx.cams[i].width = config->rgb_config.width;
             g_ctx.cams[i].height = config->rgb_config.height;
-            g_ctx.cams[i].format = config->rgb_config.pixel_format;
+            g_ctx.cams[i].format = pixelFormatToFourcc(config->rgb_config.pixel_format);
         }
     }
 
@@ -1719,7 +1760,7 @@ int insight9_receive_init_default(void) {
     }
 
     for (int i = 0; i < CAM_NUM; ++i) {
-        if (g_ctx.video_devs[i][0] == '\0') continue;
+    if (g_ctx.video_devs[i][0] == '\0') continue;
         int fd = open(g_ctx.video_devs[i], O_RDWR);
         if (fd < 0) {
             fprintf(stderr, "[CAM%d][WARN] open for format enum failed: %s\n", i, strerror(errno));
@@ -1729,6 +1770,31 @@ int insight9_receive_init_default(void) {
         if (get_camera_formats_info(&g_ctx.cams[i]) < 0) {
             fprintf(stderr, "[CAM%d][WARN] failed to get formats info during init\n", i);
         }
+
+        // 新增：拿驱动当前的真实默认分辨率/格式，并在能力表里找对应的默认帧率
+        struct v4l2_format v4l2fmt;
+        if (get_default_format(fd, &v4l2fmt) == 0) {
+            int w = v4l2fmt.fmt.pix.width;
+            int h = v4l2fmt.fmt.pix.height;
+            uint32_t fourcc = v4l2fmt.fmt.pix.pixelformat;
+            PixelFormat pf = fourccToPixelFormat(fourcc);
+            int defaultFps = find_default_fps_for(&g_ctx.cams[i], fourcc, w, h, 30);
+
+            video_config_t* target =
+                (i == 0) ? &g_ctx.config.rgb_config :
+                (i == 1) ? &g_ctx.config.gray_config :
+                        &g_ctx.config.depth_config;
+            target->width = w;
+            target->height = h;
+            target->pixel_format = pf;
+            target->fps = defaultFps;
+
+            printf("[CAM%d] Using device default: %dx%d@%d, format=%s\n",
+                i, w, h, defaultFps, pixel_format_to_string(pf));
+        } else {
+            fprintf(stderr, "[CAM%d][WARN] VIDIOC_G_FMT failed, keeping fallback config\n", i);
+        }
+
         close(fd);
         g_ctx.cams[i].fd = -1;
     }
@@ -1813,15 +1879,15 @@ int insight9_receive_start_camera(int cam_id) {
         if (cam_id == 0) {
             ctx->width = g_ctx.config.depth_config.width;
             ctx->height = g_ctx.config.depth_config.height;
-            ctx->format = g_ctx.config.depth_config.pixel_format;
+            ctx->format = pixelFormatToFourcc(g_ctx.config.depth_config.pixel_format);
         } else if (cam_id == 1) {
             ctx->width = g_ctx.config.gray_config.width;
             ctx->height = g_ctx.config.gray_config.height;
-            ctx->format = g_ctx.config.gray_config.pixel_format;
+            ctx->format = pixelFormatToFourcc(g_ctx.config.gray_config.pixel_format);
         } else {
             ctx->width = g_ctx.config.rgb_config.width;
             ctx->height = g_ctx.config.rgb_config.height;
-            ctx->format = g_ctx.config.rgb_config.pixel_format;
+            ctx->format = pixelFormatToFourcc(g_ctx.config.rgb_config.pixel_format);
         }
 
         if (init_capture(ctx) < 0) {
@@ -1955,6 +2021,23 @@ int insight9_receive_restart_camera(int cam_id) {
     return insight9_receive_start_camera(cam_id);
 }
 
+int insight9_receive_set_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (fps <= 0) return -1;
+    
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.fps = fps;
+    } else if (cam_id == 1) {
+        g_ctx.config.gray_config.fps = fps;
+    } else {
+        g_ctx.config.depth_config.fps = fps;
+    }
+    
+    printf("[SDK] Set camera %d FPS to %d\n", cam_id, fps);
+    return 0;
+}
+
 int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     if (!g_ctx.initialized) return -1;
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
@@ -1980,6 +2063,53 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps) {
         fprintf(stderr, "[SDK] Failed to restart camera %d after FPS switch\n", cam_id);
     }
     
+    return ret;
+}
+
+int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (width <= 0 || height <= 0) return -1;
+
+    if (cam_id == 0) {
+        g_ctx.config.rgb_config.width = width;
+        g_ctx.config.rgb_config.height = height;
+        g_ctx.config.rgb_config.pixel_format = format;
+    } else if (cam_id == 1) {
+        g_ctx.config.gray_config.width = width;
+        g_ctx.config.gray_config.height = height;
+        g_ctx.config.gray_config.pixel_format = format;
+    } else {
+        g_ctx.config.depth_config.width = width;
+        g_ctx.config.depth_config.height = height;
+        g_ctx.config.depth_config.pixel_format = format;
+    }
+
+    printf("[SDK] Set camera %d format to %dx%d\n", cam_id, width, height);
+    return 0;
+}
+
+int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format) {
+    if (!g_ctx.initialized) return -1;
+    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (width <= 0 || height <= 0) return -1;
+
+    printf("[SDK] Switching camera %d to %dx%d...\n", cam_id, width, height);
+
+    insight9_receive_stop_camera(cam_id);
+    usleep(1000000);
+
+    if (insight9_receive_set_camera_format(cam_id, width, height, format) != 0) {
+        fprintf(stderr, "[SDK] Failed to set camera %d format\n", cam_id);
+        return -1;
+    }
+
+    int ret = insight9_receive_restart_camera(cam_id);
+    if (ret == 0) {
+        printf("[SDK] Camera %d switched to %dx%d successfully\n", cam_id, width, height);
+    } else {
+        fprintf(stderr, "[SDK] Failed to restart camera %d after format switch\n", cam_id);
+    }
     return ret;
 }
 
@@ -2068,23 +2198,6 @@ void insight9_receive_cleanup(void) {
 
     g_ctx.initialized = 0;
     printf("[SDK] cleaned up\n");
-}
-
-int insight9_receive_set_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized) return -1;
-    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    if (fps <= 0) return -1;
-    
-    if (cam_id == 0) {
-        g_ctx.config.rgb_config.fps = fps;
-    } else if (cam_id == 1) {
-        g_ctx.config.gray_config.fps = fps;
-    } else {
-        g_ctx.config.depth_config.fps = fps;
-    }
-    
-    printf("[SDK] Set camera %d FPS to %d\n", cam_id, fps);
-    return 0;
 }
 
 void insight9_receive_register_image_callback(image_callback cb, void *userdata) {

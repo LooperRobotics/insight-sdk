@@ -773,7 +773,8 @@ int main() {
             Sleep(10000);
             
             if (keep_running) {
-                toggle_gray_camera_fps();
+                // toggle_gray_camera_fps();
+                // insight9_receive_switch_camera_format(0, 720, 1200, PixelFormat::NV12);
             }
         }
     });
@@ -795,11 +796,26 @@ int main() {
     const char* win_name = "Insight9 - L/R / Depth / RGB+AlignedDepth";
     cv::namedWindow(win_name, cv::WINDOW_AUTOSIZE);
 
+    // auto blit = [](cv::Mat& canvas, const cv::Mat& panel, const cv::Rect& roi) {
+    //     if (panel.empty()) return;
+    //     cv::Mat dst = canvas(roi);
+    //     cv::resize(panel, dst, dst.size());
+    // };
     auto blit = [](cv::Mat& canvas, const cv::Mat& panel, const cv::Rect& roi) {
-        if (panel.empty()) return;
-        cv::Mat dst = canvas(roi);
-        cv::resize(panel, dst, dst.size());
-    };
+    if (panel.empty()) return;
+    cv::Mat dst = canvas(roi);
+
+    // 保持长宽比缩放，多余部分留黑边，而不是直接拉伸变形
+    double scale = std::min((double)dst.cols / panel.cols, (double)dst.rows / panel.rows);
+    int newW = (int)(panel.cols * scale);
+    int newH = (int)(panel.rows * scale);
+    cv::Mat resized;
+    cv::resize(panel, resized, cv::Size(newW, newH));
+
+    dst.setTo(cv::Scalar(0, 0, 0));  // 先清空这块区域
+    cv::Mat sub = dst(cv::Rect((dst.cols - newW) / 2, (dst.rows - newH) / 2, newW, newH));
+    resized.copyTo(sub);
+};
 
     // One worker thread per stream (independent decoding + alignment).
     std::thread workers[3];

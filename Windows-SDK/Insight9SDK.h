@@ -239,6 +239,26 @@ int insight9_receive_restart_camera(int cam_id);
 int insight9_receive_switch_camera_fps(int cam_id, int fps);
 
 /**
+ * @brief Set the resolution/format for a specific camera (stored in config, requires restart to take effect).
+ * @param cam_id Camera ID.
+ * @param width  Target width.
+ * @param height Target height.
+ * @param format Target pixel format.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format);
+
+/**
+ * @brief Switch a specific camera to a new resolution/format and apply it immediately.
+ * @param cam_id Camera ID.
+ * @param width  Target width.
+ * @param height Target height.
+ * @param format Target pixel format.
+ * @return 0 on success, -1 on failure.
+ */
+int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format);
+
+/**
  * @brief Check if a camera is currently running.
  * @param cam_id Camera ID.
  * @return 1 if running, 0 otherwise.

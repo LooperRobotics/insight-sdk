@@ -1,551 +1,369 @@
-# Insight 9 SDK User Guide
+# Insight 9 SDK User Guide (Linux)
 
 ## 1. Overview
 
-The Insight 9 SDK is a dynamic library for capturing data from three UVC cameras (main MJPEG, left/right mono8) and two HID devices (IMU, VIO), and also provides control over camera parameters (exposure, gain, brightness, white balance, etc.) via the UVC extension unit.
+The Insight 9 Linux SDK provides a C/C++ interface for Looper Robotics Insight 9 devices. It captures three UVC image streams and two HID streams, exposes camera parameter control through the UVC extension unit, and delivers image/IMU/VIO data to the application through callbacks.
 
-The SDK automatically discovers devices with the specified VID/PID, selects appropriate devices after sorting by device number, and passes the captured image and sensor data to the application via callbacks. Camera parameter adjustment APIs allow real-time tuning of image quality.
+Current device matching uses:
 
-## 2. Features
+| Field | Value |
+|---|---|
+| VID | `0x3652` |
+| PID | `0x0b5c` |
 
-- **Automatic device discovery**: Finds UVC and HID devices based on VID=0x1d6b, PID=0x0104.
+## 2. Stream Model
 
-- **Intelligent selection**:  
-  - UVC: Sorts all matching video nodes numerically and selects indices 0, 2, 4 as the three cameras (initialization fails if less than 6 devices exist).  
-  - HID: Sorts matching hidraw nodes numerically, takes the first two; the smaller number is used for IMU, the larger for VIO.
+The SDK manages three logical cameras:
 
-- **Multi‑threaded capture**: Each device runs in its own thread without interference.
+| cam_id | Stream | Default format | Notes |
+|---|---|---|---|
+| 0 | Depth | `Z16` | Depth stream; final metadata rows should be excluded when processing 
+| 1 | Gray  | `GREY` or `Y8I` | Stereo grayscale stream |
+| 2 | RGB   | `MJPEG`, `YUYV` | Main RGB camera |depth |
 
-- **Hot‑plug support**: Automatically reconnects after device disconnection and resumes data streaming.
+The SDK also manages two HID streams:
 
-- **Callback mechanism**: Image, IMU, and VIO data are delivered to the application in real time.
+| Stream | Callback |
+|---|---|
+| IMU | `imu_callback` |
+| VIO pose | `vio_callback` |
 
-- **Extension Unit (XU) parameter control**: Full control over camera parameters including exposure, gain, brightness, contrast, gamma, hue, saturation, sharpness, white balance, and more.
+Image callback timestamps are provided in microseconds. Metadata device timestamps can also be read explicitly through `insight9_receive_read_metadata_timestamp()`.
 
-- **Simple API**: Only a few calls are needed to start/stop data acquisition and adjust camera settings.
+## 3. Features
 
-## 3. Dependencies
+- Automatic UVC and HID discovery by VID/PID.
+- Default initialization or custom per-camera stream configuration.
+- Callback delivery for RGB/gray/depth images, IMU samples, and VIO poses.
+- Per-camera start, stop, restart, FPS switching, and format switching.
+- Device capability enumeration for supported resolutions, frame rates, and formats.
+- UVC extension unit camera parameter control.
+- Factory calibration readout and depth-to-RGB alignment helper.
+- Hot-plug recovery for video/HID streams.
+- VIO status and hardware type query helpers.
 
-- **OS**: Linux (requires sysfs, V4L2, HIDRAW, UVC extension unit support)
+## 4. Dependencies
 
-- **Build**: gcc/g++, make, pthread library
+- Linux with V4L2, HIDRAW, sysfs, and UVC extension unit support.
+- CMake 3.10 or newer.
+- GCC/G++ with C++17 support.
+- pthreads.
+- OpenCV development package, required by the included `example`.
+- Runtime access to `/sys/class/video4linux`, `/sys/class/hidraw`, `/dev/video*`, and `/dev/hidraw*`.
 
-- **Runtime**: Access to `/sys/class/video4linux` and `/sys/class/hidraw`; read/write permissions for `/dev/video*` and `/dev/hidraw*`
-
-## 4. Building and Installation
-
-### 4.1 Build with CMake (Recommended)
+Install common dependencies on Ubuntu/Debian:
 
 ```bash
-# Clone or navigate to the SDK directory
-cd Insight_9_SDK
-
-# Create build directory
-mkdir build && cd build
-
-# Configure with CMake
-cmake ..
-
-# Build the library and example
-make -j$(nproc)
-
-# Run the example (requires root for device access)
-sudo ./example
+sudo apt update
+sudo apt install build-essential cmake libopencv-dev
 ```
 
-### 4.2 Manual Build (Alternative)
+If you do not run as root, make sure the user has access to the video and HID devices. Depending on your distribution, this usually means adding udev rules or adding the user to groups such as `video` and `plugdev`.
 
-Copy libinsight9.so and Insight_9_receive.h to system or project directories, e.g.:
+## 5. Build
+
+Build the SDK and example:
 
 ```bash
-sudo cp libinsight9.so /usr/local/lib/
-sudo cp Insight_9_receive.h /usr/local/include/
+cd Linux-SDK
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+Run the example:
+
+```bash
+sudo ./build/example
+```
+
+Install the shared library and headers:
+
+```bash
+sudo cmake --install build
 sudo ldconfig
 ```
 
-### 4.3 Build Options
+The build produces:
 
-CMake supports different build types:
+- `build/libinsight9.so`
+- `build/example`
 
-```bash
-# Release build (default, optimized)
-cmake -DCMAKE_BUILD_TYPE=Release ..
+## 6. API Reference
 
-# Debug build (with debug symbols)
-cmake -DCMAKE_BUILD_TYPE=Debug ..
+Include the SDK header:
 
-# Custom install prefix
-cmake -DCMAKE_INSTALL_PREFIX=/usr/local ..
-```
-
-### 4.4 Installation
-
-```bash
-# Install library and headers to system
-sudo make install
-
-# Update linker cache
-sudo ldconfig
-```
-
-## 5. API Reference
-### 5.1 Header
-c
+```cpp
 #include "Insight_9_receive.h"
+```
 
-### 5.2 Data Structures
+### 6.1 Pixel Formats and Configuration
 
-camera_params
-c
+```cpp
+enum class PixelFormat {
+    Unknown,
+    MJPEG,
+    GREY,
+    Z16,
+    RGB8,
+    Y8I,
+    YUYV,
+    YVYU,
+    NV12
+};
+
 typedef struct {
-    uint8_t cam_id;             // Camera ID (0: RGB, 1: Mono)
-    uint8_t resolution;         // Resolution index (RGB: 0-3, Mono: 0-1) Not enabled!!!
-    uint8_t frame_rate;         // Frame rate index (0-5: 90,60,30,20,15,10 fps) Not enabled!!!
-    float exposure_time;        // Exposure time (0.0 ~ 0.03 seconds)
-    float exposure_gain;        // Exposure gain (1.0 ~ 16.0)
-    uint8_t auto_exposure;      // Auto Exposure (0 ~ 1)
-    float brightness;           // Brightness (0.0 ~ 127.0)
-    float contrast;             // Contrast (0.0 ~ 1.9)
-    float gamma_dark;           // Gamma dark (1.0 ~ 4.0)
-    float hue;                  // Hue (0.0 ~ 87.0)
-    float saturation;           // Saturation (0.0 ~ 1.999)
-    uint8_t sharpness;          // Sharpness (1 ~ 255)
-    uint8_t auto_white_balance; // Auto white balance (0 or 1)
-    float white_balance;        // White balance (1.0 ~ 3.0)
-    uint8_t decimation;         // Decimation factor (1 ~ 255) Not enabled!!!
-    uint8_t rotation;           // Rotation (1 ~ 255) Not enabled!!!
+    int width;
+    int height;
+    int fps;
+    PixelFormat pixel_format;
+} video_config_t;
+
+typedef struct {
+    video_config_t rgb_config;
+    video_config_t gray_config;
+    video_config_t depth_config;
+} insight9_config_t;
+```
+
+Use `insight9_receive_init_default()` for the SDK defaults, or pass an `insight9_config_t` to `insight9_receive_init()`.
+
+### 6.2 Camera Parameters
+
+```cpp
+typedef struct {
+    uint8_t cam_id;
+    uint8_t resolution;
+    uint8_t frame_rate;
+    float exposure_time;
+    float exposure_gain;
+    uint8_t auto_exposure;
+    float brightness;
+    float contrast;
+    float gamma_dark;
+    float hue;
+    float saturation;
+    uint8_t sharpness;
+    uint8_t auto_white_balance;
+    float white_balance;
+    uint8_t decimation;
+    uint8_t hardware_model;
 } camera_params;
-Note: All fields are range-checked by the SDK before sending to the device. Invalid values will cause the set function to fail.
+```
 
-### 5.3 Callback Types
+Parameter ranges:
 
-Image callback
-c
+| Parameter | Min | Max | Notes |
+|---|---:|---:|---|
+| `exposure_time` | 0.0 | 0.03 | Seconds |
+| `exposure_gain` | 1.0 | 16.0 | Gain |
+| `auto_exposure` | 0 | 1 | Boolean |
+| `brightness` | 0.0 | 127.0 | Brightness |
+| `contrast` | 0.0 | 1.9 | Contrast |
+| `gamma_dark` | 1.0 | 4.0 | Gamma |
+| `hue` | 0.0 | 87.0 | Hue |
+| `saturation` | 0.0 | 1.999 | Saturation |
+| `sharpness` | 1 | 255 | Sharpness |
+| `auto_white_balance` | 0 | 1 | Boolean |
+| `white_balance` | 1.0 | 3.0 | White balance |
+| `decimation` | 1 | 255 | Decimation |
+| `hardware_model` | 0 | 3 | Hardware selector |
+
+Set functions validate values before sending them to the device.
+
+### 6.3 Calibration
+
+```cpp
+typedef struct {
+    camera_intrinsics intrinsics;
+    camera_extrinsics extrinsics;
+} camera_calib;
+
+enum {
+    INSIGHT9_CALIB_CAM_LEFT  = 0,
+    INSIGHT9_CALIB_CAM_RIGHT = 1,
+    INSIGHT9_CALIB_CAM_RGB   = 2,
+};
+```
+
+Calibration data contains ROS-style camera intrinsics and one extrinsic transform. Use it with `insight9_receive_align_depth_to_rgb()` to produce a depth map registered to the RGB image plane.
+
+### 6.4 Callbacks
+
+```cpp
 typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size,
                                int width, int height, unsigned int format,
-                               uint64_t timestamp, uint64_t right_timestamp,
-                               void *userdata);
-cam_id: 0 = RGB (MJPEG), 1 = left mono (GREY), 2 = right mono (GREY), 3 = depth (Z16)
+                               uint64_t timestamp, void *userdata);
 
-data: Image data (MJPEG, raw grey, or Z16)
-
-size: Data size in bytes
-
-width, height: Image dimensions
-
-format: V4L2 pixel format (V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_GREY, V4L2_PIX_FMT_Z16)
-
-timestamp: Device timestamp (microseconds)
-
-right_timestamp: Right image timestamp (for stereo cameras)
-
-userdata: User pointer passed during registration
-
-**IMU callback**
-c
 typedef void (*imu_callback)(float ax, float ay, float az,
                              float gx, float gy, float gz,
                              uint64_t timestamp, void *userdata);
-ax, ay, az: Accelerometer values (physical units)
 
-gx, gy, gz: Gyroscope values (physical units)
-
-timestamp: Device timestamp
-
-userdata: User pointer
-
-**VIO callback**
-c
 typedef void (*vio_callback)(float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              uint64_t timestamp, void *userdata);
-px, py, pz: Position coordinates
+```
 
-qx, qy, qz, qw: Quaternion orientation
+The image data pointer belongs to the SDK and may be reused after the callback returns. Copy the data inside the callback if it must be retained.
 
-timestamp: Device timestamp
+### 6.5 Initialization and Lifecycle
 
-userdata: User pointer
-
-### 5.4 SDK Control Functions
-
-**Initialization and Cleanup**
-c
-int insight9_receive_init(void);
-Initializes the SDK, scans for devices, and allocates resources.
-Returns: 0 on success, -1 on failure (insufficient devices or permission issues).
-
-c
+```cpp
+int insight9_receive_init_default(void);
+int insight9_receive_init(const insight9_config_t *config);
 int insight9_receive_start(void);
-Starts all acquisition threads.
-Returns: 0 on success, -1 if not initialized or already running.
-
-c
 void insight9_receive_stop(void);
-Stops all acquisition threads (blocks until threads exit).
-
-c
 void insight9_receive_cleanup(void);
-Releases all resources (must be called after stop).
+```
 
-**Utility**
-c
-const char *insight9_receive_get_video_dev(int cam_id);
-Returns the video device path (e.g., /dev/video0) for the specified camera.
+Call order:
 
-c
-void insight9_receive_print_camera_params(const camera_params *params);
-Prints the specified camera parameters to stdout.
+1. `insight9_receive_init_default()` or `insight9_receive_init(&config)`.
+2. Register callbacks.
+3. `insight9_receive_start()`.
+4. `insight9_receive_stop()`.
+5. `insight9_receive_cleanup()`.
 
-### 5.5 Callback Registration
-c
+### 6.6 Callback Registration
+
+```cpp
 void insight9_receive_register_image_callback(image_callback cb, void *userdata);
 void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
-Register callbacks before calling insight9_receive_start().
-
-### 5.6 Extension Unit (Camera Parameter) API
-c
-int insight9_receive_set_active_camera(int cam_id);
-int insight9_receive_get_active_camera(int *cam_id);
-Set/get the currently active camera (0: RGB, 1: Mono). Parameter read/write operations apply to the active camera.
-
-c
-int insight9_receive_set_camera_params(const camera_params *params);
-int insight9_receive_get_camera_params(camera_params *params);
-Set/get parameters for the currently active camera.
-Note: The cam_id field in params is ignored for these calls.
-
-c
-int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params);
-int insight9_receive_get_camera_params_for(int cam_id, camera_params *params);
-Set/get parameters for a specific camera (0/1/2). The cam_id field in params is overridden by the cam_id argument.
-
-c
-int insight9_receive_reset_camera_params(int cam_id);
-Reset camera parameters to their default values (currently not fully implemented; use set_camera_params_for with saved defaults).
-
-All set functions perform range validation on every parameter. If any value is out of the allowed range, the function returns -1 and no command is sent to the device.
-
-### 5.7 Camera Calibration (Intrinsics / Extrinsics) API
-c
-int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
-void insight9_receive_print_camera_calib(const camera_calib *calib);
-Read the factory calibration (intrinsics + extrinsics) of one camera in a single call.
-cam_idx: INSIGHT9_CALIB_CAM_LEFT (0, left grayscale), INSIGHT9_CALIB_CAM_RIGHT (1, right grayscale), INSIGHT9_CALIB_CAM_RGB (2, RGB).
-
-The camera_calib structure contains:
-- camera_intrinsics: aligned with ROS sensor_msgs/CameraInfo (frame_id, width/height, distortion_model, d[4], k[9], r[9], p[12], binning, ROI).
-- camera_extrinsics: one transform from the device /tf_static (parent/child frame ids, translation x/y/z in meters, quaternion x/y/z/w).
-
-The UVC gadget can only return 60 bytes per control request, so the 361-byte payload is transferred in 58-byte chunks (2-byte header: block index + total blocks, followed by 56 bytes of data). The SDK selects each block with SET_CUR and reassembles the payload transparently; the caller always receives the complete structure.
-
-Returns -1 if the device firmware does not expose the calibration selectors (0x14/0x15/0x16), the reported chunk length differs from 58, or the chunk headers are inconsistent (protocol mismatch).
-
-Example:
-```c
-camera_calib calib;
-if (insight9_receive_get_camera_calib(INSIGHT9_CALIB_CAM_LEFT, &calib) == 0) {
-    insight9_receive_print_camera_calib(&calib);
-}
 ```
 
-## 6. Usage Example
-```c
-#include "Insight_9_receive.h"
-#include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
-#include <time.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <signal.h>
-#include <linux/videodev2.h>
+Register callbacks before starting capture.
 
-static volatile int keep_running = 1;
+### 6.7 Device and Stream Control
 
-void sigint_handler(int sig) {
-    keep_running = 0;
-}
+```cpp
+const char *insight9_receive_get_video_dev(int cam_id);
+const char *insight9_receive_get_metadata_dev(int cam_id);
+int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
 
-struct cam_stats {
-    uint64_t cb_count;
-    uint64_t last_ts;
-    size_t last_size;
+int insight9_receive_start_camera(int cam_id);
+void insight9_receive_stop_camera(int cam_id);
+int insight9_receive_restart_camera(int cam_id);
+int insight9_receive_is_camera_running(int cam_id);
+
+int insight9_receive_get_current_format(int cam_id, int *width, int *height, unsigned int *format);
+int insight9_receive_get_camera_config(int cam_id, int *width, int *height, PixelFormat *format, int *fps);
+int insight9_receive_set_camera_fps(int cam_id, int fps);
+int insight9_receive_switch_camera_fps(int cam_id, int fps);
+int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format);
+int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format);
+int insight9_receive_switch_camera_config(int cam_id, int width, int height, PixelFormat format, int fps);
+int insight9_receive_get_current_fps(int *fps);
+```
+
+`set_camera_fps()` and `set_camera_format()` update the stored target config. Use the corresponding `switch_*` functions to apply changes immediately by restarting the affected camera.
+
+### 6.8 Device Capabilities
+
+```cpp
+struct DeviceCapability {
     int width;
     int height;
-    unsigned int format;
+    int fps;
+    PixelFormat format;
+    bool valid;
 };
 
-struct hid_stats {
-    uint64_t cb_count;
-    uint64_t last_ts;
-};
+int insight9_receive_get_device_capability_count(int cam_id, int *count);
+int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability *cap);
+```
 
-struct imu_latest_sample {
-    float ax;
-    float ay;
-    float az;
-    float gx;
-    float gy;
-    float gz;
-};
+Capability enumeration is available from C++ callers after SDK initialization.
 
-struct vio_latest_sample {
-    float px;
-    float py;
-    float pz;
-    float qx;
-    float qy;
-    float qz;
-    float qw;
-};
+### 6.9 Camera Parameter Control
 
-static struct cam_stats g_stats[3];
-static struct hid_stats g_imu_stats;
-static struct hid_stats g_vio_stats;
-static struct imu_latest_sample g_imu_latest;
-static struct vio_latest_sample g_vio_latest;
-static struct timespec g_img_last_print;
-static struct timespec g_hid_last_print;
-static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_img_stats_inited = 0;
-static int g_hid_stats_inited = 0;
+```cpp
+int insight9_receive_set_active_camera(int cam_id);
+int insight9_receive_get_active_camera(int *cam_id);
+int insight9_receive_set_camera_params(const camera_params *params);
+int insight9_receive_get_camera_params(camera_params *params);
+int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params);
+int insight9_receive_get_camera_params_for(int cam_id, camera_params *params);
+int insight9_receive_reset_camera_params(int cam_id);
+void insight9_receive_print_camera_params(const camera_params *params);
+```
 
-static void reset_img_stats(void) {
-    for (int i = 0; i < 3; i++) {
-        g_stats[i].cb_count = 0;
-    }
+`set_camera_params()` and `get_camera_params()` use the active camera. Prefer `set_camera_params_for()` and `get_camera_params_for()` when the target camera is known.
+
+### 6.10 Calibration, VIO, and Hardware Info
+
+```cpp
+int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib);
+void insight9_receive_print_camera_calib(const camera_calib *calib);
+
+int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
+                                        int depth_w, int depth_h,
+                                        const camera_calib *left_calib,
+                                        const camera_calib *rgb_calib,
+                                        uint16_t *aligned_out,
+                                        int rgb_w, int rgb_h);
+
+int insight9_receive_get_vio_status(int *status);
+const char *insight9_receive_get_hardware_type(void);
+```
+
+VIO status values:
+
+| Value | Status |
+|---:|---|
+| 0 | `NOT_INITED` |
+| 1 | `RESTARTING` |
+| 2 | `STOPPED` |
+| 3 | `TRACKING` |
+| 4 | `TRACKING_STATIC` |
+| 5 | `TRACKINGLOST` |
+| 6 | `DATA_LOST` |
+
+## 7. Minimal Example
+
+```cpp
+#include "Insight_9_receive.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static void image_cb(int cam_id, uint8_t *data, size_t size,
+                     int width, int height, unsigned int format,
+                     uint64_t timestamp, void *userdata) {
+    printf("Image[%d] %dx%d size=%zu fmt=0x%x ts=%lu\n",
+           cam_id, width, height, size, format, (unsigned long)timestamp);
 }
 
-static void reset_hid_stats(void) {
-    g_imu_stats.cb_count = 0;
-    g_vio_stats.cb_count = 0;
+static void imu_cb(float ax, float ay, float az,
+                   float gx, float gy, float gz,
+                   uint64_t timestamp, void *userdata) {
+    printf("IMU ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
+           ax, ay, az, gx, gy, gz, (unsigned long)timestamp);
 }
 
-static void ensure_img_stats_initialized_locked(void) {
-    if (!g_img_stats_inited) {
-        reset_img_stats();
-        clock_gettime(CLOCK_MONOTONIC, &g_img_last_print);
-        g_img_stats_inited = 1;
-    }
+static void vio_cb(float px, float py, float pz,
+                   float qx, float qy, float qz, float qw,
+                   uint64_t timestamp, void *userdata) {
+    printf("VIO pos=(%f,%f,%f) quat=(%f,%f,%f,%f) ts=%lu\n",
+           px, py, pz, qx, qy, qz, qw, (unsigned long)timestamp);
 }
 
-static void ensure_hid_stats_initialized_locked(void) {
-    if (!g_hid_stats_inited) {
-        reset_hid_stats();
-        clock_gettime(CLOCK_MONOTONIC, &g_hid_last_print);
-        g_hid_stats_inited = 1;
-    }
-}
-
-static const char *image_format_to_string(unsigned int format) {
-    switch (format) {
-        case V4L2_PIX_FMT_MJPEG:
-            return "RGB";
-        case V4L2_PIX_FMT_GREY:
-            return "GREY";
-        case V4L2_PIX_FMT_Z16:
-            return "Z16";
-        default:
-            return "UNKNOWN";
-    }
-}
-
-static void maybe_print_img_stats_locked(void) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double elapsed = (now.tv_sec - g_img_last_print.tv_sec) +
-                     (now.tv_nsec - g_img_last_print.tv_nsec) / 1e9;
-    if (elapsed < 1.0) {
-        return;
-    }
-
-    printf("\n========= Image Callbacks : 1/s =========\n");
-    for (int i = 0; i < 3; i++) {
-        const struct cam_stats *cs = &g_stats[i];
-        printf("IMG[%d]: fps=%.1f ts=%lu size=%zu %dx%d format=%s\n",
-               i,
-               cs->cb_count / elapsed,
-               (unsigned long)cs->last_ts,
-               cs->last_size,
-               cs->width,
-               cs->height,
-               image_format_to_string(cs->format));
-    }
-    fflush(stdout);
-
-    reset_img_stats();
-    g_img_last_print = now;
-}
-
-static void maybe_print_hid_stats_locked(void) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    double elapsed = (now.tv_sec - g_hid_last_print.tv_sec) +
-                     (now.tv_nsec - g_hid_last_print.tv_nsec) / 1e9;
-    if (elapsed < 0.5) {
-        return;
-    }
-    printf("\n========= HID Callbacks : 0.5/s =========\n");
-
-    printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
-           g_imu_stats.cb_count / elapsed,
-           g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
-           g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
-           (unsigned long)g_imu_stats.last_ts);
-
-    printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
-           g_vio_stats.cb_count / elapsed,
-           g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
-           g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
-           (unsigned long)g_vio_stats.last_ts);
-    fflush(stdout);
-
-    reset_hid_stats();
-    g_hid_last_print = now;
-}
-
-static void update_hid_stats(struct hid_stats *s, uint64_t ts) {
-    s->cb_count++;
-    s->last_ts = ts;
-}
-
-void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
-                 unsigned int fmt, uint64_t ts, uint64_t ts_right, void *user) {
-    if (cam_id < 0 || cam_id >= 3) return;
-
-    pthread_mutex_lock(&g_stats_lock);
-    ensure_img_stats_initialized_locked();
-
-    struct cam_stats *s = &g_stats[cam_id];
-    s->cb_count++;
-    s->last_ts = ts;
-    s->last_size = size;
-    s->width = w;
-    s->height = h;
-    s->format = fmt;
-
-    maybe_print_img_stats_locked();
-    pthread_mutex_unlock(&g_stats_lock);
-}
-
-void my_imu_cb(float ax, float ay, float az,
-               float gx, float gy, float gz,
-               uint64_t ts, void *user) {
-    pthread_mutex_lock(&g_stats_lock);
-    ensure_hid_stats_initialized_locked();
-    update_hid_stats(&g_imu_stats, ts);
-    g_imu_latest.ax = ax;
-    g_imu_latest.ay = ay;
-    g_imu_latest.az = az;
-    g_imu_latest.gx = gx;
-    g_imu_latest.gy = gy;
-    g_imu_latest.gz = gz;
-    maybe_print_hid_stats_locked();
-    pthread_mutex_unlock(&g_stats_lock);
-}
-
-void my_vio_cb(float px, float py, float pz,
-               float qx, float qy, float qz, float qw,
-               uint64_t ts, void *user) {
-    pthread_mutex_lock(&g_stats_lock);
-    ensure_hid_stats_initialized_locked();
-    update_hid_stats(&g_vio_stats, ts);
-    g_vio_latest.px = px;
-    g_vio_latest.py = py;
-    g_vio_latest.pz = pz;
-    g_vio_latest.qx = qx;
-    g_vio_latest.qy = qy;
-    g_vio_latest.qz = qz;
-    g_vio_latest.qw = qw;
-    maybe_print_hid_stats_locked();
-    pthread_mutex_unlock(&g_stats_lock);
-}
-
-int main() {
-    signal(SIGINT, sigint_handler);
-
-    int active_cam = -1;
-    camera_params params = {0};
-
-    if (insight9_receive_init() != 0) {
+int main(void) {
+    if (insight9_receive_init_default() != 0) {
         fprintf(stderr, "SDK init failed\n");
-        return -1;
+        return 1;
     }
 
-    insight9_receive_register_image_callback(my_image_cb, NULL);
-    insight9_receive_register_imu_callback(my_imu_cb, NULL);
-    insight9_receive_register_vio_callback(my_vio_cb, NULL);
+    insight9_receive_register_image_callback(image_cb, NULL);
+    insight9_receive_register_imu_callback(imu_cb, NULL);
+    insight9_receive_register_vio_callback(vio_cb, NULL);
 
     if (insight9_receive_start() != 0) {
         fprintf(stderr, "SDK start failed\n");
         insight9_receive_cleanup();
-        return -1;
+        return 1;
     }
 
-    // Example: Get current active camera and its parameters
-    if (insight9_receive_get_active_camera(&active_cam) == 0) {
-        printf("Current active camera: %d\n", active_cam);
-        if(insight9_receive_get_camera_params(&params) == 0) {
-            printf("Camera parameters retrieved successfully\n");
-            insight9_receive_print_camera_params(&params);
-        } else {
-            printf("Failed to get camera parameters\n");
-        }
-    } else {
-        printf("Failed to get active camera\n");
-    }
-
-    if(insight9_receive_get_camera_params_for(1, &params) == 0) {
-        printf("Camera parameters for cam %d retrieved successfully\n", active_cam);
-        insight9_receive_print_camera_params(&params);
-    } else {
-        printf("Failed to get camera parameters for cam %d\n", active_cam);
-    }
-
-    if (insight9_receive_get_active_camera(&active_cam) == 0) {
-        printf("Current active camera: %d\n", active_cam);
-    } else {
-        printf("Failed to get active camera\n");
-    }
-
-    // Example: Adjust RGB camera parameters
-    params.cam_id = 0;
-    params.brightness = 80.0f;
-    params.contrast = 1.2f;
-    params.exposure_time = 0.015f;
-    params.exposure_gain = 4.0f;
-    params.auto_white_balance = 1;
-    params.resolution = 0;
-    params.frame_rate = 2;
-    params.auto_exposure = 0;
-    params.gamma_dark = 2.0f;
-    params.hue = 40.0f;
-    params.saturation = 1.0f;
-    params.sharpness = 128;
-    params.white_balance = 2.0f;
-    params.decimation = 1;
-
-    if (insight9_receive_set_camera_params_for(0, &params) == 0) {
-        printf("Camera parameters set successfully\n");
-        if(insight9_receive_get_camera_params_for(0, &params) == 0) {
-            printf("Camera parameters for cam %d after setting:\n", 0);
-            insight9_receive_print_camera_params(&params);
-        } else {
-            printf("Failed to get camera parameters for cam %d after setting\n", 0);
-        }
-    } else {
-        printf("Failed to set camera parameters (invalid range or XU not available)\n");
-    }
-
-    printf("Current connected hardware type: %s\n", insight9_receive_get_hardware_type().c_str());
-
-    printf("SDK running, press Ctrl+C to stop...\n");
-    while (keep_running) {
-        sleep(1);
-    }
+    sleep(10);
 
     insight9_receive_stop();
     insight9_receive_cleanup();
@@ -553,102 +371,48 @@ int main() {
 }
 ```
 
-Compile and run:
+Manual compile example:
 
 ```bash
-# Using CMake (recommended)
-cd build
-cmake ..
-make
-sudo ./example
-
-# Or manually compile
-g++ -o example example.cpp -L. -linsight9 -lpthread -Wl,-rpath=.
-sudo LD_LIBRARY_PATH=. ./example
+g++ -std=c++17 -o minimal minimal.cpp -I. -Lbuild -linsight9 -lpthread -Wl,-rpath=build
+sudo ./minimal
 ```
 
-## 7. Important Notes
-Data lifecycle: The image data pointer points to an internal SDK buffer that will be reused after the callback returns. If you need to keep the data, copy it inside the callback.
+## 8. Included Example
 
-Thread safety: Callbacks are invoked from acquisition threads; avoid blocking operations (e.g., file I/O, long computations) to prevent frame drops.
+`example.cpp` demonstrates:
 
-Device permissions: The program must have read/write access to /dev/video* and /dev/hidraw*. This often requires root privileges or membership in the video and plugdev groups.
+- SDK initialization and callback registration.
+- Image/IMU/VIO statistics printing.
+- Camera parameter read/write.
+- Current FPS, VIO status, and hardware type queries.
+- Calibration readout.
+- Depth-to-RGB alignment and OpenCV visualization.
+- Runtime FPS switching for the gray camera.
 
-Device count requirement: The SDK expects at least 6 UVC devices (to select indices 0, 2, 4) and 2 HID devices; otherwise insight9_receive_init() will return -1.
+The OpenCV window layout is:
 
-Hot‑plug: After device disconnection, the acquisition threads will automatically attempt to reconnect using the same device roles. Data flow will pause and resume when the device becomes available again.
+| Position | Content |
+|---|---|
+| Top-left | Left grayscale image |
+| Bottom-left | Right grayscale image |
+| Top-right | Raw depth |
+| Bottom-right | RGB with aligned depth overlay |
 
-USB stability: Repeated SDK restart cycles or rapid device disconnect/reconnect operations can expose weaknesses in the host USB stack or driver. If the host stops recognizing USB devices after heavy reuse, replug the hardware or reboot the computer before restarting the SDK.
+Press `q`, `Esc`, or `Ctrl+C` to stop the example.
 
-Parameter validation: All set functions validate each parameter against the defined range. The SDK will reject out-of-range values and return an error without sending anything to the device. This prevents invalid configurations that could cause USB communication errors.
+## 9. Notes and Troubleshooting
 
-Extension unit availability: The extension unit is opened on the first camera (/dev/video0). If it cannot be opened (e.g., missing kernel support), camera parameter functions will return -1. The rest of the SDK (video capture) will still work.
-
-Error handling: If insight9_receive_init() fails, it is safe to call insight9_receive_cleanup() (though the SDK already cleans up internally, calling it ensures proper resource release).
-
-## 8. Parameter Range Reference
-Parameter	        Min	    Max	    Notes
-exposure_time (s)	0.0	    0.03	Linear mapping from UI value
-exposure_gain	    1.0	    16.0	Linear mapping
-auto_exposure	    0	    1	    Boolean
-brightness	        0.0	    127.0	Linear mapping from -64..64
-contrast	        0.0	    1.9	    Linear mapping from 0..100
-gamma_dark	        1.0	    4.0	    Linear mapping from 100..500
-hue	                0.0	    87.0	Linear mapping from -180..180
-saturation	        0.0	    1.999	Linear mapping from 0..100
-sharpness	        1	    255	    Linear mapping from 0..100
-auto_white_balance	0	    1	    Boolean
-white_balance	    1.0	    3.0	    Linear mapping from 2800..6500K
-decimation	        1	    255	    Linear mapping from 1..8
-rotation	        1	    255	    Linear mapping from -90..180
-
-## 9. Frequently Asked Questions
-Q: How can I verify that devices are correctly detected?
-A: When the program runs, it prints the selected device nodes, e.g., Selected UVC device 0: /dev/video4. You can also call insight9_receive_get_video_dev() after init.
-
-Q: The image data is MJPEG. How do I decode it?
-A: You can use libjpeg, turbojpeg, or a hardware decoder to convert MJPEG to RGB/YUV. Mono (GREY) data is raw 8‑bit and can be saved as PGM or processed with OpenCV. Z16 is 16‑bit depth data (little-endian).
-
-Q: The SDK returns -1 when setting parameters. What could be wrong?
-A: Possible reasons:
-
-The extension unit was not opened during init (check console for warning).
-
-One or more parameter values are out of the allowed range (see table above).
-
-The device is disconnected or the extension unit is busy.
-
-The kernel UVC driver does not support the control.
-
-Q: How do I save current parameters as defaults for reset?
-A: Use insight9_receive_get_camera_params_for() to read the current parameters and store them. Later, call insight9_receive_set_camera_params_for() with the stored values to reset.
-
-Q: I get "cannot find libinsight9.so" when running the example.
-A: Ensure the library path is set correctly:
-
-With CMake: The executable has RPATH set automatically.
-
-Manual build: Use -Wl,-rpath=. during compilation or set LD_LIBRARY_PATH:
-
-```bash
-export LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH
-sudo ./example
-```
-
-Q: CMake build fails with buffer overflow detection.
-A: The CMake configuration already disables Fortify Source checks. If you still encounter issues, try:
-
-```bash
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-make clean
-make
-```
+- The SDK expects matching UVC video/metadata node pairs and HID devices. If initialization fails, check VID/PID, cabling, permissions, and `dmesg`.
+- Linux discovery currently selects video/metadata pairs from matching `/sys/class/video4linux` nodes.
+- Callbacks run on SDK capture threads. Keep callback work short; hand data off to worker threads for decoding, disk I/O, or heavy processing.
+- For `Z16` depth frames, ignore metadata rows before depth processing. The included example uses `height - 2` valid depth rows.
+- If UVC extension unit setup fails, image capture can still work, but parameter, calibration, VIO status, and hardware queries may fail.
+- If USB recovery becomes unreliable after repeated disconnect/reconnect or rapid restart cycles, replug the device or restart the host.
 
 ## 10. Changelog
-v1.1.0 (2026-06): Added CMake build system support; fixed VLA buffer overflow issues; improved device discovery robustness.
 
-v1.1 (2026-05): Added Extension Unit API for camera parameter control (exposure, gain, white balance, etc.). Range validation implemented. Updated to C++ for compatibility with UvcExtensionUnit class.
-
-v1.0 (2026-03): Initial release – supports automatic device discovery and acquisition for three UVC cameras and two HID devices.
-
-For further assistance or customisations, please contact the developer.
+- v1.2.0 (2026-09): Updated README for current APIs; documented default/custom initialization, per-camera switching, metadata timestamps, VIO status, device capabilities, and depth-to-RGB alignment.
+- v1.1.0 (2026-06): Added CMake build support, improved device discovery, and fixed build/runtime robustness issues.
+- v1.1.0 (2026-05): Added UVC extension unit camera parameter API with range validation.
+- v1.0.0 (2026-03): Initial Linux SDK release with UVC image capture and HID IMU/VIO callbacks.

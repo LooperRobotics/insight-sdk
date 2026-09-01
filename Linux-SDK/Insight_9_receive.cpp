@@ -353,7 +353,6 @@ static PixelFormat fourccToPixelFormat(unsigned int fcc) {
     }
 }
 
-// 获取单个分辨率的帧率列表
 int get_frame_intervals(int fd, uint32_t pixelformat, 
                         uint32_t width, uint32_t height,
                         unsigned int *intervals, int max_count) {
@@ -368,18 +367,15 @@ int get_frame_intervals(int fd, uint32_t pixelformat,
     while (count < max_count && 
            ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
         if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
-            // 计算帧率（denominator/numerator）
             intervals[count] = frmival.discrete.denominator / 
                               frmival.discrete.numerator;
             count++;
         } else if (frmival.type == V4L2_FRMIVAL_TYPE_STEPWISE) {
-            // 步进范围：取最大值
             intervals[count] = frmival.stepwise.max.denominator / 
                               frmival.stepwise.max.numerator;
             count++;
         } else if (frmival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) {
-            // 连续范围，取常见值
-            intervals[count++] = 30;  // 默认
+            intervals[count++] = 30;
             intervals[count++] = 25;
             intervals[count++] = 15;
         }
@@ -389,12 +385,10 @@ int get_frame_intervals(int fd, uint32_t pixelformat,
     return count;
 }
 
-// 获取设备默认格式
 static int get_default_format(int fd, struct v4l2_format *fmt) {
     memset(fmt, 0, sizeof(*fmt));
     fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     
-    // 先尝试获取当前设备正在使用的格式
     if (ioctl(fd, VIDIOC_G_FMT, fmt) == 0) {
         printf("[CAM] Got current format: %dx%d, pixelformat=0x%x\n",
                fmt->fmt.pix.width, fmt->fmt.pix.height, fmt->fmt.pix.pixelformat);
@@ -420,7 +414,6 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
     memset(&fmtdesc, 0, sizeof(fmtdesc));
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     
-    // 第一遍：统计格式数量
     while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
         format_count++;
         fmtdesc.index++;
@@ -437,7 +430,6 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
         return -1;
     }
     
-    // 第二遍：填充数据
     memset(&fmtdesc, 0, sizeof(fmtdesc));
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmtdesc.index = 0;
@@ -448,7 +440,6 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
         formats[fmt_idx].frames_num = 0;
         formats[fmt_idx].frames = NULL;
         
-        // 枚举该格式下的所有分辨率
         memset(&frmsize, 0, sizeof(frmsize));
         frmsize.pixel_format = fmtdesc.pixelformat;
         frmsize.index = 0;
@@ -457,13 +448,11 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
         struct uvc_frame_info *frames = NULL;
         
         while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
-            // 只处理离散分辨率
             if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
                 frame_count++;
                 frames = (struct uvc_frame_info*)realloc(frames, frame_count * sizeof(struct uvc_frame_info));
                 if (!frames) {
                     fprintf(stderr, "[CAM] Failed to allocate frames memory\n");
-                    // 清理已分配的内存
                     for (int i = 0; i < fmt_idx; i++) {
                         if (formats[i].frames) free(formats[i].frames);
                     }
@@ -476,17 +465,15 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
                 memset(frames[frame_count - 1].intervals, 0, 
                        sizeof(frames[frame_count - 1].intervals));
                 
-                // 获取该分辨率的帧率
                 int interval_count = get_frame_intervals(
                     fd,
                     fmtdesc.pixelformat,
                     frmsize.discrete.width,
                     frmsize.discrete.height,
                     frames[frame_count - 1].intervals,
-                    8  // 最多8个帧率
+                    8
                 );
                 
-                // 如果没获取到帧率，使用默认值
                 if (interval_count == 0) {
                     frames[frame_count - 1].intervals[0] = 30;
                     interval_count = 1;
@@ -618,7 +605,7 @@ static void refresh_video_device_path(int cam_id) {
 }
 
 static bool reopenXUControlLocked(const char* reason) {
-    const char* dev_path = g_ctx.video_devs[0];  // RGB 视频节点
+    const char* dev_path = g_ctx.video_devs[0];
     if (dev_path[0] == '\0') {
         fprintf(stderr, "[XU][ERR] Cannot reopen XU: RGB UVC path unavailable (%s)\n",
                 reason ? reason : "unknown");
@@ -676,7 +663,6 @@ template<typename Func>
 static bool callXUWithRetry(const char* op, Func fn) {
     pthread_mutex_lock(&g_ctx.xu_mutex);
 
-    // 若 XU 未就绪，先重建
     if (!g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
         if (!reopenXUControlLocked(op)) {
             pthread_mutex_unlock(&g_ctx.xu_mutex);
@@ -690,7 +676,6 @@ static bool callXUWithRetry(const char* op, Func fn) {
         return true;
     }
 
-    // 失败后重开并重试一次
     fprintf(stderr, "[XU][WARN] Operation '%s' failed; reopening XU and retrying once\n", op ? op : "unknown");
     if (!reopenXUControlLocked(op)) {
         pthread_mutex_unlock(&g_ctx.xu_mutex);
@@ -736,14 +721,12 @@ static int set_framerate(int fd, int framerate) {
     return 0;
 }
 
-// 获取摄像头所有格式信息并写入 cam_ctx
 static int get_camera_formats_info(struct cam_ctx *ctx) {
     if (!ctx || ctx->fd < 0) {
         fprintf(stderr, "[CAM] Invalid context or file descriptor\n");
         return -1;
     }
 
-    // 获取所有格式信息
     struct uvc_format_info *formats = NULL;
     int format_num = 0;
     
@@ -757,7 +740,6 @@ static int get_camera_formats_info(struct cam_ctx *ctx) {
     
     printf("[CAM%d] Got %d formats info\n", ctx->cam_id, format_num);
     
-    // 打印调试信息
     for (int i = 0; i < format_num; i++) {
         printf("  Format %d: 0x%08X (%c%c%c%c), frames=%d\n", 
                i,
@@ -784,12 +766,10 @@ static int get_camera_formats_info(struct cam_ctx *ctx) {
     return 0;
 }
 
-// 初始化捕获（从设备获取默认格式或使用指定格式）
 static int init_capture(struct cam_ctx *ctx) {
     struct v4l2_format fmt;
     int use_default_format = 0;
 
-    // 如果 ctx 中没有指定宽高或格式，则使用设备默认值
     if (ctx->width == 0 || ctx->height == 0 || ctx->format == 0) {
         use_default_format = 1;
         printf("[CAM%d] Using default format from device\n", ctx->cam_id);
@@ -802,7 +782,6 @@ static int init_capture(struct cam_ctx *ctx) {
         ctx->format = fmt.fmt.pix.pixelformat;
         printf("init capture (default) %d %d %d\n", ctx->width, ctx->height, ctx->format);
     } else {
-        // 使用 ctx 中存储的目标参数
         memset(&fmt, 0, sizeof(fmt));
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = ctx->width;
@@ -813,16 +792,9 @@ static int init_capture(struct cam_ctx *ctx) {
                ctx->cam_id, ctx->width, ctx->height, ctx->format);
     }
 
-    // 移除硬编码的 MJPEG 强制设置（格式已由 ctx->format 决定）
-    // if (ctx->cam_id == 2) {
-    //     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-    //     printf("set cam3 format mjpeg");
-    // }
-
-    // 尝试设置格式（若 use_default_format==1，fmt 来自默认值；若为0，则来自 ctx）
     if (ioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
         fprintf(stderr, "[CAM%d][ERR] VIDIOC_S_FMT failed: %s\n", ctx->cam_id, strerror(errno));
-        // 如果设置了指定格式但失败，尝试回退到默认格式
+
         if (!use_default_format) {
             fprintf(stderr, "[CAM%d] Falling back to default format\n", ctx->cam_id);
             if (get_default_format(ctx->fd, &fmt) < 0) {
@@ -836,7 +808,6 @@ static int init_capture(struct cam_ctx *ctx) {
         }
     }
 
-    // 成功后，再次读取实际生效的格式（以防驱动调整）
     struct v4l2_format actual_fmt;
     memset(&actual_fmt, 0, sizeof(actual_fmt));
     actual_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -848,7 +819,6 @@ static int init_capture(struct cam_ctx *ctx) {
                ctx->cam_id, ctx->width, ctx->height, ctx->format);
     }
 
-    // 设置帧率（沿用原有逻辑）
     set_framerate(ctx->fd, ctx->fps);
     int cam_id = ctx->cam_id;
     if (cam_id == 0) {
@@ -878,7 +848,6 @@ static int init_capture(struct cam_ctx *ctx) {
             fprintf(stderr, "[CAM%d][WARN] VIDIOC_REQBUFS忙，重试 %d...\n", ctx->cam_id, retries);
             usleep(100000); 
         } else {
-            // 其他错误则直接退出
             fprintf(stderr, "[CAM%d][ERR] VIDIOC_REQBUFS失败: %s\n", ctx->cam_id, strerror(errno));
             return -1;
         }
@@ -937,7 +906,6 @@ err_cleanup:
     return -1;
 }
 
-// 获取摄像头当前格式
 int insight9_receive_get_current_format(int cam_id, int *width, int *height, unsigned int *format) {
     if (!g_ctx.initialized) {
         fprintf(stderr, "[SDK][ERR] not initialized\n");
@@ -954,7 +922,6 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
     
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
     
-    // 如果设备已打开，直接从设备查询
     if (ctx->fd >= 0) {
         struct v4l2_format fmt;
         memset(&fmt, 0, sizeof(fmt));
@@ -968,7 +935,6 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
         }
     }
     
-    // 如果设备未打开，尝试打开并获取格式
     int fd = open(g_ctx.video_devs[cam_id], O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
@@ -986,14 +952,12 @@ int insight9_receive_get_current_format(int cam_id, int *width, int *height, uns
         return 0;
     }
     
-    // 如果获取失败，返回ctx中保存的值
     *width = ctx->width;
     *height = ctx->height;
     *format = ctx->format;
     return 0;
 }
 
-// 获取设备支持的格式列表
 int insight9_receive_enum_formats(int cam_id, int index, struct v4l2_fmtdesc *desc) {
     if (!g_ctx.initialized) {
         fprintf(stderr, "[SDK][ERR] not initialized\n");
@@ -1024,7 +988,6 @@ int insight9_receive_enum_formats(int cam_id, int index, struct v4l2_fmtdesc *de
     return ret < 0 ? -1 : 0;
 }
 
-// 枚举帧大小
 int insight9_receive_enum_frame_sizes(int cam_id, unsigned int pixelformat, int index, struct v4l2_frmsizeenum *frmsize) {
     if (!g_ctx.initialized) {
         fprintf(stderr, "[SDK][ERR] not initialized\n");
@@ -1282,30 +1245,6 @@ static void safe_cleanup_camera(struct cam_ctx *ctx) {
 }
 
 // ==================== Extension Unit Helpers ====================
-// static int ensure_xu_available() {
-//     if (!g_ctx.xu_control) {
-//         // Try to recreate the extension unit.
-//         if (g_ctx.video_devs[0][0] == '\0') return -1;
-//         g_ctx.xu_control = new viewer::UvcExtensionUnit();
-//         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-//             delete g_ctx.xu_control;
-//             g_ctx.xu_control = nullptr;
-//             g_ctx.xu_ready = false;
-//             return -1;
-//         }
-//         g_ctx.xu_ready = true;
-//     } else if (!g_ctx.xu_control->isOpen()) {
-//         // The extension unit exists but is closed; try to reopen it because the path may have changed.
-//         g_ctx.xu_control->close();
-//         if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-//             g_ctx.xu_ready = false;
-//             return -1;
-//         }
-//         g_ctx.xu_ready = true;
-//     }
-//     return 0;
-// }
-
 static int is_camera_params_valid(const camera_params *params) {
     // Validate resolution index. RGB uses 0-3 and grayscale uses 0-1; the SDK uses the more permissive 0-3 range.
     if (params->resolution > 3) {
@@ -1469,10 +1408,6 @@ static void *capture_thread(void *arg) {
                 pthread_mutex_unlock(&ctx->fd_lock);
                 pending_fail_reset = false;  // invalidate any stale probation timer
                 reconnect_backoff_apply_for_cam(ctx, &reconnect_fails, "open failed");
-                // stop_metadata_capture(ctx->meta_fd);
-                // close(ctx->meta_fd);
-                // ctx->meta_fd = -1;
-                // free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 continue;
             }
             if (init_capture(ctx) < 0) {
@@ -2101,9 +2036,9 @@ int insight9_receive_get_camera_config(int cam_id, int* width, int* height, Pixe
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM) return -1;
     if (!width || !height || !format || !fps) return -1;
 
-    const video_config_t* cur = (cam_id == 0) ? &g_ctx.config.depth_config   // 原来是 rgb_config
+    const video_config_t* cur = (cam_id == 0) ? &g_ctx.config.depth_config
                                : (cam_id == 1) ? &g_ctx.config.gray_config
-                                               : &g_ctx.config.rgb_config;   // 原来是 depth_config
+                                               : &g_ctx.config.rgb_config;
     *width  = cur->width;
     *height = cur->height;
     *format = cur->pixel_format;
@@ -2126,11 +2061,11 @@ int insight9_receive_set_camera_fps(int cam_id, int fps) {
     if (fps <= 0) return -1;
     
     if (cam_id == 0) {
-        g_ctx.config.depth_config.fps = fps;          // 原来是 rgb_config
+        g_ctx.config.depth_config.fps = fps;
     } else if (cam_id == 1) {
         g_ctx.config.gray_config.fps = fps;
     } else { // cam_id == 2
-        g_ctx.config.rgb_config.fps = fps;            // 原来是 depth_config
+        g_ctx.config.rgb_config.fps = fps;
     }
     
     printf("[SDK] Set camera %d FPS to %d\n", cam_id, fps);
@@ -2143,7 +2078,7 @@ int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelF
     if (width <= 0 || height <= 0) return -1;
 
     if (cam_id == 0) {
-        g_ctx.config.depth_config.width = width;      // 原来是 rgb_config
+        g_ctx.config.depth_config.width = width;
         g_ctx.config.depth_config.height = height;
         g_ctx.config.depth_config.pixel_format = format;
     } else if (cam_id == 1) {
@@ -2151,7 +2086,7 @@ int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelF
         g_ctx.config.gray_config.height = height;
         g_ctx.config.gray_config.pixel_format = format;
     } else { // cam_id == 2
-        g_ctx.config.rgb_config.width = width;        // 原来是 depth_config
+        g_ctx.config.rgb_config.width = width;
         g_ctx.config.rgb_config.height = height;
         g_ctx.config.rgb_config.pixel_format = format;
     }
@@ -2313,13 +2248,13 @@ static bool buildCapabilityList(struct cam_ctx* ctx, std::vector<DeviceCapabilit
     for (int f = 0; f < ctx->format_num; ++f) {
         const struct uvc_format_info& fmt = ctx->formats_info[f];
         PixelFormat pf = fourccToPixelFormat(fmt.fcc);
-        if (pf == PixelFormat::Unknown) continue;   // SDK 不认识的格式先跳过，不展示
+        if (pf == PixelFormat::Unknown) continue;
 
         for (int r = 0; r < fmt.frames_num; ++r) {
             const struct uvc_frame_info& frame = fmt.frames[r];
             for (int iv = 0; iv < 8; ++iv) {
                 unsigned int fps = frame.intervals[iv];
-                if (fps == 0) break;   // intervals[] 用 0 表示后面没有更多帧率了
+                if (fps == 0) break;
                 DeviceCapability cap;
                 cap.width = frame.width;
                 cap.height = frame.height;
@@ -2331,7 +2266,6 @@ static bool buildCapabilityList(struct cam_ctx* ctx, std::vector<DeviceCapabilit
         }
     }
 
-    // 跟 Windows 那边保持一致的排序：先按 format 分组，组内分辨率、帧率从小到大
     std::sort(out.begin(), out.end(), [](const DeviceCapability& a, const DeviceCapability& b) {
         if (a.format != b.format) return (int)a.format < (int)b.format;
         long long areaA = (long long)a.width * a.height;

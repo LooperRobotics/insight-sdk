@@ -1462,7 +1462,7 @@ static bool openVideoSourceForSlot(int uvcId) {
         return false;
     }
     
-    if (!src->start()) {          // ← 补上这一步，之前漏掉了
+    if (!src->start()) {
         delete src;
         return false;
     }
@@ -1925,13 +1925,13 @@ static void deliverFrame(int uvcId, uint8_t* data, size_t size, const FrameInfo&
     }
 
     unsigned int v4l2Fmt = 0;
-    if (info.format == PixelFormat::MJPEG) v4l2Fmt = 0x47504A4D;  // 'MJPG'
-    else if (info.format == PixelFormat::GREY) v4l2Fmt = 0x59455247;  // 'GREY'
-    else if (info.format == PixelFormat::Z16) v4l2Fmt = 0x36315A;  // 'Z16 '
-    else if (info.format == PixelFormat::Y8I) v4l2Fmt = 0x49385956;  // 'Y8I '
-    else if (info.format == PixelFormat::YUYV) v4l2Fmt = 0x32595559;  // 'YUYV'
-    else if (info.format == PixelFormat::RGB8) v4l2Fmt = 0x42475200;  // 'RGB8'
-    else if (info.format == PixelFormat::NV12) v4l2Fmt = 0x3231564E;   // 'NV12'
+    if (info.format == PixelFormat::MJPEG) v4l2Fmt = 0x47504A4D;        // 'MJPG'
+    else if (info.format == PixelFormat::GREY) v4l2Fmt = 0x59455247;    // 'GREY'
+    else if (info.format == PixelFormat::Z16) v4l2Fmt = 0x36315A;       // 'Z16 '
+    else if (info.format == PixelFormat::Y8I) v4l2Fmt = 0x49385956;     // 'Y8I '
+    else if (info.format == PixelFormat::YUYV) v4l2Fmt = 0x32595559;    // 'YUYV'
+    else if (info.format == PixelFormat::RGB8) v4l2Fmt = 0x42475200;    // 'RGB8'
+    else if (info.format == PixelFormat::NV12) v4l2Fmt = 0x3231564E;    // 'NV12'
 
     g_ctx.imgCb(callbackCamId, data, size, info.width, info.height, 
                 v4l2Fmt, info.timestamp, g_ctx.imgUser);
@@ -1950,7 +1950,6 @@ static void videoThreadFunc(int uvcId) {
     };
 
     while (stillWanted()) {
-        // ---- 设备没打开 / 上次断开了：尝试（重新）打开 ----
         if (!g_ctx.videos[uvcId]) {
             if (!openVideoSourceForSlot(uvcId)) {
                 reconnect_backoff_apply("VIDEO", uvcId, &reconnect_fails, "open failed");
@@ -1969,8 +1968,6 @@ static void videoThreadFunc(int uvcId) {
             }
         }
 
-        // ---- 正常读帧循环（跟原来一样，只是把"检测到设备断开"的处理方式从
-        //      "线程退出"改成"清理掉 source、break 回外层重连循环"）----
         MFVideoSource* src = g_ctx.videos[uvcId];
         while (stillWanted() && src->isRunning()) {
             uint8_t* data = nullptr;
@@ -1982,7 +1979,7 @@ static void videoThreadFunc(int uvcId) {
                     deliverFrame(uvcId, data, size, info);
                     delete[] data;
                 } else if (!src->isRunning()) {
-                    break;   // readFrame 内部检测到设备已失效（running_=false），跳出内层循环去重连
+                    break;
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
@@ -2002,8 +1999,6 @@ static void videoThreadFunc(int uvcId) {
             }
         }
 
-        // ---- 走到这里说明内层循环退出了：要么是用户主动停止（stillWanted()==false，
-        //      外层 while 也会退出），要么是设备掉线（src->isRunning()==false，需要清掉重连）----
         if (g_ctx.videos[uvcId]) {
             delete g_ctx.videos[uvcId];
             g_ctx.videos[uvcId] = nullptr;
@@ -2219,7 +2214,6 @@ int insight9_receive_init(const insight9_config_t* config) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         if (hr == RPC_E_CHANGED_MODE) {
-            // 之前已以不同模式初始化，尝试重置为 MTA
             CoUninitialize();
             hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             if (FAILED(hr)) {
@@ -2263,18 +2257,12 @@ int insight9_receive_init(const insight9_config_t* config) {
         return -1;
     }
     g_ctx.hidPaths[0] = hidPaths[0];
-    // g_ctx.hidPaths[1] = hidPaths[1];
-    // SDK_LOG_INFO("[HID] IMU device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
     SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
         SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
         return -1;
     }
-    // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
-    //     SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
-    //     return -1;
-    // }
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
@@ -2307,7 +2295,6 @@ int insight9_receive_init_default() {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         if (hr == RPC_E_CHANGED_MODE) {
-            // 之前已以不同模式初始化，尝试重置为 MTA
             CoUninitialize();
             hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             if (FAILED(hr)) {
@@ -2320,7 +2307,6 @@ int insight9_receive_init_default() {
         }
     }
 
-    // sdk_ctx_t contains std::thread/std::mutex/std::string; never memset it.
     g_ctx.config = {};
     g_ctx.running = false;
     g_ctx.initialized = false;
@@ -2497,19 +2483,12 @@ int insight9_receive_init_default() {
         return -1;
     }
     g_ctx.hidPaths[0] = hidPaths[0];
-    // g_ctx.hidPaths[1] = hidPaths[1];
-    // SDK_LOG_INFO("[HID] IMU device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
     SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
     g_ctx.hidDevs[0] = new HidDevice();
     if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
         SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
         return -1;
     }
-    // if (!g_ctx.hidDevs[1]->open(g_ctx.hidPaths[1])) {
-    //     SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
-    //     return -1;
-    // }
-
     {
         std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
         if (!reopenXUControlLocked("initialization")) {
@@ -2768,8 +2747,6 @@ int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelF
         g_ctx.config.rgb_config.height = height;
         g_ctx.config.rgb_config.pixel_format = format;
     } else if (cam_id == GRAY_CAM_ID || cam_id == DEPTH_CAM_ID) {
-        // Depth/Gray 共享同一组 width/height（MF 驱动限制），这里统一写两边，
-        // 避免下次 restart 时又触发"composite streams size mismatch"的兜底逻辑
         g_ctx.config.gray_config.width = width;
         g_ctx.config.gray_config.height = height;
         g_ctx.config.depth_config.width = width;

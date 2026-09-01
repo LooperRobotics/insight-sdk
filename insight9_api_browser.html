@@ -1,0 +1,1338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Insight9 SDK API Browser</title>
+    <style>
+        /* ===== Global Reset & Base ===== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', 'PingFang SC', Roboto, system-ui, -apple-system, sans-serif;
+            background: #f5f7fb;
+            color: #1e293b;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+        }
+        /* ===== Header ===== */
+        .app-header {
+            background: linear-gradient(135deg, #0f172a, #1e293b);
+            color: #f1f5f9;
+            padding: 18px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .app-header .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .app-header .brand h1 {
+            font-weight: 600;
+            font-size: 22px;
+            letter-spacing: 0.3px;
+        }
+        .app-header .brand small {
+            font-weight: 400;
+            font-size: 14px;
+            opacity: 0.7;
+            margin-left: 8px;
+        }
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .header-stats {
+            display: flex;
+            gap: 24px;
+            font-size: 14px;
+            background: rgba(255, 255, 255, 0.06);
+            padding: 8px 18px;
+            border-radius: 40px;
+        }
+        .header-stats span {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .header-stats .num {
+            font-weight: 700;
+            color: #60a5fa;
+        }
+        .lang-switch {
+            display: flex;
+            gap: 4px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 30px;
+            padding: 4px;
+            border: 1px solid rgba(255,255,255,0.15);
+        }
+        .lang-switch button {
+            background: transparent;
+            border: none;
+            color: #cbd5e1;
+            padding: 6px 16px;
+            border-radius: 30px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .lang-switch button.active {
+            background: #3b82f6;
+            color: #fff;
+            box-shadow: 0 2px 8px rgba(59,130,246,0.3);
+        }
+        .lang-switch button:hover:not(.active) {
+            background: rgba(255,255,255,0.05);
+            color: #f1f5f9;
+        }
+        /* ===== Layout ===== */
+        .app-body {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        /* ===== Sidebar ===== */
+        .sidebar {
+            width: 270px;
+            background: #ffffff;
+            border-right: 1px solid #e2e8f0;
+            padding: 20px 0 20px 16px;
+            overflow-y: auto;
+            flex-shrink: 0;
+            height: calc(100vh - 80px);
+            position: sticky;
+            top: 80px;
+        }
+        .sidebar .search-box {
+            margin-right: 16px;
+            margin-bottom: 20px;
+        }
+        .sidebar .search-box input {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 10px;
+            font-size: 14px;
+            outline: none;
+            transition: 0.2s;
+            background: #f8fafc;
+        }
+        .sidebar .search-box input:focus {
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+            background: #fff;
+        }
+        .sidebar .category-list {
+            list-style: none;
+            margin-right: 16px;
+        }
+        .sidebar .category-list li {
+            padding: 10px 14px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: 0.15s;
+            color: #334155;
+        }
+        .sidebar .category-list li:hover {
+            background: #f1f5f9;
+        }
+        .sidebar .category-list li.active {
+            background: #e0e7ff;
+            color: #1d4ed8;
+            font-weight: 600;
+        }
+        .sidebar .category-list li .badge {
+            background: #e2e8f0;
+            color: #475569;
+            font-size: 12px;
+            padding: 2px 10px;
+            border-radius: 30px;
+            font-weight: 400;
+        }
+        .sidebar .category-list li.active .badge {
+            background: #bfdbfe;
+            color: #1d4ed8;
+        }
+        .sidebar .file-tag {
+            margin-top: 24px;
+            margin-right: 16px;
+            padding: 12px 14px;
+            background: #f1f5f9;
+            border-radius: 10px;
+            font-size: 13px;
+            color: #475569;
+        }
+        .sidebar .file-tag strong {
+            color: #0f172a;
+        }
+        .sidebar .file-tag .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .sidebar .file-tag .dot.v1 {
+            background: #3b82f6;
+        }
+        .sidebar .file-tag .dot.v2 {
+            background: #8b5cf6;
+        }
+        /* ===== Main Content ===== */
+        .main-content {
+            flex: 1;
+            padding: 28px 36px 40px;
+            overflow-y: auto;
+            height: calc(100vh - 80px);
+            background: #f8fafc;
+        }
+        .main-content .empty-state {
+            text-align: center;
+            padding: 80px 20px;
+            color: #94a3b8;
+        }
+        .main-content .empty-state .icon {
+            font-size: 56px;
+            margin-bottom: 16px;
+        }
+        .main-content .empty-state h3 {
+            color: #475569;
+            margin-bottom: 8px;
+        }
+        /* ===== API Cards ===== */
+        .api-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        .api-card {
+            background: #ffffff;
+            border-radius: 16px;
+            border: 1px solid #e9edf2;
+            padding: 22px 26px;
+            transition: 0.15s;
+            cursor: default;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.02);
+        }
+        .api-card:hover {
+            border-color: #cbd5e1;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.06);
+        }
+        .api-card .card-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .api-card .card-header .name {
+            font-size: 18px;
+            font-weight: 600;
+            color: #0f172a;
+            font-family: 'JetBrains Mono', 'Cascadia Code', monospace;
+            word-break: break-all;
+        }
+        .api-card .card-header .tags {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .api-card .card-header .tag {
+            font-size: 11px;
+            font-weight: 500;
+            padding: 2px 12px;
+            border-radius: 30px;
+            background: #f1f5f9;
+            color: #475569;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        .api-card .card-header .tag.func {
+            background: #dbeafe;
+            color: #1d4ed8;
+        }
+        .api-card .card-header .tag.struct {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        .api-card .card-header .tag.enum {
+            background: #fef3c7;
+            color: #92400e;
+        }
+        .api-card .card-header .tag.callback {
+            background: #fce7f3;
+            color: #9d174d;
+        }
+        .api-card .card-header .tag.const {
+            background: #e0e7ff;
+            color: #3730a3;
+        }
+        .api-card .card-header .tag.file {
+            font-size: 10px;
+            background: #e9edf2;
+            color: #64748b;
+        }
+        .api-card .card-signature {
+            font-family: 'JetBrains Mono', 'Cascadia Code', monospace;
+            font-size: 13px;
+            color: #1e293b;
+            background: #f1f5f9;
+            padding: 10px 16px;
+            border-radius: 8px;
+            margin: 12px 0 10px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .api-card .card-desc {
+            font-size: 14px;
+            color: #475569;
+            line-height: 1.7;
+            margin-top: 6px;
+        }
+        .api-card .card-details {
+            margin-top: 14px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px 40px;
+            font-size: 13px;
+            color: #475569;
+            border-top: 1px solid #f1f5f9;
+            padding-top: 14px;
+        }
+        .api-card .card-details .detail-item {
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
+        }
+        .api-card .card-details .detail-item .label {
+            font-weight: 500;
+            color: #64748b;
+        }
+        .api-card .card-details .detail-item .value {
+            font-family: 'JetBrains Mono', monospace;
+            color: #0f172a;
+            background: #f8fafc;
+            padding: 0 6px;
+            border-radius: 4px;
+        }
+        .api-card .card-details .detail-item .value.code {
+            background: #f1f5f9;
+            padding: 2px 8px;
+        }
+        .api-card .members {
+            margin-top: 14px;
+            background: #f8fafc;
+            border-radius: 8px;
+            padding: 12px 16px;
+            font-size: 13px;
+            border: 1px solid #e9edf2;
+        }
+        .api-card .members .member {
+            padding: 5px 0;
+            border-bottom: 1px dashed #e9edf2;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px 16px;
+        }
+        .api-card .members .member:last-child {
+            border-bottom: none;
+        }
+        .api-card .members .member .mname {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 500;
+            color: #0f172a;
+        }
+        .api-card .members .member .mtype {
+            color: #64748b;
+        }
+        .api-card .members .member .mdesc {
+            color: #475569;
+        }
+        /* ===== Function Quick Reference Table ===== */
+        .func-index-table {
+            background: #ffffff;
+            border-radius: 16px;
+            border: 1px solid #e9edf2;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+        }
+        .func-index-header, .func-index-row {
+            display: grid;
+            grid-template-columns: 50px 1fr 2.2fr;
+            padding: 14px 24px;
+            border-bottom: 1px solid #f1f5f9;
+            gap: 16px;
+            align-items: center;
+        }
+        .func-index-header {
+            background: #f8fafc;
+            font-weight: 600;
+            color: #475569;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        .func-index-row:hover {
+            background: #f8fafc;
+        }
+        .func-index-row .func-name {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 500;
+            color: #0f172a;
+            font-size: 14px;
+        }
+        .func-index-row .func-desc {
+            color: #475569;
+            font-size: 14px;
+        }
+        .func-index-row .func-idx {
+            color: #94a3b8;
+            font-size: 13px;
+            font-weight: 400;
+        }
+        /* ===== Responsive ===== */
+        @media (max-width: 820px) {
+            .app-body {
+                flex-direction: column;
+            }
+            .sidebar {
+                width: 100%;
+                height: auto;
+                position: static;
+                border-right: none;
+                border-bottom: 1px solid #e2e8f0;
+                padding: 16px;
+                top: 0;
+            }
+            .main-content {
+                height: auto;
+                padding: 16px;
+            }
+            .app-header {
+                padding: 14px 16px;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 8px;
+            }
+            .header-right {
+                justify-content: space-between;
+            }
+            .header-stats {
+                flex-wrap: wrap;
+                gap: 12px;
+                padding: 6px 14px;
+                font-size: 12px;
+            }
+            .api-card .card-header .name {
+                font-size: 16px;
+            }
+            .sidebar .category-list {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+                margin-right: 0;
+            }
+            .sidebar .category-list li {
+                padding: 6px 14px;
+                font-size: 13px;
+                flex: 0 0 auto;
+            }
+            .sidebar .search-box {
+                margin-right: 0;
+            }
+            .sidebar .file-tag {
+                display: none;
+            }
+            .func-index-header, .func-index-row {
+                grid-template-columns: 40px 1fr 1.5fr;
+                padding: 10px 16px;
+                gap: 8px;
+                font-size: 13px;
+            }
+        }
+        @media (max-width: 480px) {
+            .api-card .card-details {
+                flex-direction: column;
+                gap: 6px;
+            }
+            .api-card .card-signature {
+                font-size: 12px;
+                padding: 6px 10px;
+            }
+            .func-index-header, .func-index-row {
+                grid-template-columns: 1fr;
+                gap: 4px;
+                padding: 10px 12px;
+            }
+            .func-index-header span:not(:first-child) {
+                display: none;
+            }
+            .func-index-row .func-idx {
+                display: none;
+            }
+        }
+        /* ===== Scrollbar ===== */
+        .sidebar::-webkit-scrollbar,
+        .main-content::-webkit-scrollbar {
+            width: 5px;
+        }
+        .sidebar::-webkit-scrollbar-track,
+        .main-content::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .sidebar::-webkit-scrollbar-thumb,
+        .main-content::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 10px;
+        }
+        .sidebar::-webkit-scrollbar-thumb:hover,
+        .main-content::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+        /* ===== Animation ===== */
+        .fade-in {
+            animation: fadeIn 0.25s ease;
+        }
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== Header ===== -->
+    <header class="app-header">
+        <div class="brand">
+            <h1>📷 Insight9 SDK</h1>
+            <small id="headerSub">API Browser</small>
+        </div>
+        <div class="header-right">
+            <div class="header-stats" id="headerStats">
+                <span id="statTotal">📦 Total <span class="num" id="totalCount">0</span></span>
+                <span id="statFunc">⚙️ Functions <span class="num" id="funcCount">0</span></span>
+                <span id="statStruct">📐 Structs <span class="num" id="structCount">0</span></span>
+                <span id="statEnum">🏷️ Enums <span class="num" id="enumCount">0</span></span>
+                <span id="statCallback">🔄 Callbacks <span class="num" id="callbackCount">0</span></span>
+            </div>
+            <div class="lang-switch">
+                <button id="langZh" data-lang="zh">中文</button>
+                <button id="langEn" class="active" data-lang="en">English</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- ===== Body ===== -->
+    <div class="app-body">
+
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="🔍 Search API... (name/desc)" />
+            </div>
+            <ul class="category-list" id="categoryList">
+                <li data-category="all" class="active"><span id="catAll">📋 All</span> <span class="badge" id="badgeAll">0</span></li>
+                <li data-category="func"><span id="catFunc">⚙️ Functions</span> <span class="badge" id="badgeFunc">0</span></li>
+                <li data-category="struct"><span id="catStruct">📐 Structs</span> <span class="badge" id="badgeStruct">0</span></li>
+                <li data-category="enum"><span id="catEnum">🏷️ Enums</span> <span class="badge" id="badgeEnum">0</span></li>
+                <li data-category="callback"><span id="catCallback">🔄 Callbacks</span> <span class="badge" id="badgeCallback">0</span></li>
+                <li data-category="const"><span id="catConst">📌 Constants</span> <span class="badge" id="badgeConst">0</span></li>
+                <li data-category="func_index" style="margin-top:8px;border-top:1px solid #e2e8f0;border-radius:0;padding-top:14px;">
+                    <span id="catFuncIndex">📑 Function Quick Reference</span> <span class="badge" id="badgeFuncIndex">0</span>
+                </li>
+            </ul>
+            <div class="file-tag">
+                <div><span class="dot v1"></span> <strong>Insight_9_receive.h</strong> <span id="fileV1Label">(v1)</span></div>
+                <div style="margin-top:6px;"><span class="dot v2"></span> <strong>Insight9SDK.h</strong> <span id="fileV2Label">(v2)</span></div>
+                <div style="margin-top:10px;font-size:12px;color:#64748b;">
+                    <span id="fileMergeLabel">Merged · </span> <span id="fileTotal">0</span> <span id="fileApiLabel">API elements</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main -->
+        <main class="main-content" id="mainContent">
+            <div class="empty-state" id="emptyState">
+                <div class="icon">🔎</div>
+                <h3 id="emptyTitle">Select a category or search</h3>
+                <p id="emptyDesc">Choose a category from the left or enter keywords</p>
+            </div>
+            <div class="api-grid" id="apiGrid"></div>
+        </main>
+
+    </div>
+
+    <script>
+        // ================================================================
+        //  Localization resources (UI strings)
+        // ================================================================
+        const LOCALE = {
+            zh: {
+                headerSub: 'API 浏览器',
+                statTotal: '📦 总数',
+                statFunc: '⚙️ 函数',
+                statStruct: '📐 结构体',
+                statEnum: '🏷️ 枚举',
+                statCallback: '🔄 回调',
+                searchPlaceholder: '🔍 搜索 API... (名称/描述)',
+                catAll: '📋 全部',
+                catFunc: '⚙️ 函数',
+                catStruct: '📐 结构体',
+                catEnum: '🏷️ 枚举',
+                catCallback: '🔄 回调',
+                catConst: '📌 常量',
+                catFuncIndex: '📑 函数速查',
+                fileV1Label: '(v1)',
+                fileV2Label: '(v2)',
+                fileMergeLabel: '合并展示 · 共',
+                fileApiLabel: '个 API 元素',
+                emptyTitle: '选择分类或搜索',
+                emptyDesc: '从左侧选择 API 分类，或输入关键词搜索',
+                labelParams: '📥 参数',
+                labelReturns: '📤 返回',
+                labelFile: '📁 文件',
+                labelCategory: '🏷️ 分类',
+                funcIndexHead1: '#',
+                funcIndexHead2: '函数名',
+                funcIndexHead3: '功能描述',
+            },
+            en: {
+                headerSub: 'API Browser',
+                statTotal: '📦 Total',
+                statFunc: '⚙️ Functions',
+                statStruct: '📐 Structs',
+                statEnum: '🏷️ Enums',
+                statCallback: '🔄 Callbacks',
+                searchPlaceholder: '🔍 Search API... (name/desc)',
+                catAll: '📋 All',
+                catFunc: '⚙️ Functions',
+                catStruct: '📐 Structs',
+                catEnum: '🏷️ Enums',
+                catCallback: '🔄 Callbacks',
+                catConst: '📌 Constants',
+                catFuncIndex: '📑 Function Quick Reference',
+                fileV1Label: '(v1)',
+                fileV2Label: '(v2)',
+                fileMergeLabel: 'Merged · ',
+                fileApiLabel: 'API elements',
+                emptyTitle: 'Select a category or search',
+                emptyDesc: 'Choose a category from the left or enter keywords',
+                labelParams: '📥 Params',
+                labelReturns: '📤 Returns',
+                labelFile: '📁 File',
+                labelCategory: '🏷️ Category',
+                funcIndexHead1: '#',
+                funcIndexHead2: 'Function',
+                funcIndexHead3: 'Description',
+            }
+        };
+
+        // ================================================================
+        //  API Data (bilingual descriptions)
+        //  Ordered as: consts → structs → enums → callbacks → funcs
+        // ================================================================
+        const API_DATA = {
+            consts: [
+                { name: 'VENDOR_ID / PRODUCT_ID', desc: { zh: '目标设备 USB VID/PID', en: 'Target device USB VID/PID' }, value: '0x3652 / 0x0b5c', file: 'v1' },
+                { name: 'CAM_NUM / HID_NUM', desc: { zh: '相机数量 / HID 设备数量', en: 'Number of cameras / HID devices' }, value: '3 / 2', file: 'v1' },
+                { name: 'MAIN_WIDTH / MAIN_HEIGHT', desc: { zh: '主相机 (RGB) 默认分辨率', en: 'Default resolution for main (RGB) camera' }, value: '1088 x 1920', file: 'v1' },
+                { name: 'SUB_WIDTH / SUB_HEIGHT', desc: { zh: '灰度相机默认分辨率', en: 'Default resolution for grayscale camera' }, value: '544 x 1281', file: 'v1' },
+                { name: 'DEPTH_WIDTH / DEPTH_HEIGHT', desc: { zh: '深度相机默认分辨率', en: 'Default resolution for depth camera' }, value: '544 x 642', file: 'v1' },
+                { name: 'FRAME_RATE', desc: { zh: '默认帧率', en: 'Default frame rate' }, value: '30 fps', file: 'v1' },
+                { name: 'BUFFER_COUNT', desc: { zh: '缓冲区数量', en: 'Number of buffers' }, value: '8', file: 'v1' },
+                { name: 'METADATA_SIZE', desc: { zh: 'Metadata 数据大小', en: 'Metadata size in bytes' }, value: '258 字节', file: 'v1' },
+                { name: 'INSIGHT9_CALIB_CAM_LEFT', desc: { zh: '左灰度相机标定索引', en: 'Left grayscale camera calibration index' }, value: '0', file: 'both' },
+                { name: 'INSIGHT9_CALIB_CAM_RIGHT', desc: { zh: '右灰度相机标定索引', en: 'Right grayscale camera calibration index' }, value: '1', file: 'both' },
+                { name: 'INSIGHT9_CALIB_CAM_RGB', desc: { zh: 'RGB 相机标定索引', en: 'RGB camera calibration index' }, value: '2', file: 'both' },
+            ],
+            structs: [
+                { name: 'camera_params', desc: { zh: '相机参数结构体，包含曝光、增益、白平衡、锐度等所有可调参数。', en: 'Camera parameters: exposure, gain, white balance, sharpness, etc.' },
+                    members: [
+                        { name: 'cam_id', type: 'uint8_t', desc: { zh: '相机 ID (0/1)', en: 'Camera ID (0/1)' } },
+                        { name: 'resolution', type: 'uint8_t', desc: { zh: '分辨率索引', en: 'Resolution index' } },
+                        { name: 'frame_rate', type: 'uint8_t', desc: { zh: '帧率索引 (0-5)', en: 'Frame-rate index (0-5)' } },
+                        { name: 'exposure_time', type: 'float', desc: { zh: '曝光时间 (秒), 0.0~0.03', en: 'Exposure time (seconds), 0.0~0.03' } },
+                        { name: 'exposure_gain', type: 'float', desc: { zh: '曝光增益, 1.0~16.0', en: 'Exposure gain, 1.0~16.0' } },
+                        { name: 'auto_exposure', type: 'uint8_t', desc: { zh: '自动曝光 (0/1)', en: 'Auto exposure (0/1)' } },
+                        { name: 'brightness', type: 'float', desc: { zh: '亮度, 0.0~127.0', en: 'Brightness, 0.0~127.0' } },
+                        { name: 'contrast', type: 'float', desc: { zh: '对比度, 0.0~1.9', en: 'Contrast, 0.0~1.9' } },
+                        { name: 'gamma_dark', type: 'float', desc: { zh: '暗部伽马, 1.0~4.0', en: 'Dark gamma, 1.0~4.0' } },
+                        { name: 'hue', type: 'float', desc: { zh: '色相, 0.0~87.0', en: 'Hue, 0.0~87.0' } },
+                        { name: 'saturation', type: 'float', desc: { zh: '饱和度, 0.0~1.999', en: 'Saturation, 0.0~1.999' } },
+                        { name: 'sharpness', type: 'uint8_t', desc: { zh: '锐度 (1~255)', en: 'Sharpness (1~255)' } },
+                        { name: 'auto_white_balance', type: 'uint8_t', desc: { zh: '自动白平衡 (0/1)', en: 'Auto white balance (0/1)' } },
+                        { name: 'white_balance', type: 'float', desc: { zh: '白平衡, 1.0~3.0', en: 'White balance, 1.0~3.0' } },
+                        { name: 'decimation', type: 'uint8_t', desc: { zh: '降采样 (1~255)', en: 'Decimation (1~255)' } },
+                        { name: 'hardware_model', type: 'uint8_t', desc: { zh: '硬件型号', en: 'Hardware model' } }
+                    ],
+                    file: 'both' },
+                { name: 'camera_intrinsics', desc: { zh: '相机内参，与 ROS sensor_msgs/CameraInfo 对齐。', en: 'Camera intrinsics aligned with ROS sensor_msgs/CameraInfo.' },
+                    members: [
+                        { name: 'sec / nsec', type: 'uint32_t', desc: { zh: '标定时间戳 (秒/纳秒)', en: 'Calibration timestamp (sec/nsec)' } },
+                        { name: 'frame_id', type: 'char[32]', desc: { zh: '相机 frame ID', en: 'Camera frame ID' } },
+                        { name: 'height / width', type: 'uint32_t', desc: { zh: '标定图像尺寸', en: 'Calibration image dimensions' } },
+                        { name: 'distortion_model', type: 'char[32]', desc: { zh: '畸变模型 (如 "plumb_bob")', en: 'Distortion model (e.g. "plumb_bob")' } },
+                        { name: 'd[4]', type: 'float', desc: { zh: '畸变系数', en: 'Distortion coefficients' } },
+                        { name: 'k[9]', type: 'float', desc: { zh: '3x3 内参矩阵 (行主序)', en: '3x3 intrinsic matrix (row-major)' } },
+                        { name: 'r[9]', type: 'float', desc: { zh: '3x3 整流矩阵 (行主序)', en: '3x3 rectification matrix (row-major)' } },
+                        { name: 'p[12]', type: 'float', desc: { zh: '3x4 投影矩阵 (行主序)', en: '3x4 projection matrix (row-major)' } },
+                        { name: 'binning_x/y', type: 'uint32_t', desc: { zh: 'Binning 因子', en: 'Binning factors' } },
+                        { name: 'roi_*', type: 'uint32_t', desc: { zh: 'ROI 区域参数', en: 'ROI region parameters' } },
+                        { name: 'roi_do_rectify', type: 'uint8_t', desc: { zh: 'ROI 整流标志', en: 'ROI rectify flag' } }
+                    ],
+                    file: 'both' },
+                { name: 'camera_extrinsics', desc: { zh: '相机外参，描述从父 frame 到子 frame 的变换。', en: 'Camera extrinsics: transform from parent to child frame.' },
+                    members: [
+                        { name: 'parent_frame_id', type: 'char[32]', desc: { zh: '父 frame ID', en: 'Parent frame ID' } },
+                        { name: 'child_frame_id', type: 'char[32]', desc: { zh: '子 frame ID (本相机)', en: 'Child frame ID (this camera)' } },
+                        { name: 'translation[3]', type: 'double', desc: { zh: '平移量 (x, y, z), 单位 m', en: 'Translation (x, y, z) in meters' } },
+                        { name: 'rotation[4]', type: 'double', desc: { zh: '旋转四元数 (x, y, z, w)', en: 'Quaternion (x, y, z, w)' } }
+                    ],
+                    file: 'both' },
+                { name: 'camera_calib', desc: { zh: '完整的相机标定：内参 + 外参。', en: 'Full camera calibration: intrinsics + extrinsics.' },
+                    members: [
+                        { name: 'intrinsics', type: 'camera_intrinsics', desc: { zh: '内参', en: 'Intrinsics' } },
+                        { name: 'extrinsics', type: 'camera_extrinsics', desc: { zh: '外参', en: 'Extrinsics' } }
+                    ],
+                    file: 'both' },
+                { name: 'video_config_t', desc: { zh: '单个相机的视频配置（分辨率、帧率、像素格式）。', en: 'Video configuration for one camera (resolution, fps, pixel format).' },
+                    members: [
+                        { name: 'width', type: 'int', desc: { zh: '宽度', en: 'Width' } },
+                        { name: 'height', type: 'int', desc: { zh: '高度', en: 'Height' } },
+                        { name: 'fps', type: 'int', desc: { zh: '帧率', en: 'Frame rate' } },
+                        { name: 'pixel_format', type: 'PixelFormat', desc: { zh: '像素格式', en: 'Pixel format' } }
+                    ],
+                    file: 'v2' },
+                { name: 'insight9_config_t', desc: { zh: 'SDK 初始化配置，包含三路相机的配置。', en: 'SDK initialization config with three camera streams.' },
+                    members: [
+                        { name: 'rgb_config', type: 'video_config_t', desc: { zh: 'RGB 相机配置', en: 'RGB camera config' } },
+                        { name: 'gray_config', type: 'video_config_t', desc: { zh: '灰度相机配置', en: 'Grayscale camera config' } },
+                        { name: 'depth_config', type: 'video_config_t', desc: { zh: '深度相机配置', en: 'Depth camera config' } }
+                    ],
+                    file: 'v2' },
+                { name: 'DeviceCapability', desc: { zh: '设备能力集条目，描述一种支持的配置。', en: 'One supported capability entry (resolution, fps, format).' },
+                    members: [
+                        { name: 'width', type: 'int', desc: { zh: '宽度', en: 'Width' } },
+                        { name: 'height', type: 'int', desc: { zh: '高度', en: 'Height' } },
+                        { name: 'fps', type: 'int', desc: { zh: '帧率', en: 'Frame rate' } },
+                        { name: 'format', type: 'PixelFormat', desc: { zh: '像素格式', en: 'Pixel format' } },
+                        { name: 'valid', type: 'bool', desc: { zh: '是否有效', en: 'Validity flag' } }
+                    ],
+                    file: 'v2' },
+                { name: 'DeviceCapabilities_t', desc: { zh: '设备完整能力集，包含三路相机的所有支持配置及默认配置。', en: 'Complete device capabilities for all camera streams.' },
+                    members: [
+                        { name: 'rgb_capabilities', type: 'std::vector<DeviceCapability>', desc: { zh: 'RGB 支持配置列表', en: 'RGB supported configs' } },
+                        { name: 'gray_capabilities', type: 'std::vector<DeviceCapability>', desc: { zh: '灰度支持配置列表', en: 'Grayscale supported configs' } },
+                        { name: 'depth_capabilities', type: 'std::vector<DeviceCapability>', desc: { zh: '深度支持配置列表', en: 'Depth supported configs' } },
+                        { name: 'rgb_default', type: 'DeviceCapability', desc: { zh: 'RGB 默认配置', en: 'RGB default config' } },
+                        { name: 'gray_default', type: 'DeviceCapability', desc: { zh: '灰度默认配置', en: 'Grayscale default config' } },
+                        { name: 'depth_default', type: 'DeviceCapability', desc: { zh: '深度默认配置', en: 'Depth default config' } },
+                        { name: 'initialized', type: 'bool', desc: { zh: '是否已初始化', en: 'Initialization flag' } }
+                    ],
+                    file: 'v2' },
+                { name: 'buffer', desc: { zh: '【v1】视频缓冲区描述。', en: '[v1] Video buffer descriptor.' },
+                    members: [
+                        { name: 'start', type: 'void*', desc: { zh: '缓冲区起始地址', en: 'Buffer start address' } },
+                        { name: 'length', type: 'size_t', desc: { zh: '缓冲区长度', en: 'Buffer length' } }
+                    ],
+                    file: 'v1' },
+                { name: 'uvc_frame_info', desc: { zh: '【v1】UVC 帧信息。', en: '[v1] UVC frame info.' },
+                    members: [
+                        { name: 'width', type: 'unsigned int', desc: { zh: '宽度', en: 'Width' } },
+                        { name: 'height', type: 'unsigned int', desc: { zh: '高度', en: 'Height' } },
+                        { name: 'intervals', type: 'unsigned int[8]', desc: { zh: '帧间隔列表', en: 'Frame intervals' } }
+                    ],
+                    file: 'v1' },
+                { name: 'uvc_format_info', desc: { zh: '【v1】UVC 格式信息。', en: '[v1] UVC format info.' },
+                    members: [
+                        { name: 'fcc', type: 'unsigned int', desc: { zh: 'FourCC 格式码', en: 'FourCC format code' } },
+                        { name: 'frames_num', type: 'int', desc: { zh: '帧信息数量', en: 'Number of frame infos' } },
+                        { name: 'frames', type: 'struct uvc_frame_info*', desc: { zh: '帧信息数组', en: 'Frame info array' } }
+                    ],
+                    file: 'v1' },
+                { name: 'cam_ctx', desc: { zh: '【v1】相机上下文。', en: '[v1] Camera context.' },
+                    members: [
+                        { name: 'fd', type: 'int', desc: { zh: '视频设备 fd', en: 'Video device fd' } },
+                        { name: 'buffers', type: 'struct buffer*', desc: { zh: '缓冲区数组', en: 'Buffer array' } },
+                        { name: 'meta_fd', type: 'int', desc: { zh: 'metadata 设备 fd', en: 'Metadata device fd' } },
+                        { name: 'meta_buffers', type: 'struct buffer*', desc: { zh: 'metadata 缓冲区', en: 'Metadata buffers' } },
+                        { name: 'meta_buffer_count', type: 'int', desc: { zh: 'metadata 缓冲区数量', en: 'Metadata buffer count' } },
+                        { name: 'buffer_count', type: 'int', desc: { zh: '缓冲区数量', en: 'Buffer count' } },
+                        { name: 'tid', type: 'pthread_t', desc: { zh: '采集线程 ID', en: 'Capture thread ID' } },
+                        { name: 'cam_id', type: 'int', desc: { zh: '相机 ID', en: 'Camera ID' } },
+                        { name: 'width/height/fps', type: 'int', desc: { zh: '图像参数', en: 'Image parameters' } },
+                        { name: 'format/format_num', type: 'unsigned int', desc: { zh: '格式信息', en: 'Format info' } },
+                        { name: 'formats_info', type: 'struct uvc_format_info*', desc: { zh: '格式列表', en: 'Format list' } },
+                        { name: 'last_timestamp', type: 'uint64_t', desc: { zh: '最后时间戳', en: 'Last timestamp' } },
+                        { name: 'fd_lock', type: 'pthread_mutex_t', desc: { zh: 'fd 互斥锁', en: 'fd mutex' } }
+                    ],
+                    file: 'v1' },
+            ],
+            enums: [
+                { name: 'PixelFormat', desc: { zh: '像素格式枚举 (v2 更完整)。', en: 'Pixel format enum (v2 includes more).' },
+                    values: [
+                        { name: 'Unknown', value: '0', desc: { zh: '', en: '' } },
+                        { name: 'MJPEG', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'GREY', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'Z16', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'RGB8', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'Y8I', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'YUYV', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'NV12', value: '-', desc: { zh: '', en: '' } },
+                        { name: 'YVYU', value: '- (v2 only)', desc: { zh: '', en: '' } }
+                    ],
+                    file: 'both' },
+                { name: 'VioStatus', desc: { zh: 'VIO 状态枚举，与设备固件匹配。', en: 'VIO status enum, matches device firmware.' },
+                    values: [
+                        { name: 'NOT_INITED', value: '0', desc: { zh: '未初始化', en: 'Not initialized' } },
+                        { name: 'RESTARTING', value: '1', desc: { zh: '重启中', en: 'Restarting' } },
+                        { name: 'STOPPED', value: '2', desc: { zh: '已停止', en: 'Stopped' } },
+                        { name: 'TRACKING', value: '3', desc: { zh: '跟踪中', en: 'Tracking' } },
+                        { name: 'TRACKING_STATIC', value: '4', desc: { zh: '静态跟踪', en: 'Static tracking' } },
+                        { name: 'TRACKINGLOST', value: '5', desc: { zh: '跟踪丢失', en: 'Tracking lost' } },
+                        { name: 'DATA_LOST', value: '6', desc: { zh: '数据丢失', en: 'Data lost' } },
+                        { name: 'Unknown', value: '0xFF', desc: { zh: '未知状态', en: 'Unknown status' } }
+                    ],
+                    file: 'both' },
+            ],
+            callbacks: [
+                { name: 'image_callback', sig: 'typedef void (*image_callback)(int cam_id, uint8_t *data, size_t size, int width, int height, unsigned int format, uint64_t timestamp, void *userdata)',
+                    desc: { zh: '图像数据回调函数。', en: 'Image data callback.' },
+                    params: { zh: 'cam_id: 相机 ID (0=RGB, 1=灰度, 2=深度); data: 图像数据; size: 数据大小; width/height: 图像尺寸; format: V4L2 像素格式; timestamp: 时间戳 (微秒); userdata: 用户指针。',
+                              en: 'cam_id: Camera ID (0=RGB, 1=grayscale, 2=depth); data: image data; size: data size; width/height: image dimensions; format: V4L2 pixel format; timestamp: timestamp (µs); userdata: user pointer.' },
+                    file: 'both' },
+                { name: 'imu_callback', sig: 'typedef void (*imu_callback)(float ax, float ay, float az, float gx, float gy, float gz, uint64_t timestamp, void *userdata)',
+                    desc: { zh: 'IMU 数据回调函数。', en: 'IMU data callback.' },
+                    params: { zh: 'ax/ay/az: 加速度计原始值; gx/gy/gz: 陀螺仪原始值; timestamp: 设备时间戳; userdata: 用户指针。',
+                              en: 'ax/ay/az: accelerometer raw values; gx/gy/gz: gyroscope raw values; timestamp: device timestamp; userdata: user pointer.' },
+                    file: 'both' },
+                { name: 'vio_callback', sig: 'typedef void (*vio_callback)(float px, float py, float pz, float qx, float qy, float qz, float qw, uint64_t timestamp, void *userdata)',
+                    desc: { zh: 'VIO 位姿数据回调函数。', en: 'VIO pose data callback.' },
+                    params: { zh: 'px/py/pz: 位置坐标; qx/qy/qz/qw: 方向四元数; timestamp: 时间戳; userdata: 用户指针。',
+                              en: 'px/py/pz: position; qx/qy/qz/qw: orientation quaternion; timestamp: timestamp; userdata: user pointer.' },
+                    file: 'both' },
+            ],
+            funcs: [
+                { name: 'insight9_receive_init', sig: 'int insight9_receive_init(const insight9_config_t* config)',
+                    desc: { zh: '使用自定义配置初始化 SDK。', en: 'Initialize SDK with custom configuration.' },
+                    params: { zh: 'config: 包含各相机分辨率、FPS 和像素格式的配置结构体。', en: 'config: configuration struct with resolution, fps, and pixel format for each camera.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '初始化/清理', en: 'Init/Cleanup' } },
+                { name: 'insight9_receive_init_default', sig: 'int insight9_receive_init_default(void)',
+                    desc: { zh: '使用默认配置初始化 SDK。', en: 'Initialize SDK with default configuration.' },
+                    params: { zh: '无', en: 'None' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '初始化/清理', en: 'Init/Cleanup' } },
+                { name: 'insight9_receive_cleanup', sig: 'void insight9_receive_cleanup(void)',
+                    desc: { zh: '释放所有资源。必须在停止后调用。', en: 'Release all resources. Must be called after stop.' },
+                    params: { zh: '无', en: 'None' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '初始化/清理', en: 'Init/Cleanup' } },
+                { name: 'insight9_receive_start', sig: 'int insight9_receive_start(void)',
+                    desc: { zh: '启动所有采集线程。', en: 'Start all capture threads.' },
+                    params: { zh: '无', en: 'None' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '启动/停止', en: 'Start/Stop' } },
+                { name: 'insight9_receive_stop', sig: 'void insight9_receive_stop(void)',
+                    desc: { zh: '停止所有采集线程。', en: 'Stop all capture threads.' },
+                    params: { zh: '无', en: 'None' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '启动/停止', en: 'Start/Stop' } },
+                { name: 'insight9_receive_start_camera', sig: 'int insight9_receive_start_camera(int cam_id)',
+                    desc: { zh: '启动指定相机。cam_id: 0=RGB, 1=灰度, 2=深度。', en: 'Start specified camera. cam_id: 0=RGB, 1=grayscale, 2=depth.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '启动/停止', en: 'Start/Stop' } },
+                { name: 'insight9_receive_stop_camera', sig: 'void insight9_receive_stop_camera(int cam_id)',
+                    desc: { zh: '停止指定相机。', en: 'Stop specified camera.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '启动/停止', en: 'Start/Stop' } },
+                { name: 'insight9_receive_restart_camera', sig: 'int insight9_receive_restart_camera(int cam_id)',
+                    desc: { zh: '重启指定相机（停止后重新启动）。', en: 'Restart specified camera (stop then start).' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '启动/停止', en: 'Start/Stop' } },
+                { name: 'insight9_receive_is_camera_running', sig: 'int insight9_receive_is_camera_running(int cam_id)',
+                    desc: { zh: '检查相机是否正在运行。', en: 'Check if camera is running.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '1 运行中, 0 未运行。', en: '1 if running, 0 otherwise.' },
+                    file: 'both', category: { zh: '启动/停止', en: 'Start/Stop' } },
+                { name: 'insight9_receive_switch_camera_fps', sig: 'int insight9_receive_switch_camera_fps(int cam_id, int fps)',
+                    desc: { zh: '立即切换指定相机的帧率（停止→更新配置→重启）。', en: 'Immediately switch camera FPS (stop → update → restart).' },
+                    params: { zh: 'cam_id: 相机 ID; fps: 目标帧率。', en: 'cam_id: camera ID; fps: target FPS.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_set_camera_fps', sig: 'int insight9_receive_set_camera_fps(int cam_id, int fps)',
+                    desc: { zh: '设置指定相机的帧率（仅存储配置，需要重启生效）。', en: 'Set camera FPS (store config, requires restart).' },
+                    params: { zh: 'cam_id: 相机 ID; fps: 目标帧率。', en: 'cam_id: camera ID; fps: target FPS.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_get_current_format', sig: 'int insight9_receive_get_current_format(int cam_id, int *width, int *height, unsigned int *format)',
+                    desc: { zh: '【v1】获取指定相机的当前视频格式（V4L2 像素格式）。', en: '[v1] Get current video format (V4L2 pixel format) for camera.' },
+                    params: { zh: 'cam_id: 相机 ID; width/height/format: 输出参数。', en: 'cam_id: camera ID; width/height/format: output parameters.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v1', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_get_camera_config', sig: 'int insight9_receive_get_camera_config(int cam_id, int* width, int* height, PixelFormat* format, int* fps)',
+                    desc: { zh: '【v2】获取指定相机的当前配置（分辨率、像素格式、帧率）。', en: '[v2] Get current camera configuration (resolution, format, FPS).' },
+                    params: { zh: 'cam_id: 相机 ID; width/height/format/fps: 输出参数。', en: 'cam_id: camera ID; width/height/format/fps: output parameters.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_set_camera_format', sig: 'int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format)',
+                    desc: { zh: '【v2】设置指定相机的分辨率/格式（存储配置，需重启生效）。', en: '[v2] Set camera resolution/format (store config, requires restart).' },
+                    params: { zh: 'cam_id: 相机 ID; width/height/format: 目标值。', en: 'cam_id: camera ID; width/height/format: target values.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_switch_camera_format', sig: 'int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format)',
+                    desc: { zh: '【v2】立即切换指定相机的分辨率/格式（停止→更新→重启）。', en: '[v2] Immediately switch camera resolution/format (stop → update → restart).' },
+                    params: { zh: 'cam_id: 相机 ID; width/height/format: 目标值。', en: 'cam_id: camera ID; width/height/format: target values.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_switch_camera_config', sig: 'int insight9_receive_switch_camera_config(int cam_id, int width, int height, PixelFormat format, int fps)',
+                    desc: { zh: '【v2】立即切换指定相机的完整配置（分辨率、格式、帧率）。', en: '[v2] Immediately switch camera full configuration (resolution, format, FPS).' },
+                    params: { zh: 'cam_id: 相机 ID; width/height/format/fps: 目标值。', en: 'cam_id: camera ID; width/height/format/fps: target values.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '配置', en: 'Configuration' } },
+                { name: 'insight9_receive_get_current_fps', sig: 'int insight9_receive_get_current_fps(int* fps)',
+                    desc: { zh: '获取当前帧率。', en: 'Get current frame rate.' },
+                    params: { zh: 'fps: 输出参数。', en: 'fps: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '查询', en: 'Query' } },
+                { name: 'insight9_receive_get_video_dev', sig: 'const char *insight9_receive_get_video_dev(int cam_id)',
+                    desc: { zh: '获取指定相机的视频设备路径。', en: 'Get video device path for specified camera.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '设备路径字符串，失败返回 NULL。', en: 'Device path string, or NULL on failure.' },
+                    file: 'both', category: { zh: '设备', en: 'Device' } },
+                { name: 'insight9_receive_get_metadata_dev', sig: 'const char *insight9_receive_get_metadata_dev(int cam_id)',
+                    desc: { zh: '获取指定相机的 metadata 设备路径。', en: 'Get metadata device path for specified camera.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '设备路径字符串，失败返回 NULL。', en: 'Device path string, or NULL on failure.' },
+                    file: 'both', category: { zh: '设备', en: 'Device' } },
+                { name: 'insight9_receive_read_metadata_timestamp', sig: 'int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp)',
+                    desc: { zh: '从 metadata 设备读取时间戳。', en: 'Read metadata timestamp from metadata device.' },
+                    params: { zh: 'cam_id: 相机 ID; timestamp: 输出参数。', en: 'cam_id: camera ID; timestamp: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '设备', en: 'Device' } },
+                { name: 'insight9_receive_register_image_callback', sig: 'void insight9_receive_register_image_callback(image_callback cb, void *userdata)',
+                    desc: { zh: '注册图像数据回调。', en: 'Register image data callback.' },
+                    params: { zh: 'cb: 回调函数; userdata: 用户指针。', en: 'cb: callback function; userdata: user pointer.' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '回调', en: 'Callback' } },
+                { name: 'insight9_receive_register_imu_callback', sig: 'void insight9_receive_register_imu_callback(imu_callback cb, void *userdata)',
+                    desc: { zh: '注册 IMU 数据回调。', en: 'Register IMU data callback.' },
+                    params: { zh: 'cb: 回调函数; userdata: 用户指针。', en: 'cb: callback function; userdata: user pointer.' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '回调', en: 'Callback' } },
+                { name: 'insight9_receive_register_vio_callback', sig: 'void insight9_receive_register_vio_callback(vio_callback cb, void *userdata)',
+                    desc: { zh: '注册 VIO 位姿数据回调。', en: 'Register VIO pose data callback.' },
+                    params: { zh: 'cb: 回调函数; userdata: 用户指针。', en: 'cb: callback function; userdata: user pointer.' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '回调', en: 'Callback' } },
+                { name: 'insight9_receive_set_active_camera', sig: 'int insight9_receive_set_active_camera(int cam_id)',
+                    desc: { zh: '设置当前活跃相机（用于参数读写）。cam_id: 0=RGB, 1=立体灰度。', en: 'Set active camera for parameter read/write. cam_id: 0=RGB, 1=stereo grayscale.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_get_active_camera', sig: 'int insight9_receive_get_active_camera(int *cam_id)',
+                    desc: { zh: '读取当前活跃相机 ID。', en: 'Get active camera ID.' },
+                    params: { zh: 'cam_id: 输出参数。', en: 'cam_id: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_set_camera_params', sig: 'int insight9_receive_set_camera_params(const camera_params *params)',
+                    desc: { zh: '设置当前活跃相机的所有参数。注意: params->cam_id 被忽略。', en: 'Set all parameters for currently active camera. Note: params->cam_id is ignored.' },
+                    params: { zh: 'params: 参数结构体指针。', en: 'params: parameter struct pointer.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_get_camera_params', sig: 'int insight9_receive_get_camera_params(camera_params *params)',
+                    desc: { zh: '读取当前活跃相机的所有参数。', en: 'Get all parameters for currently active camera.' },
+                    params: { zh: 'params: 输出参数。', en: 'params: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_set_camera_params_for', sig: 'int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params)',
+                    desc: { zh: '设置指定相机的所有参数。', en: 'Set all parameters for specified camera.' },
+                    params: { zh: 'cam_id: 相机 ID; params: 参数结构体指针。', en: 'cam_id: camera ID; params: parameter struct pointer.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_get_camera_params_for', sig: 'int insight9_receive_get_camera_params_for(int cam_id, camera_params *params)',
+                    desc: { zh: '读取指定相机的所有参数。', en: 'Get all parameters for specified camera.' },
+                    params: { zh: 'cam_id: 相机 ID; params: 输出参数。', en: 'cam_id: camera ID; params: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_reset_camera_params', sig: 'int insight9_receive_reset_camera_params(int cam_id)',
+                    desc: { zh: '将指定相机的参数恢复为初始值。', en: 'Reset camera parameters to initial values.' },
+                    params: { zh: 'cam_id: 相机 ID。', en: 'cam_id: camera ID.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_print_camera_params', sig: 'void insight9_receive_print_camera_params(const camera_params *params)',
+                    desc: { zh: '打印相机参数到 stdout。', en: 'Print camera parameters to stdout.' },
+                    params: { zh: 'params: 参数结构体指针。', en: 'params: parameter struct pointer.' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '参数', en: 'Parameters' } },
+                { name: 'insight9_receive_get_camera_calib', sig: 'int insight9_receive_get_camera_calib(int cam_idx, camera_calib *calib)',
+                    desc: { zh: '读取指定相机的内参和外参标定数据。', en: 'Get camera intrinsics and extrinsics calibration data.' },
+                    params: { zh: 'cam_idx: INSIGHT9_CALIB_CAM_LEFT/RIGHT/RGB; calib: 输出参数。', en: 'cam_idx: INSIGHT9_CALIB_CAM_LEFT/RIGHT/RGB; calib: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '标定', en: 'Calibration' } },
+                { name: 'insight9_receive_print_camera_calib', sig: 'void insight9_receive_print_camera_calib(const camera_calib *calib)',
+                    desc: { zh: '打印相机标定数据到 stdout。', en: 'Print camera calibration data to stdout.' },
+                    params: { zh: 'calib: 标定结构体指针。', en: 'calib: calibration struct pointer.' },
+                    returns: { zh: '无', en: 'None' },
+                    file: 'both', category: { zh: '标定', en: 'Calibration' } },
+                { name: 'insight9_receive_align_depth_to_rgb', sig: 'int insight9_receive_align_depth_to_rgb(const uint16_t *depth, int depth_w, int depth_h, const camera_calib *left_calib, const camera_calib *rgb_calib, uint16_t *aligned_out, int rgb_w, int rgb_h)',
+                    desc: { zh: '将深度图（左相机坐标系）对齐到 RGB 图像平面。使用 forward warp + z-buffering。', en: 'Align depth map (left camera) to RGB image plane using forward warp + z-buffering.' },
+                    params: { zh: 'depth: 输入深度 (uint16, mm); depth_w/h: 深度尺寸; left_calib/rgb_calib: 标定; aligned_out: 输出对齐深度; rgb_w/h: RGB 尺寸。', en: 'depth: input depth (uint16, mm); depth_w/h: depth dimensions; left_calib/rgb_calib: calibrations; aligned_out: output aligned depth; rgb_w/h: RGB dimensions.' },
+                    returns: { zh: '0 成功, -1 参数无效。', en: '0 on success, -1 on invalid arguments.' },
+                    file: 'both', category: { zh: '标定', en: 'Calibration' } },
+                { name: 'insight9_receive_get_vio_status', sig: 'int insight9_receive_get_vio_status(int* status)',
+                    desc: { zh: '获取 VIO 状态。', en: 'Get VIO status.' },
+                    params: { zh: 'status: 输出参数 (VioStatus 枚举值)。', en: 'status: output parameter (VioStatus enum value).' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'both', category: { zh: '查询', en: 'Query' } },
+                { name: 'insight9_receive_get_hardware_type', sig: 'const char* insight9_receive_get_hardware_type(void)',
+                    desc: { zh: '获取硬件类型/型号字符串。', en: 'Get hardware type/model string.' },
+                    params: { zh: '无', en: 'None' },
+                    returns: { zh: '硬件型号字符串，失败返回 "unknown"。', en: 'Hardware model string, or "unknown" on failure.' },
+                    file: 'both', category: { zh: '查询', en: 'Query' } },
+                { name: 'insight9_receive_get_device_capability_count', sig: 'int insight9_receive_get_device_capability_count(int cam_id, int* count)',
+                    desc: { zh: '【v2 C++】获取指定相机支持的能力集数量。', en: '[v2 C++] Get number of supported capabilities for camera.' },
+                    params: { zh: 'cam_id: 相机 ID; count: 输出参数。', en: 'cam_id: camera ID; count: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '查询', en: 'Query' } },
+                { name: 'insight9_receive_get_device_capability_by_index', sig: 'int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap)',
+                    desc: { zh: '【v2 C++】按索引获取指定相机的能力集。', en: '[v2 C++] Get capability by index for camera.' },
+                    params: { zh: 'cam_id: 相机 ID; index: 索引; cap: 输出参数。', en: 'cam_id: camera ID; index: index; cap: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '查询', en: 'Query' } },
+                { name: 'insight9_receive_get_device_capabilities_ptr', sig: 'const DeviceCapabilities_t* insight9_receive_get_device_capabilities_ptr(void)',
+                    desc: { zh: '【v2 C++】获取设备能力集指针（包含所有相机的支持配置）。', en: '[v2 C++] Get pointer to device capabilities (all streams).' },
+                    params: { zh: '无', en: 'None' },
+                    returns: { zh: 'DeviceCapabilities_t 指针。', en: 'DeviceCapabilities_t pointer.' },
+                    file: 'v2', category: { zh: '查询', en: 'Query' } },
+                { name: 'insight9_receive_get_device_default_capability', sig: 'int insight9_receive_get_device_default_capability(int cam_id, DeviceCapability* cap)',
+                    desc: { zh: '【v2 C++】获取指定相机的默认能力集。', en: '[v2 C++] Get default capability for camera.' },
+                    params: { zh: 'cam_id: 相机 ID; cap: 输出参数。', en: 'cam_id: camera ID; cap: output parameter.' },
+                    returns: { zh: '0 成功, -1 失败。', en: '0 on success, -1 on failure.' },
+                    file: 'v2', category: { zh: '查询', en: 'Query' } },
+            ]
+        };
+
+        // ================================================================
+        //  Build allItems (ordered)
+        // ================================================================
+        const allItems = [];
+        API_DATA.consts.forEach(f => { allItems.push({ ...f, _type: 'const', _typeLabel: { zh: '常量', en: 'Constant' } }); });
+        API_DATA.structs.forEach(f => { allItems.push({ ...f, _type: 'struct', _typeLabel: { zh: '结构体', en: 'Struct' } }); });
+        API_DATA.enums.forEach(f => { allItems.push({ ...f, _type: 'enum', _typeLabel: { zh: '枚举', en: 'Enum' } }); });
+        API_DATA.callbacks.forEach(f => { allItems.push({ ...f, _type: 'callback', _typeLabel: { zh: '回调', en: 'Callback' } }); });
+        API_DATA.funcs.forEach(f => { allItems.push({ ...f, _type: 'func', _typeLabel: { zh: '函数', en: 'Function' } }); });
+
+        // ================================================================
+        //  State & Statistics
+        // ================================================================
+        let currentLang = 'en';   // default to English
+        let currentCategory = 'all';
+        let currentSearch = '';
+
+        function updateStats() {
+            const total = allItems.length;
+            const funcs = allItems.filter(i => i._type === 'func').length;
+            const structs = allItems.filter(i => i._type === 'struct').length;
+            const enums = allItems.filter(i => i._type === 'enum').length;
+            const callbacks = allItems.filter(i => i._type === 'callback').length;
+            const consts = allItems.filter(i => i._type === 'const').length;
+
+            document.getElementById('totalCount').textContent = total;
+            document.getElementById('funcCount').textContent = funcs;
+            document.getElementById('structCount').textContent = structs;
+            document.getElementById('enumCount').textContent = enums;
+            document.getElementById('callbackCount').textContent = callbacks;
+
+            document.getElementById('badgeAll').textContent = total;
+            document.getElementById('badgeFunc').textContent = funcs;
+            document.getElementById('badgeStruct').textContent = structs;
+            document.getElementById('badgeEnum').textContent = enums;
+            document.getElementById('badgeCallback').textContent = callbacks;
+            document.getElementById('badgeConst').textContent = consts;
+            document.getElementById('badgeFuncIndex').textContent = funcs;
+
+            document.getElementById('fileTotal').textContent = total;
+        }
+
+        // ================================================================
+        //  Rendering
+        // ================================================================
+        function applyLocale() {
+            const l = LOCALE[currentLang];
+            document.getElementById('headerSub').textContent = l.headerSub;
+            document.getElementById('statTotal').innerHTML = l.statTotal + ' <span class="num" id="totalCount">0</span>';
+            document.getElementById('statFunc').innerHTML = l.statFunc + ' <span class="num" id="funcCount">0</span>';
+            document.getElementById('statStruct').innerHTML = l.statStruct + ' <span class="num" id="structCount">0</span>';
+            document.getElementById('statEnum').innerHTML = l.statEnum + ' <span class="num" id="enumCount">0</span>';
+            document.getElementById('statCallback').innerHTML = l.statCallback + ' <span class="num" id="callbackCount">0</span>';
+            document.getElementById('searchInput').placeholder = l.searchPlaceholder;
+            document.getElementById('catAll').textContent = l.catAll;
+            document.getElementById('catFunc').textContent = l.catFunc;
+            document.getElementById('catStruct').textContent = l.catStruct;
+            document.getElementById('catEnum').textContent = l.catEnum;
+            document.getElementById('catCallback').textContent = l.catCallback;
+            document.getElementById('catConst').textContent = l.catConst;
+            document.getElementById('catFuncIndex').textContent = l.catFuncIndex;
+            document.getElementById('fileV1Label').textContent = l.fileV1Label;
+            document.getElementById('fileV2Label').textContent = l.fileV2Label;
+            document.getElementById('fileMergeLabel').textContent = l.fileMergeLabel;
+            document.getElementById('fileApiLabel').textContent = l.fileApiLabel;
+            document.getElementById('emptyTitle').textContent = l.emptyTitle;
+            document.getElementById('emptyDesc').textContent = l.emptyDesc;
+
+            // Update language toggle buttons
+            document.querySelectorAll('.lang-switch button').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.lang === currentLang);
+            });
+
+            updateStats();
+        }
+
+        // Helper to get localized text from bilingual objects
+        function getLocalizedText(obj) {
+            if (typeof obj === 'string') return obj;
+            if (obj && typeof obj === 'object') {
+                return obj[currentLang] || obj.en || '';
+            }
+            return obj || '';
+        }
+
+        function render() {
+            const grid = document.getElementById('apiGrid');
+            const empty = document.getElementById('emptyState');
+            const l = LOCALE[currentLang];
+
+            let filtered = [];
+
+            // Function quick reference mode
+            if (currentCategory === 'func_index') {
+                filtered = allItems.filter(i => i._type === 'func');
+                if (currentSearch.trim()) {
+                    const q = currentSearch.trim().toLowerCase();
+                    filtered = filtered.filter(i =>
+                        i.name.toLowerCase().includes(q) ||
+                        getLocalizedText(i.desc).toLowerCase().includes(q)
+                    );
+                }
+                if (filtered.length === 0) {
+                    grid.innerHTML = '';
+                    empty.style.display = 'block';
+                    return;
+                }
+                empty.style.display = 'none';
+
+                let tableHtml = `
+                            <div class="func-index-table">
+                                <div class="func-index-header">
+                                    <span>${l.funcIndexHead1}</span>
+                                    <span>${l.funcIndexHead2}</span>
+                                    <span>${l.funcIndexHead3}</span>
+                                </div>
+                        `;
+                filtered.forEach((f, idx) => {
+                    tableHtml += `
+                                <div class="func-index-row">
+                                    <span class="func-idx">${idx + 1}</span>
+                                    <span class="func-name">${escapeHtml(f.name)}</span>
+                                    <span class="func-desc">${escapeHtml(getLocalizedText(f.desc) || '-')}</span>
+                                </div>
+                            `;
+                });
+                tableHtml += `</div>`;
+                grid.innerHTML = tableHtml;
+                return;
+            }
+
+            // Normal browsing mode
+            filtered = allItems;
+            if (currentCategory !== 'all') {
+                filtered = filtered.filter(i => i._type === currentCategory);
+            }
+            if (currentSearch.trim()) {
+                const q = currentSearch.trim().toLowerCase();
+                filtered = filtered.filter(i =>
+                    i.name.toLowerCase().includes(q) ||
+                    getLocalizedText(i.desc).toLowerCase().includes(q) ||
+                    (i.sig && i.sig.toLowerCase().includes(q)) ||
+                    getLocalizedText(i.params).toLowerCase().includes(q)
+                );
+            }
+
+            if (filtered.length === 0) {
+                grid.innerHTML = '';
+                empty.style.display = 'block';
+                return;
+            }
+            empty.style.display = 'none';
+
+            let html = '';
+            filtered.forEach((item, idx) => {
+                const typeLabel = getLocalizedText(item._typeLabel);
+                const tagClass = item._type;
+                const icon = getCategoryIcon(item._type);
+
+                let detailsHtml = '';
+                if (item.params) {
+                    detailsHtml += `<div class="detail-item"><span class="label">${l.labelParams}</span><span class="value">${escapeHtml(getLocalizedText(item.params))}</span></div>`;
+                }
+                if (item.returns) {
+                    detailsHtml += `<div class="detail-item"><span class="label">${l.labelReturns}</span><span class="value">${escapeHtml(getLocalizedText(item.returns))}</span></div>`;
+                }
+                if (item.file) {
+                    detailsHtml += `<div class="detail-item"><span class="label">${l.labelFile}</span><span class="value">${getFileLabel(item.file)}</span></div>`;
+                }
+                if (item.category) {
+                    detailsHtml += `<div class="detail-item"><span class="label">${l.labelCategory}</span><span class="value">${escapeHtml(getLocalizedText(item.category))}</span></div>`;
+                }
+
+                let membersHtml = '';
+                if (item.members && item.members.length > 0) {
+                    membersHtml += '<div class="members">';
+                    item.members.forEach(m => {
+                        const mdesc = getLocalizedText(m.desc) ? ` — ${escapeHtml(getLocalizedText(m.desc))}` : '';
+                        const mval = m.value ? ` = ${escapeHtml(m.value)}` : '';
+                        membersHtml += `<div class="member">
+                                    <span class="mname">${escapeHtml(m.name)}</span>
+                                    <span class="mtype">${escapeHtml(m.type)}${mval}</span>
+                                    <span class="mdesc">${mdesc}</span>
+                                </div>`;
+                    });
+                    membersHtml += '</div>';
+                }
+
+                if (item._type === 'enum' && item.values && item.values.length > 0) {
+                    membersHtml = '<div class="members">';
+                    item.values.forEach(v => {
+                        const vdesc = getLocalizedText(v.desc) ? ` — ${escapeHtml(getLocalizedText(v.desc))}` : '';
+                        membersHtml += `<div class="member">
+                                    <span class="mname">${escapeHtml(v.name)}</span>
+                                    <span class="mtype">= ${escapeHtml(v.value)}</span>
+                                    <span class="mdesc">${vdesc}</span>
+                                </div>`;
+                    });
+                    membersHtml += '</div>';
+                }
+
+                let sigHtml = '';
+                if (item.sig) {
+                    sigHtml = `<div class="card-signature">${escapeHtml(item.sig)}</div>`;
+                }
+
+                const descHtml = getLocalizedText(item.desc) ? `<div class="card-desc">${escapeHtml(getLocalizedText(item.desc))}</div>` : '';
+
+                html += `
+                            <div class="api-card fade-in" style="animation-delay:${(idx % 20) * 0.02}s">
+                                <div class="card-header">
+                                    <span class="name">${icon} ${escapeHtml(item.name)}</span>
+                                    <div class="tags">
+                                        <span class="tag ${tagClass}">${typeLabel}</span>
+                                        ${item.file ? `<span class="tag file">${getFileLabel(item.file)}</span>` : ''}
+                                    </div>
+                                </div>
+                                ${sigHtml}
+                                ${descHtml}
+                                ${detailsHtml ? `<div class="card-details">${detailsHtml}</div>` : ''}
+                                ${membersHtml}
+                            </div>
+                        `;
+            });
+
+            grid.innerHTML = html;
+        }
+
+        // Utilities
+        function getFileLabel(file) {
+            const map = { v1: '📄 v1', v2: '📄 v2', both: '📄 both' };
+            return map[file] || file;
+        }
+        function getCategoryIcon(cat) {
+            const map = { func: '⚙️', struct: '📐', enum: '🏷️', callback: '🔄', const: '📌' };
+            return map[cat] || '📋';
+        }
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/\n/g, ' ');
+        }
+
+        // ================================================================
+        //  Event Binding
+        // ================================================================
+
+        // Language switching
+        document.querySelectorAll('.lang-switch button').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const lang = this.dataset.lang;
+                if (lang === currentLang) return;
+                currentLang = lang;
+                applyLocale();
+                render(); // Re-render to update all bilingual texts
+            });
+        });
+
+        // Category click
+        document.getElementById('categoryList').addEventListener('click', (e) => {
+            const li = e.target.closest('li');
+            if (!li) return;
+            const cat = li.dataset.category;
+            if (!cat) return;
+
+            document.querySelectorAll('#categoryList li').forEach(el => el.classList.remove('active'));
+            li.classList.add('active');
+
+            currentCategory = cat;
+            render();
+        });
+
+        // Search
+        document.getElementById('searchInput').addEventListener('input', (e) => {
+            currentSearch = e.target.value;
+            render();
+        });
+
+        // ================================================================
+        //  Start
+        // ================================================================
+
+        applyLocale(); // Apply initial language (English)
+        updateStats();
+        render();
+        console.log('✅ Insight9 SDK API Browser loaded, ' + allItems.length + ' API elements. Bilingual descriptions supported.');
+    </script>
+
+</body>
+</html>

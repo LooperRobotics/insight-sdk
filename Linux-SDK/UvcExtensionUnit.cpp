@@ -14,6 +14,7 @@ namespace viewer {
 static int uvc_control_query(int fd, __u8 unit, __u8 selector,
                              __u8 query, void *data, __u16 size)
 {
+printf("\n\n\n11111111--uvc_control_query--fd: %d\n\n\n", fd);
     struct uvc_xu_control_query xq;
     memset(&xq, 0, sizeof(xq));
     xq.unit = unit;
@@ -65,6 +66,7 @@ bool UvcExtensionUnit::open(const std::string& devicePath) {
         perror("open UVC device");
         return false;
     }
+printf("\n\n\n2222222222222--open--fd: %d\n\n\n", fd_);
 
     // Check whether the required selectors exist.
     if (!selector_exists(fd_, unitId_, kCameraParamsSelector) || !selector_exists(fd_, unitId_, kActiveCameraSelector)) {
@@ -83,6 +85,7 @@ bool UvcExtensionUnit::reopen() {
 
 void UvcExtensionUnit::close() {
     if (fd_ >= 0) {
+    printf("\n\n\n333333333--close--fd: %d\n\n\n", fd_);
         ::close(fd_);
         fd_ = -1;
     }

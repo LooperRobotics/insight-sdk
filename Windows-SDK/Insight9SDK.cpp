@@ -770,6 +770,9 @@ private:
             case PixelFormat::YUYV:
                 targetSubtype = MFVideoFormat_YUY2;
                 break;
+            case PixelFormat::YVYU:
+                targetSubtype = MFVideoFormat_YUY2;
+                break;
             case PixelFormat::NV12:
                 targetSubtype = MFVideoFormat_NV12;
                 break;
@@ -2618,6 +2621,20 @@ void insight9_receive_stop_camera(int cam_id) {
     }
 }
 
+int insight9_receive_get_camera_config(int cam_id, int* width, int* height, PixelFormat* format, int* fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+    if (!width || !height || !format || !fps) return -1;
+
+    const video_config_t* cur = (cam_id == RGB_CAM_ID) ? &g_ctx.config.rgb_config
+                               : (cam_id == GRAY_CAM_ID) ? &g_ctx.config.gray_config
+                                                          : &g_ctx.config.depth_config;
+    *width  = cur->width;
+    *height = cur->height;
+    *format = cur->pixel_format;
+    *fps    = cur->fps;
+    return 0;
+}
+
 int insight9_receive_restart_camera(int cam_id) {
     if (!g_ctx.initialized) {
         return -1;
@@ -2724,28 +2741,6 @@ int insight9_receive_set_camera_fps(int cam_id, int fps) {
     return 0;
 }
 
-int insight9_receive_switch_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id >= UVC_NUM || fps <= 0) return -1;
-
-    SDK_LOG_INFO("[SDK] Switching camera %d to %d FPS...", cam_id, fps);
-
-    insight9_receive_stop_camera(cam_id);
-    Sleep(3000);
-
-    if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
-        SDK_LOG_ERROR("[SDK] Failed to set camera %d FPS to %d", cam_id, fps);
-        return -1;
-    }
-
-    int ret = insight9_receive_restart_camera(cam_id);
-    if (ret == 0) {
-        SDK_LOG_INFO("[SDK] Camera %d switched to %d FPS successfully", cam_id, fps);
-    } else {
-        SDK_LOG_ERROR("[SDK] Failed to restart camera %d after FPS switch", cam_id);
-    }
-    return ret;
-}
-
 int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format) {
     if (!g_ctx.initialized) return -1;
     if (width <= 0 || height <= 0) return -1;
@@ -2775,11 +2770,11 @@ int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelF
     return 0;
 }
 
-int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format) {
+int insight9_receive_switch_camera_config(int cam_id, int width, int height, PixelFormat format, int fps) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
-    if (width <= 0 || height <= 0) return -1;
+    if (width <= 0 || height <= 0 || fps <= 0) return -1;
 
-    SDK_LOG_INFO("[SDK] Switching camera %d to %dx%d...", cam_id, width, height);
+    SDK_LOG_INFO("[SDK] Switching camera %d to %dx%d@%d...", cam_id, width, height, fps);
 
     insight9_receive_stop_camera(cam_id);
     Sleep(3000);
@@ -2788,14 +2783,34 @@ int insight9_receive_switch_camera_format(int cam_id, int width, int height, Pix
         SDK_LOG_ERROR("[SDK] Failed to set camera %d format", cam_id);
         return -1;
     }
+    if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
+        SDK_LOG_ERROR("[SDK] Failed to set camera %d fps", cam_id);
+        return -1;
+    }
 
     int ret = insight9_receive_restart_camera(cam_id);
     if (ret == 0) {
-        SDK_LOG_INFO("[SDK] Camera %d switched to %dx%d successfully", cam_id, width, height);
+        SDK_LOG_INFO("[SDK] Camera %d switched to %dx%d@%d successfully", cam_id, width, height, fps);
     } else {
-        SDK_LOG_ERROR("[SDK] Failed to restart camera %d after format switch", cam_id);
+        SDK_LOG_ERROR("[SDK] Failed to restart camera %d after config switch", cam_id);
     }
     return ret;
+}
+
+int insight9_receive_switch_camera_fps(int cam_id, int fps) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= UVC_NUM) return -1;
+    video_config_t* cur = (cam_id == RGB_CAM_ID) ? &g_ctx.config.rgb_config
+                        : (cam_id == GRAY_CAM_ID) ? &g_ctx.config.gray_config
+                                                    : &g_ctx.config.depth_config;
+    return insight9_receive_switch_camera_config(cam_id, cur->width, cur->height, cur->pixel_format, fps);
+}
+
+int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+    video_config_t* cur = (cam_id == RGB_CAM_ID) ? &g_ctx.config.rgb_config
+                        : (cam_id == GRAY_CAM_ID) ? &g_ctx.config.gray_config
+                                                    : &g_ctx.config.depth_config;
+    return insight9_receive_switch_camera_config(cam_id, width, height, format, cur->fps);
 }
 
 int insight9_receive_is_camera_running(int cam_id) {

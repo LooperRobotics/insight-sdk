@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <thread>
 #include <vector>
+#include <atomic>
 #include <time.h>
 
 static volatile int keep_running = 1;
@@ -96,9 +97,15 @@ struct raw_frame {
     unsigned int fmt = 0;
     bool has_new = false;
 };
-static std::mutex g_raw_lock;
-static std::condition_variable g_raw_cv;
+// One lock/CV per stream: a shared pair made the 4 MB RGB memcpy contend with the
+// depth and gray callbacks, and notify_all() woke all three workers every frame.
+static std::mutex g_raw_lock[3];
+static std::condition_variable g_raw_cv[3];
 static raw_frame g_raw[3];
+
+// Bumped whenever a worker publishes a new panel, so the display thread can skip
+// recompositing (a 6 MB clone + five resizes) when nothing has changed.
+static std::atomic<uint64_t> g_panel_seq{0};
 
 // Decoded panels + colorized aligned depth, written by worker threads and read
 // by the display thread. g_panel_lock guards this handoff.
@@ -175,18 +182,26 @@ static uint64_t get_tick_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
-static void maybe_print_img_stats_locked(void) {
+// Copy the counters out and reset them; the caller prints after unlocking.
+static int take_img_stats_locked(struct cam_stats out[3], double *elapsed_out) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     double elapsed = (now.tv_sec - g_img_last_print.tv_sec) +
                      (now.tv_nsec - g_img_last_print.tv_nsec) / 1e9;
     if (elapsed < 1.0) {
-        return;
+        return 0;
     }
+    memcpy(out, g_stats, sizeof(g_stats));
+    *elapsed_out = elapsed;
+    reset_img_stats();
+    g_img_last_print = now;
+    return 1;
+}
 
+static void print_img_stats(const struct cam_stats stats[3], double elapsed) {
     printf("\n========= Image Callbacks : 1/s =========\n");
     for (int i = 0; i < 3; i++) {
-        const struct cam_stats *cs = &g_stats[i];
+        const struct cam_stats *cs = &stats[i];
         printf("IMG[%d]: fps=%.1f ts=%lu size=%zu %dx%d format=0x%x %s\n",
                i,
                cs->cb_count / elapsed,
@@ -198,43 +213,49 @@ static void maybe_print_img_stats_locked(void) {
                image_format_to_string(cs->format));
     }
     fflush(stdout);
-
-    reset_img_stats();
-    g_img_last_print = now;
 }
 
-static void maybe_print_hid_stats_locked(void) {
+struct hid_snapshot {
+    double elapsed;
+    struct hid_stats imu;
+    struct hid_stats vio;
+    struct imu_latest_sample imu_val;
+    struct vio_latest_sample vio_val;
+};
+
+static int take_hid_stats_locked(struct hid_snapshot *snap) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     double elapsed = (now.tv_sec - g_hid_last_print.tv_sec) +
                      (now.tv_nsec - g_hid_last_print.tv_nsec) / 1e9;
     if (elapsed < 0.5) {
-        return;
+        return 0;
     }
+    snap->elapsed = elapsed;
+    snap->imu = g_imu_stats;
+    snap->vio = g_vio_stats;
+    snap->imu_val = g_imu_latest;
+    snap->vio_val = g_vio_latest;
+    reset_hid_stats();
+    g_hid_last_print = now;
+    return 1;
+}
+
+static void print_hid_stats(const struct hid_snapshot *s) {
     printf("\n========= HID Callbacks : 0.5/s =========\n");
 
     printf("IMU: hz=%.1f ax=%f ay=%f az=%f gx=%f gy=%f gz=%f ts=%lu\n",
-           g_imu_stats.cb_count / elapsed,
-           g_imu_latest.ax, g_imu_latest.ay, g_imu_latest.az,
-           g_imu_latest.gx, g_imu_latest.gy, g_imu_latest.gz,
-           (unsigned long)g_imu_stats.last_ts);
+           s->imu.cb_count / s->elapsed,
+           s->imu_val.ax, s->imu_val.ay, s->imu_val.az,
+           s->imu_val.gx, s->imu_val.gy, s->imu_val.gz,
+           (unsigned long)s->imu.last_ts);
 
     printf("VIO: hz=%.1f pos=(%f %f %f) ori=(%f %f %f %f) ts=%lu\n",
-           g_vio_stats.cb_count / elapsed,
-           g_vio_latest.px, g_vio_latest.py, g_vio_latest.pz,
-           g_vio_latest.qx, g_vio_latest.qy, g_vio_latest.qz, g_vio_latest.qw,
-           (unsigned long)g_vio_stats.last_ts);
+           s->vio.cb_count / s->elapsed,
+           s->vio_val.px, s->vio_val.py, s->vio_val.pz,
+           s->vio_val.qx, s->vio_val.qy, s->vio_val.qz, s->vio_val.qw,
+           (unsigned long)s->vio.last_ts);
     fflush(stdout);
-
-    if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
-        VioStatus vio_status = static_cast<VioStatus>(vio_status_raw);
-        printf("Current VIO status: %s (%d)\n", vio_status_to_string(vio_status), vio_status_raw);
-    } else {
-        printf("Failed to get VIO status\n");
-    }
-
-    reset_hid_stats();
-    g_hid_last_print = now;
 }
 
 static void update_hid_stats(struct hid_stats *s, uint64_t ts) {
@@ -259,12 +280,18 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
     s->height = h;
     s->format = fmt;
 
-    maybe_print_img_stats_locked();
+    struct cam_stats snapshot[3];
+    double elapsed = 0.0;
+    int want_print = take_img_stats_locked(snapshot, &elapsed);
     pthread_mutex_unlock(&g_stats_lock);
 
-    // Cheap hand-off to the per-camera worker: just copy the raw bytes.
+    // Printing is done outside the lock: this runs on the SDK's capture thread,
+    // and blocking it on terminal I/O costs V4L2 frames.
+    if (want_print) print_img_stats(snapshot, elapsed);
+
+    // Cheap hand-off to this camera's worker: just copy the raw bytes.
     {
-        std::lock_guard<std::mutex> lk(g_raw_lock);
+        std::lock_guard<std::mutex> lk(g_raw_lock[cam_id]);
         raw_frame &rf = g_raw[cam_id];
         rf.data.assign(data, data + size);
         rf.width = w;
@@ -272,7 +299,7 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
         rf.fmt = fmt;
         rf.has_new = true;
     }
-    g_raw_cv.notify_all();
+    g_raw_cv[cam_id].notify_one();
 }
 
 void my_imu_cb(float ax, float ay, float az,
@@ -287,8 +314,10 @@ void my_imu_cb(float ax, float ay, float az,
     g_imu_latest.gx = gx;
     g_imu_latest.gy = gy;
     g_imu_latest.gz = gz;
-    maybe_print_hid_stats_locked();
+    struct hid_snapshot snap;
+    int want_print = take_hid_stats_locked(&snap);
     pthread_mutex_unlock(&g_stats_lock);
+    if (want_print) print_hid_stats(&snap);
 }
 
 void my_vio_cb(float px, float py, float pz,
@@ -304,8 +333,10 @@ void my_vio_cb(float px, float py, float pz,
     g_vio_latest.qy = qy;
     g_vio_latest.qz = qz;
     g_vio_latest.qw = qw;
-    maybe_print_hid_stats_locked();
+    struct hid_snapshot snap;
+    int want_print = take_hid_stats_locked(&snap);
     pthread_mutex_unlock(&g_stats_lock);
+    if (want_print) print_hid_stats(&snap);
 }
 
 // Decode one raw frame into BGR panel(s); for depth, also align it to RGB and
@@ -316,11 +347,17 @@ static void process_raw_frame(int cam_id, const raw_frame &rf) {
     int w = rf.width, h = rf.height;
 
     if (rf.fmt == V4L2_PIX_FMT_MJPEG) {
-        // cam0 RGB. Reject truncated frames: require SOI (FFD8)...EOI (FFD9).
-        bool valid_jpeg = size >= 4 &&
-                          data[0] == 0xFF && data[1] == 0xD8 &&
-                          data[size - 2] == 0xFF && data[size - 1] == 0xD9;
-        if (!valid_jpeg) return;
+        // RGB. Reject truncated frames: require SOI (FFD8) and an EOI (FFD9).
+        // The EOI is not always the last two bytes - the firmware can pad the
+        // payload - so scan back a little instead of testing only the tail.
+        if (size < 4 || data[0] != 0xFF || data[1] != 0xD8) return;
+        size_t eoi = 0;
+        size_t scan_from = (size > 64) ? size - 64 : 2;
+        for (size_t i = size - 1; i >= scan_from + 1; i--) {
+            if (data[i - 1] == 0xFF && data[i] == 0xD9) { eoi = i + 1; break; }
+        }
+        if (eoi == 0) return;
+        size = eoi;   // ignore any trailing padding
 
         // Strip the firmware's non-standard 16-byte APP1 "TS__" segment after
         // the SOI (its bogus length otherwise desyncs libjpeg -> garbled color).
@@ -428,11 +465,14 @@ static void process_raw_frame(int cam_id, const raw_frame &rf) {
 // One dedicated worker thread per camera: waits for its latest raw frame and
 // decodes independently, so a slow stream never delays the others.
 static void camera_worker(int cam_id) {
+    // Hoisted out of the loop on purpose: swapping hands this buffer's capacity
+    // back to the staging slot, so the capture callback's assign() reuses it
+    // instead of reallocating megabytes per frame.
+    raw_frame local;
     while (keep_running) {
-        raw_frame local;
         {
-            std::unique_lock<std::mutex> lk(g_raw_lock);
-            g_raw_cv.wait(lk, [cam_id] {
+            std::unique_lock<std::mutex> lk(g_raw_lock[cam_id]);
+            g_raw_cv[cam_id].wait(lk, [cam_id] {
                 return !keep_running || g_raw[cam_id].has_new;
             });
             if (!keep_running) break;
@@ -440,6 +480,7 @@ static void camera_worker(int cam_id) {
             g_raw[cam_id].has_new = false;
         }
         process_raw_frame(cam_id, local);
+        g_panel_seq.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -626,7 +667,33 @@ int main() {
         workers[cam] = std::thread(camera_worker, cam);
     }
 
+    uint64_t last_seq = ~0ULL;
+    uint64_t last_vio_poll = 0;
+
     while (keep_running) {
+        // Poll VIO status here rather than from the HID callback: it is a USB
+        // control transfer, and running it on the callback thread stalled the
+        // image path (both callbacks share g_stats_lock).
+        uint64_t now_ms = get_tick_ms();
+        if (now_ms - last_vio_poll >= 500) {
+            last_vio_poll = now_ms;
+            if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
+                printf("Current VIO status: %s (%d)\n",
+                       vio_status_to_string(static_cast<VioStatus>(vio_status_raw)),
+                       vio_status_raw);
+                fflush(stdout);
+            }
+        }
+
+        // Nothing decoded since the last redraw - just pump the GUI event loop.
+        uint64_t seq = g_panel_seq.load(std::memory_order_acquire);
+        if (seq == last_seq) {
+            int k = cv::waitKey(5);
+            if (k == 'q' || k == 27) keep_running = 0;
+            continue;
+        }
+        last_seq = seq;
+
         // Grab the latest panels/overlay under the lock (cheap shallow copies),
         // then do the heavy compositing unlocked so workers are never blocked.
         cv::Mat left, right, depth, rgb, acolor, amask;
@@ -641,15 +708,14 @@ int main() {
         }
 
         // Bottom-right = RGB with the aligned depth semi-transparently overlaid.
-        cv::Mat rgb_view;
-        if (!rgb.empty()) {
+        cv::Mat rgb_view = rgb;   // shallow; only cloned if we draw onto it
+        if (!rgb.empty() &&
+            !acolor.empty() && acolor.size() == rgb.size() &&
+            !amask.empty() && amask.size() == rgb.size()) {
             rgb_view = rgb.clone();
-            if (!acolor.empty() && acolor.size() == rgb.size() &&
-                !amask.empty() && amask.size() == rgb.size()) {
-                cv::Mat blend;
-                cv::addWeighted(rgb, 0.5, acolor, 0.5, 0, blend);
-                blend.copyTo(rgb_view, amask);
-            }
+            cv::Mat blend;
+            cv::addWeighted(rgb, 0.5, acolor, 0.5, 0, blend);
+            blend.copyTo(rgb_view, amask);
         }
 
         cv::Mat canvas = cv::Mat::zeros(canvas_h, canvas_w, CV_8UC3);
@@ -662,14 +728,14 @@ int main() {
         cv::resize(canvas, shown, cv::Size(), DISPLAY_SCALE, DISPLAY_SCALE);
         cv::imshow(win_name, shown);
 
-        int key = cv::waitKey(30);
+        int key = cv::waitKey(1);
         if (key == 'q' || key == 27) {
             keep_running = 0;
         }
     }
 
     // Wake and join the worker threads.
-    g_raw_cv.notify_all();
+    for (int cam = 0; cam < 3; cam++) g_raw_cv[cam].notify_all();
     for (int cam = 0; cam < 3; cam++) {
         if (workers[cam].joinable()) workers[cam].join();
     }

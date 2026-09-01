@@ -150,6 +150,7 @@ enum class PixelFormat {
     RGB8,
     Y8I,
     YUYV,
+    YVYU,
     NV12
 };
 
@@ -293,6 +294,17 @@ int insight9_receive_start_camera(int cam_id);
 void insight9_receive_stop_camera(int cam_id);
 
 /**
+ * @brief Get the current configuration (resolution, pixel format, and frame rate) of the specified camera.
+ * @param cam_id Camera ID (0: Depth, 1: Grayscale, 2: RGB on Linux; may vary by platform).
+ * @param width  Output pointer to receive the current width.
+ * @param height Output pointer to receive the current height.
+ * @param format Output pointer to receive the current pixel format.
+ * @param fps    Output pointer to receive the current frame rate.
+ * @return 0 on success, -1 on failure (e.g., invalid cam_id or NULL pointer).
+ */
+int insight9_receive_get_camera_config(int cam_id, int* width, int* height, PixelFormat* format, int* fps);
+
+/**
  * @brief Restart a specific camera (stop and start again).
  * @param cam_id Camera ID.
  * @return 0 on success, -1 on failure.
@@ -320,6 +332,18 @@ int insight9_receive_switch_camera_fps(int cam_id, int fps);
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelFormat format);
+
+/**
+ * @brief Immediately switch the specified camera to a new configuration (resolution, format, and frame rate).
+ *        This function stops the camera, updates the stored configuration, and restarts the camera with the new settings.
+ * @param cam_id Camera ID (0: Depth, 1: Grayscale, 2: RGB on Linux; may vary by platform).
+ * @param width  Desired width.
+ * @param height Desired height.
+ * @param format Desired pixel format.
+ * @param fps    Desired frame rate.
+ * @return 0 on success, -1 on failure (e.g., invalid parameters, unable to set format/fps, or restart failure).
+ */
+int insight9_receive_switch_camera_config(int cam_id, int width, int height, PixelFormat format, int fps);
 
 /**
  * @brief Switch a specific camera to a new resolution/format and apply it immediately.

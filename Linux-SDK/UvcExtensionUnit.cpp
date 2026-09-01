@@ -14,7 +14,6 @@ namespace viewer {
 static int uvc_control_query(int fd, __u8 unit, __u8 selector,
                              __u8 query, void *data, __u16 size)
 {
-printf("\n\n\n11111111--uvc_control_query--fd: %d\n\n\n", fd);
     struct uvc_xu_control_query xq;
     memset(&xq, 0, sizeof(xq));
     xq.unit = unit;
@@ -24,7 +23,7 @@ printf("\n\n\n11111111--uvc_control_query--fd: %d\n\n\n", fd);
     xq.data = static_cast<__u8*>(data);
     int ret = ioctl(fd, UVCIOC_CTRL_QUERY, &xq);
     if (ret < 0) {
-        printf("ioctl查询失败: %s (errno=%d)\n", strerror(errno), errno);
+        printf("ioctl query failed: %s (errno=%d)\n", strerror(errno), errno);
         printf("unit:%u cs:%d query:%d\n", unit, selector, query);
         close(fd);
         return 1;
@@ -66,7 +65,6 @@ bool UvcExtensionUnit::open(const std::string& devicePath) {
         perror("open UVC device");
         return false;
     }
-printf("\n\n\n2222222222222--open--fd: %d\n\n\n", fd_);
 
     // Check whether the required selectors exist.
     if (!selector_exists(fd_, unitId_, kCameraParamsSelector) || !selector_exists(fd_, unitId_, kActiveCameraSelector)) {
@@ -85,7 +83,6 @@ bool UvcExtensionUnit::reopen() {
 
 void UvcExtensionUnit::close() {
     if (fd_ >= 0) {
-    printf("\n\n\n333333333--close--fd: %d\n\n\n", fd_);
         ::close(fd_);
         fd_ = -1;
     }

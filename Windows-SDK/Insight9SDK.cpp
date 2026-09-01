@@ -2217,10 +2217,19 @@ int insight9_receive_init(const insight9_config_t* config) {
     }
     
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE) {
-        SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
-        CoUninitialize();
-        return -1;
+    if (FAILED(hr)) {
+        if (hr == RPC_E_CHANGED_MODE) {
+            // 之前已以不同模式初始化，尝试重置为 MTA
+            CoUninitialize();
+            hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (FAILED(hr)) {
+                SDK_LOG_ERROR("[SDK] CoInitializeEx retry failed, hr=0x%08lx", hr);
+                return -1;
+            }
+        } else {
+            SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
+            return -1;
+        }
     }
 
     for (int i = 0; i < UVC_NUM; ++i) {
@@ -2296,10 +2305,19 @@ int insight9_receive_init_default() {
     }
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE) {
-        SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
-        CoUninitialize();
-        return -1;
+    if (FAILED(hr)) {
+        if (hr == RPC_E_CHANGED_MODE) {
+            // 之前已以不同模式初始化，尝试重置为 MTA
+            CoUninitialize();
+            hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (FAILED(hr)) {
+                SDK_LOG_ERROR("[SDK] CoInitializeEx retry failed, hr=0x%08lx", hr);
+                return -1;
+            }
+        } else {
+            SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
+            return -1;
+        }
     }
 
     // sdk_ctx_t contains std::thread/std::mutex/std::string; never memset it.

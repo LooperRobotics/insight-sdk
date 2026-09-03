@@ -11,6 +11,8 @@ typedef struct {
     char metadata_usb_paths[CAM_NUM][MAX_PATH];
     char video_devs[CAM_NUM][MAX_PATH];   // Dynamically resolved video device paths
     char video_usb_paths[CAM_NUM][MAX_PATH]; // Matching USB root paths, used for rediscovery after reconnect
+    camera_params cachedInitialParams[CAM_NUM];
+    bool hasCachedInitialParams[CAM_NUM] = {false, false, false};
     // HID devices (only two are used: 0=IMU, 1=VIO)
     char hid_devs[HID_NUM][MAX_PATH];           // Dynamically resolved hidraw device paths
     char hid_usb_paths[HID_NUM][MAX_PATH];   // Matching HID USB root paths, used for rediscovery after reconnect

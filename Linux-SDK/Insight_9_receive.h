@@ -412,6 +412,13 @@ int insight9_receive_set_active_camera(int cam_id);
 int insight9_receive_get_active_camera(int *cam_id);
 
 /**
+ * @brief Check if the provided camera parameters are valid.
+ * @param params Pointer to camera_params structure to validate.
+ * @return 0 if valid, -1 if invalid.
+ */
+int insight9_check_camera_params(const camera_params *params);
+
+/**
  * @brief Set all parameters for the currently active camera.
  * @param params Parameters to set. Must include the cam_id field indicating the target camera.
  * @return 0 on success, -1 on failure.
@@ -441,6 +448,14 @@ int insight9_receive_set_camera_params_for(int cam_id, const camera_params *para
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params);
+
+/**
+ * @brief Get the cached initial parameters for the specified camera.
+ * @param cam_id Camera ID.
+ * @param params Output parameter that receives the cached initial parameters.
+ * @return 0 on success, -1 on failure (e.g., no cached parameters available).
+ */
+int insight9_receive_get_cached_initial_params(int cam_id, camera_params* params);
 
 /**
  * @brief Restore the specified camera to its initial values.

@@ -316,8 +316,19 @@ void insight9_receive_register_imu_callback(imu_callback cb, void *userdata);
  */
 void insight9_receive_register_vio_callback(vio_callback cb, void *userdata);
 
+/**
+ * @brief Get the metadata device path for the specified camera.
+ * @param cam_id Camera index (0..2).
+ * @return Device path string, or NULL on failure.
+ */
 const char *insight9_receive_get_metadata_dev(int cam_id);
 
+/**
+ * @brief Read metadata timestamp from the metadata device.
+ * @param cam_id Camera index.
+ * @param timestamp Output parameter for the timestamp.
+ * @return 0 on success, -1 on failure.
+ */
 int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
 
 /**
@@ -341,6 +352,13 @@ int insight9_receive_set_active_camera(int cam_id);
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_get_active_camera(int *cam_id);
+
+/**
+ * @brief Check if the provided camera parameters are valid.
+ * @param params Pointer to camera_params structure to validate.
+ * @return 0 if valid, -1 if invalid.
+ */
+int insight9_check_camera_params(const camera_params *params);
 
 /**
  * @brief Set all parameters for the currently active camera.
@@ -372,6 +390,14 @@ int insight9_receive_set_camera_params_for(int cam_id, const camera_params *para
  * @return 0 on success, -1 on failure.
  */
 int insight9_receive_get_camera_params_for(int cam_id, camera_params *params);
+
+/**
+ * @brief Get the cached initial parameters for the specified camera.
+ * @param cam_id Camera ID.
+ * @param params Output parameter that receives the cached initial parameters.
+ * @return 0 on success, -1 on failure (e.g., no cached parameters available).
+ */
+int insight9_receive_get_cached_initial_params(int cam_id, camera_params* params);
 
 /**
  * @brief Restore the specified camera to its initial values.

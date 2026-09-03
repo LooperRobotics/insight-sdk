@@ -306,6 +306,83 @@ static bool joinWithTimeout(std::thread& t, DWORD timeoutMs, const char* label) 
     return false;
 }
 
+// ==================== Extension Unit Helpers ====================
+static int is_camera_params_valid(const camera_params *params) {
+    // Validate resolution index. RGB uses 0-3 and grayscale uses 0-1; the SDK uses the more permissive 0-3 range.
+    if (params->resolution > 3) {
+        fprintf(stderr, "[XU][ERR] invalid resolution, expected 0-3, got %d\n", params->resolution);
+        return 0;
+    }
+    // Validate frame-rate index.
+    if (params->frame_rate > 5) {
+        fprintf(stderr, "[XU][ERR] invalid frame rate, expected 0-5, got %d\n", params->frame_rate);
+        return 0;
+    }
+
+    // exposure_time: 0.0 ~ 0.03
+    if (params->exposure_time < 0.0f || params->exposure_time > 0.03f) {
+        fprintf(stderr, "[XU][ERR] invalid exposure time, expected 0.0-0.03, got %f\n", params->exposure_time);
+        return 0;
+    }
+    // exposure_gain: 1.0 ~ 16.0
+    if (params->exposure_gain < 1.0f || params->exposure_gain > 16.0f) {
+        fprintf(stderr, "[XU][ERR] invalid exposure gain, expected 1.0-16.0, got %f\n", params->exposure_gain);
+        return 0;
+    }
+    // auto_exposure: 0 or 1
+    if (params->auto_exposure > 1) {
+        fprintf(stderr, "[XU][ERR] invalid auto exposure, expected 0 or 1, got %d\n", params->auto_exposure);
+        return 0;
+    }
+    // brightness: 0.0 ~ 127.0
+    if (params->brightness < 0.0f || params->brightness > 127.0f) {
+        fprintf(stderr, "[XU][ERR] invalid brightness, expected 0.0-127.0, got %f\n", params->brightness);
+        return 0;
+    }
+    // contrast: 0.0 ~ 1.9
+    if (params->contrast < 0.0f || params->contrast > 1.9f) {
+        fprintf(stderr, "[XU][ERR] invalid contrast, expected 0.0-1.9, got %f\n", params->contrast);
+        return 0;
+    }
+    // gamma_dark: 1.0 ~ 4.0
+    if (params->gamma_dark < 1.0f || params->gamma_dark > 4.0f) {
+        fprintf(stderr, "[XU][ERR] invalid gamma dark, expected 1.0-4.0, got %f\n", params->gamma_dark);
+        return 0;
+    }
+    // hue: 0.0 ~ 87.0
+    if (params->hue < 0.0f || params->hue > 87.0f) {
+        fprintf(stderr, "[XU][ERR] invalid hue, expected 0.0-87.0, got %f\n", params->hue);
+        return 0;
+    }
+    // saturation: 0.0 ~ 1.999
+    if (params->saturation < 0.0f || params->saturation > 1.999f) {
+        fprintf(stderr, "[XU][ERR] invalid saturation, expected 0.0-1.999, got %f\n", params->saturation);
+        return 0;
+    }
+    // sharpness: 1 ~ 255
+    if (params->sharpness < 1 || params->sharpness > 255) {
+        fprintf(stderr, "[XU][ERR] invalid sharpness, expected 1-255, got %d\n", params->sharpness);
+        return 0;
+    }
+    // auto_white_balance: 0 or 1
+    if (params->auto_white_balance > 1) {
+        fprintf(stderr, "[XU][ERR] invalid auto white balance, expected 0 or 1, got %d\n", params->auto_white_balance);
+        return 0;
+    }
+    // white_balance: 1.0 ~ 3.0
+    if (params->white_balance < 1.0f || params->white_balance > 3.0f) {
+        fprintf(stderr, "[XU][ERR] invalid white balance, expected 1.0-3.0, got %f\n", params->white_balance);
+        return 0;
+    }
+    // decimation: 1 ~ 255
+    if (params->decimation < 1 || params->decimation > 255) {
+        fprintf(stderr, "[XU][ERR] invalid decimation, expected 1-255, got %d\n", params->decimation);
+        return 0;
+    }
+
+    return 1;
+}
+
 class MFVideoSource {
 public:
     MFVideoSource() {
@@ -1155,6 +1232,8 @@ struct sdk_ctx_t {
     std::thread videoThreads[UVC_NUM];
     bool videoThreadStuck[UVC_NUM] = {false, false};
     bool hidThreadStuck[HID_NUM] = {false, false};
+    camera_params cachedInitialParams[UVC_NUM];
+    bool hasCachedInitialParams[UVC_NUM] = {false, false};
     // =====================================================
     HidDevice* hidDevs[HID_NUM];
     std::string hidPaths[HID_NUM];
@@ -1433,15 +1512,28 @@ static void reconnect_backoff_apply(const char* tag, int id, int* fails, const c
     interruptible_sleep_ms(delay, extraStop);
 }
 
+static void cacheInitialCameraParams(int cam_id) {
+    camera_params params;
+    if (insight9_receive_get_camera_params_for(cam_id, &params) == 0) {
+        g_ctx.cachedInitialParams[cam_id] = params;
+        g_ctx.hasCachedInitialParams[cam_id] = true;
+        printf("[SDK] Cached initial params for camera %d\n", cam_id);
+    } else {
+        printf("[SDK][WARN] Failed to cache initial params for camera %d (device may not be ready yet)\n", cam_id);
+    }
+}
+
 static bool openVideoSourceForSlot(int uvcId) {
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
     std::string path;
     if (uvcId == RGB_UVC_ID) {
         if (uvcPaths.empty()) return false;
         path = uvcPaths[0];
+        cacheInitialCameraParams(RGB_CAM_ID);
     } else {
         if (uvcPaths.size() < 2 && !g_ctx.singleNodeMode) return false;
         path = g_ctx.singleNodeMode ? uvcPaths[0] : uvcPaths[COMPOSITE_UVC_ID];
+        cacheInitialCameraParams(GRAY_CAM_ID);
     }
 
     MFVideoSource* src = new MFVideoSource();
@@ -2269,6 +2361,8 @@ int insight9_receive_init(const insight9_config_t* config) {
         if (!reopenXUControlLocked("initialization")) {
             SDK_LOG_WARN("[SDK][WARN] XU control unavailable during initialization; video can still run");
         }
+        cacheInitialCameraParams(RGB_CAM_ID);
+        cacheInitialCameraParams(GRAY_CAM_ID);
     }
 
     g_ctx.initialized = true;
@@ -2494,6 +2588,8 @@ int insight9_receive_init_default() {
         if (!reopenXUControlLocked("initialization")) {
             SDK_LOG_WARN("[SDK][WARN] XU control unavailable during initialization; video can still run");
         }
+        cacheInitialCameraParams(RGB_CAM_ID);
+        cacheInitialCameraParams(GRAY_CAM_ID);
     }
 
     g_ctx.initialized = true;
@@ -3047,8 +3143,13 @@ int insight9_receive_get_active_camera(int *cam_id) {
     return 0;
 }
 
-int insight9_receive_set_camera_params(const camera_params *params) {
+int insight9_check_camera_params(const camera_params *params) {
     if (!params) return -1;
+    return is_camera_params_valid(params) ? 0 : -1;
+}
+
+int insight9_receive_set_camera_params(const camera_params *params) {
+    if (!params || !is_camera_params_valid(params)) return -1;
     viewer::camera_params xuParams;
     memcpy(&xuParams, params, sizeof(viewer::camera_params));
     return callXUWithRetry("writeCurrentCameraParams", [xuParams](viewer::ExtensionUnitControl& xu) {
@@ -3067,7 +3168,7 @@ int insight9_receive_get_camera_params(camera_params *params) {
 }
 
 int insight9_receive_set_camera_params_for(int cam_id, const camera_params *params) {
-    if (!params) return -1;
+    if (!params || !is_camera_params_valid(params)) return -1;
     int mapped = mapCompositeCamId(cam_id);
     if (mapped < 0) return -1;
     viewer::camera_params xuParams;
@@ -3086,6 +3187,13 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
             return xu.readCameraParams((uint8_t)mapped, xuParams);
         })) return -1;
     memcpy(params, &xuParams, sizeof(camera_params));
+    return 0;
+}
+
+int insight9_receive_get_cached_initial_params(int cam_id, camera_params* params) {
+    if (!params || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+    if (!g_ctx.hasCachedInitialParams[cam_id]) return -1;
+    *params = g_ctx.cachedInitialParams[cam_id];
     return 0;
 }
 

@@ -336,6 +336,17 @@ static int find_uvc_devices_by_vid_pid(unsigned int target_vid, unsigned int tar
     return count;
 }
 
+static void cache_initial_camera_params(int cam_id) {
+    camera_params params;
+    if (insight9_receive_get_camera_params_for(cam_id, &params) == 0) {
+        g_ctx.cachedInitialParams[cam_id] = params;
+        g_ctx.hasCachedInitialParams[cam_id] = 1;
+        printf("[SDK] Cached initial params for camera %d\n", cam_id);
+    } else {
+        fprintf(stderr, "[SDK][WARN] Failed to cache initial params for camera %d\n", cam_id);
+    }
+}
+
 static PixelFormat fourccToPixelFormat(unsigned int fcc) {
     switch (fcc) {
         case V4L2_PIX_FMT_MJPEG: return PixelFormat::MJPEG;
@@ -1248,12 +1259,12 @@ static void safe_cleanup_camera(struct cam_ctx *ctx) {
 static int is_camera_params_valid(const camera_params *params) {
     // Validate resolution index. RGB uses 0-3 and grayscale uses 0-1; the SDK uses the more permissive 0-3 range.
     if (params->resolution > 3) {
-        fprintf(stderr, "[XU][ERR] invalid resolution index, expected 0-3, got %d\n", params->resolution);
+        fprintf(stderr, "[XU][ERR] invalid resolution, expected 0-3, got %d\n", params->resolution);
         return 0;
     }
     // Validate frame-rate index.
     if (params->frame_rate > 5) {
-        fprintf(stderr, "[XU][ERR] invalid frame rate index, expected 0-5, got %d\n", params->frame_rate);
+        fprintf(stderr, "[XU][ERR] invalid frame rate, expected 0-5, got %d\n", params->frame_rate);
         return 0;
     }
 
@@ -1378,6 +1389,8 @@ static void *capture_thread(void *arg) {
             printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
+
+            cache_initial_camera_params(ctx->cam_id);
             
             printf("[CAM%d][META] opening %s\n", ctx->cam_id, g_ctx.metadata_devs[ctx->cam_id]);
             ctx->meta_fd = open(g_ctx.metadata_devs[ctx->cam_id], O_RDWR | O_NONBLOCK);
@@ -1740,6 +1753,9 @@ int insight9_receive_init(const insight9_config_t* config) {
         } else {
             g_ctx.xu_ready = true;
             printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
+
+            cache_initial_camera_params(0);
+            cache_initial_camera_params(1);
         }
     } else {
         g_ctx.xu_control = nullptr;
@@ -1815,6 +1831,7 @@ int insight9_receive_init_default(void) {
         if (get_camera_formats_info(&g_ctx.cams[i]) < 0) {
             fprintf(stderr, "[CAM%d][WARN] failed to get formats info during init\n", i);
         }
+
         close(fd);
         g_ctx.cams[i].fd = -1;
     }
@@ -1832,6 +1849,9 @@ int insight9_receive_init_default(void) {
         } else {
             g_ctx.xu_ready = true;
             printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
+
+            cache_initial_camera_params(0);
+            cache_initial_camera_params(1);
         }
     } else {
         g_ctx.xu_control = nullptr;
@@ -2312,6 +2332,11 @@ int insight9_receive_get_active_camera(int *cam_id) {
     return 0;
 }
 
+int insight9_check_camera_params(const camera_params *params) {
+    if (!params) return -1;
+    return is_camera_params_valid(params) ? 0 : -1;
+}
+
 int insight9_receive_set_camera_params(const camera_params *params) {
     if (!params || !is_camera_params_valid(params)) return -1;
     viewer::camera_params xu_params;
@@ -2347,6 +2372,13 @@ int insight9_receive_get_camera_params_for(int cam_id, camera_params *params) {
             return xu.readCameraParams(static_cast<uint8_t>(cam_id), xu_params);
         })) return -1;
     memcpy(params, &xu_params, sizeof(viewer::camera_params));
+    return 0;
+}
+
+int insight9_receive_get_cached_initial_params(int cam_id, camera_params* params) {
+    if (!params || cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (!g_ctx.hasCachedInitialParams[cam_id]) return -1;
+    *params = g_ctx.cachedInitialParams[cam_id];
     return 0;
 }
 

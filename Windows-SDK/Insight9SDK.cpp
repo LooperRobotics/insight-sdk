@@ -292,18 +292,20 @@ static bool parseRsVendorMetadata(const uint8_t* buf, size_t len,
 }
 
 static bool joinWithTimeout(std::thread& t, DWORD timeoutMs, const char* label) {
+    // Never detach a worker that may still dereference g_ctx.videos[].
+    // MFVideoSource::stop() flushes the SourceReader first, so the blocking
+    // ReadSample() is released and join becomes the ownership boundary.
     if (!t.joinable()) return true;
     HANDLE h = t.native_handle();
-    if (WaitForSingleObject(h, timeoutMs) == WAIT_OBJECT_0) {
+    DWORD waitMs = timeoutMs ? timeoutMs : 5000;
+    if (WaitForSingleObject(h, waitMs) == WAIT_OBJECT_0) {
         t.join();
         return true;
     }
-    SDK_LOG_INFO(
-            "[SDK][WARN] Thread '%s' did not exit within %lu ms "
-            "(likely stuck in ReadSample/blocking I/O). Detaching instead of waiting forever.\n",
-            label, timeoutMs);
-    t.detach();
-    return false;
+    SDK_LOG_WARN("[SDK][WARN] Thread '%s' did not exit within %lu ms; forcing a longer wait (no detach)\n",
+                 label ? label : "unknown", static_cast<unsigned long>(waitMs));
+    t.join();
+    return true;
 }
 
 // ==================== Extension Unit Helpers ====================
@@ -443,13 +445,14 @@ public:
             }
         }
 
+        resetTimingState();
         printf("[MFVideoSource] Open success: %dx%d@%d, format=%d\n", width, height, fps, (int)fmt);
 
         return true;
     }
 
     bool openWithTwoStreams(const std::string& devicePath, int deviceIndex, 
-                            int width, int height, 
+                            int width0, int height0, int width1, int height1,
                             PixelFormat fmt0, int fps0,
                             PixelFormat fmt1, int fps1)
     {
@@ -457,8 +460,8 @@ public:
 
         devicePath_ = devicePath;
         deviceIndex_ = deviceIndex;
-        width_ = width;
-        height_ = height;
+        width_ = width0;
+        height_ = height0;
         format_ = fmt0;
         fps_ = fps0;
 
@@ -468,23 +471,25 @@ public:
         if (!configureSourceReader())
             return false;
 
-        if (!configureStream(0, fmt0, width, height, fps0)) {
+        if (!configureStream(0, fmt0, width0, height0, fps0)) {
             SDK_LOG_ERROR("Stream 0 configure failed.\n");
             return false;
         }
 
-        if (!configureStream(1, fmt1, width, height, fps1)) {
+        if (!configureStream(1, fmt1, width1, height1, fps1)) {
             SDK_LOG_ERROR("Stream 1 configure failed.\n");
             return false;
         }
 
+        resetTimingState();
         printf("[MFVideoSource] Open success: two streams (%dx%d@%d, %dx%d@%d)\n", 
-            width, height, fps0, width, height, fps1);
+            width0, height0, fps0, width1, height1, fps1);
         return true;
     }
     
     void close() {
         stop();
+        resetTimingState();
         
         if (sourceReader_) {
             sourceReader_->Release();
@@ -505,6 +510,15 @@ public:
     
     void stop() {
         running_ = false;
+        // Wake a worker blocked inside ReadSample().  This is critical for safe
+        // camera switching: the owner must join the worker before deleting or
+        // replacing this MFVideoSource.
+        if (sourceReader_) {
+            HRESULT hr = sourceReader_->Flush(MF_SOURCE_READER_ALL_STREAMS);
+            if (FAILED(hr) && hr != MF_E_NOT_INITIALIZED) {
+                SDK_LOG_DEBUG("[MFVideoSource] SourceReader Flush failed: 0x%08lx\n", hr);
+            }
+        }
     }
     
     bool isRunning() const { return running_; }
@@ -559,11 +573,11 @@ public:
         }
 
         if (flags & MF_SOURCE_READERF_STREAMTICK) {
-            SDK_LOG_ERROR("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n", requestedStream, ts, sample);
+            SDK_LOG_DEBUG("[MFVideoSource] Stream %lu STREAMTICK ts=%lld sample=%p\n", requestedStream, ts, sample);
         }
 
         if (!sample) {
-            SDK_LOG_ERROR("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n", requestedStream, flags);
+            SDK_LOG_DEBUG("[MFVideoSource] Stream %lu no sample, flags=0x%08lx\n", requestedStream, flags);
             return false;
         }
         
@@ -670,14 +684,33 @@ SDK_LOG_INFO("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
             info.timestamp = (uint64_t)(ts / 10);
         }
 
-        if (lastTimestamp_[actualStream] != 0 && lastTimestamp_[actualStream] == info.timestamp) {
-            SDK_LOG_ERROR("[MFVideoSource] Stream %lu duplicate timestamp=%llu\n", requestedStream, info.timestamp);
+        // Do not use timestamp equality alone as a duplicate-frame detector.
+        // During UVC restart/SourceReader flush, MF can legitimately repeat a
+        // presentation timestamp while the vendor metadata frame counter has
+        // advanced.  Prefer the device frame counter when metadata is valid.
+        bool duplicate = false;
+        if (actualStream < 2 && timingValid_[actualStream].load(std::memory_order_relaxed)) {
+            const uint32_t lastFc = lastFrameCounter_[actualStream].load(std::memory_order_relaxed);
+            if (mdValid && mdFrameCounter != 0) {
+                duplicate = (mdFrameCounter == lastFc);
+            } else {
+                duplicate = (info.timestamp == lastTimestamp_[actualStream].load(std::memory_order_relaxed));
+            }
+        }
+
+        if (duplicate) {
+            SDK_LOG_DEBUG("[MFVideoSource] Stream %lu duplicate sample ignored: ts=%llu frame=%u\n",
+                          actualStream, (unsigned long long)info.timestamp, mdFrameCounter);
             delete[] data;
             data = nullptr;
             size = 0;
             return false;
         }
-        lastTimestamp_[actualStream] = info.timestamp;
+
+        lastTimestamp_[actualStream].store(info.timestamp, std::memory_order_relaxed);
+        if (mdValid && mdFrameCounter != 0)
+            lastFrameCounter_[actualStream].store(mdFrameCounter, std::memory_order_relaxed);
+        timingValid_[actualStream].store(true, std::memory_order_relaxed);
 
         return true;
     }
@@ -805,6 +838,14 @@ SDK_LOG_INFO("[MD] stream=%lu valid=%d counter=%u time_us64=%llu\n",
         if (pSampleAttrs) pSampleAttrs->Release();
 
         return success;
+    }
+
+    void resetTimingState() {
+        for (int i = 0; i < 2; ++i) {
+            lastTimestamp_[i].store(0, std::memory_order_relaxed);
+            lastFrameCounter_[i].store(0, std::memory_order_relaxed);
+            timingValid_[i].store(false, std::memory_order_relaxed);
+        }
     }
 
     uint64_t getLastTimestamp(DWORD streamIndex) const {
@@ -1190,6 +1231,8 @@ private:
     std::atomic<bool> running_{false};
     std::mutex readerMutex_;
     std::atomic<uint64_t> lastTimestamp_[2] = {0, 0};
+    std::atomic<uint32_t> lastFrameCounter_[2] = {0, 0};
+    std::atomic<bool> timingValid_[2] = {false, false};
     uint32_t lastMeta32_[2]   = {0, 0};
     uint64_t metaWrapHigh_[2] = {0, 0};
     bool     metaInit_[2]     = {false, false};
@@ -1241,6 +1284,17 @@ struct sdk_ctx_t {
     viewer::ExtensionUnitControl* xu;
     // Serialize all access/recreation of the KS Extension Unit object.
     std::recursive_mutex xuMutex;
+    // Serialize ownership changes of MFVideoSource. Never hold this while
+    // waiting for a video worker to join, otherwise the worker could deadlock
+    // while retiring an invalidated source.
+    std::mutex videoLifecycleMutex;
+    // Serialize user-triggered start/stop/reconfigure operations so two UI/control
+    // calls can never rebuild the same physical UVC concurrently.
+    std::recursive_mutex cameraControlMutex;
+    // A Composite UVC reconfiguration temporarily resets the whole MI_00 USB
+    // function. During that short window HID/VIO may legitimately stop sending
+    // reports; do not tear down/reopen HID in the middle of video reconfigure.
+    std::atomic<bool> videoReconfiguring{false};
     // =====================================================
     std::atomic<bool> running;
     image_callback imgCb;
@@ -1334,8 +1388,17 @@ std::string getDirectShowDeviceName(const std::string& devicePath) {
     return "";
 }
 
+// Returns a vector of exactly UVC_NUM entries indexed by slot:
+//   [RGB_UVC_ID]       the standalone RGB function   (MI_03 / MI_04)
+//   [COMPOSITE_UVC_ID] the depth+gray composite      (MI_00 / MI_06 / MI_08)
+// An empty string means that slot is not present on this unit. The previous
+// version returned a flat, sorted list and callers assumed index 0 was RGB and
+// index 1 was the composite - so a device that publishes only the composite
+// node (Insight 3u: one composite device on Windows, four v4l2 nodes on Linux)
+// both failed the size>=2 check and, had it passed, would have had its
+// composite opened as if it were the single-stream RGB device.
 static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
-    std::vector<std::string> paths;
+    std::vector<std::string> paths(UVC_NUM);
     std::vector<std::string> rgbPaths;
     std::vector<std::string> grayDepthPaths;
     
@@ -1406,25 +1469,39 @@ static std::vector<std::string> findUvcDevices(uint16_t vid, uint16_t pid) {
     
     std::sort(rgbPaths.begin(), rgbPaths.end());
     std::sort(grayDepthPaths.begin(), grayDepthPaths.end());
-    
-    paths.insert(paths.end(), rgbPaths.begin(), rgbPaths.end());
-    paths.insert(paths.end(), grayDepthPaths.begin(), grayDepthPaths.end());
 
-    printf("[SDK] Found %zu UVC devices:\n", paths.size());
-    for (size_t i = 0; i < paths.size(); i++) {
-        printf("[SDK]   [%zu] %s\n", i, paths[i].c_str());
-    }
+    if (!rgbPaths.empty())       paths[RGB_UVC_ID]       = rgbPaths.front();
+    if (!grayDepthPaths.empty()) paths[COMPOSITE_UVC_ID] = grayDepthPaths.front();
+
+    printf("[SDK] UVC slots: RGB=%s Composite=%s\n",
+           paths[RGB_UVC_ID].empty() ? "(absent)" : paths[RGB_UVC_ID].c_str(),
+           paths[COMPOSITE_UVC_ID].empty() ? "(absent)" : paths[COMPOSITE_UVC_ID].c_str());
 
     return paths;
 }
 
+// True when this unit has no standalone RGB function - the composite node is
+// the whole device. Keeps g_ctx.singleNodeMode, which existed but was never
+// set, actually meaningful.
+static bool uvcSlotsAreSingleNode(const std::vector<std::string>& paths) {
+    return paths[RGB_UVC_ID].empty() && !paths[COMPOSITE_UVC_ID].empty();
+}
+
 static bool reopenXUControlLocked(const char* reason) {
+    // The XU sits on the VideoControl interface, so either function exposes
+    // it. Prefer RGB, but fall back to the composite: on a composite-only unit
+    // there is no RGB path at all, and insisting on it left camera params
+    // permanently unavailable.
     std::string path = g_ctx.videoPaths[RGB_UVC_ID];
+    if (path.empty()) path = g_ctx.videoPaths[COMPOSITE_UVC_ID];
     if (path.empty()) {
         auto paths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-        if (!paths.empty()) {
+        if (!paths[RGB_UVC_ID].empty()) {
             path = paths[RGB_UVC_ID];
             g_ctx.videoPaths[RGB_UVC_ID] = path;
+        } else if (!paths[COMPOSITE_UVC_ID].empty()) {
+            path = paths[COMPOSITE_UVC_ID];
+            g_ctx.videoPaths[COMPOSITE_UVC_ID] = path;
         }
     }
 
@@ -1446,7 +1523,7 @@ static bool reopenXUControlLocked(const char* reason) {
         return false;
     }
 
-    SDK_LOG_INFO("[XU] Reopening XU on RGB UVC: %s (%s)\n",
+    SDK_LOG_INFO("[XU] Reopening XU on UVC: %s (%s)\n",
            path.c_str(), reason ? reason : "unknown");
 
     if (!xu->open(path)) {
@@ -1524,17 +1601,17 @@ static void cacheInitialCameraParams(int cam_id) {
 }
 
 static bool openVideoSourceForSlot(int uvcId) {
+    if (uvcId < 0 || uvcId >= UVC_NUM) return false;
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    std::string path;
-    if (uvcId == RGB_UVC_ID) {
-        if (uvcPaths.empty()) return false;
-        path = uvcPaths[0];
-        cacheInitialCameraParams(RGB_CAM_ID);
-    } else {
-        if (uvcPaths.size() < 2 && !g_ctx.singleNodeMode) return false;
-        path = g_ctx.singleNodeMode ? uvcPaths[0] : uvcPaths[COMPOSITE_UVC_ID];
-        cacheInitialCameraParams(GRAY_CAM_ID);
-    }
+    g_ctx.singleNodeMode = uvcSlotsAreSingleNode(uvcPaths);
+
+    // Slot-indexed now, so this is just "is my slot present?". This is the
+    // path videoThreadFunc retries on, which is what lets a device that was
+    // absent at init attach later.
+    const std::string path = uvcPaths[uvcId];
+    if (path.empty()) return false;
+
+    cacheInitialCameraParams(uvcId == RGB_UVC_ID ? RGB_CAM_ID : GRAY_CAM_ID);
 
     MFVideoSource* src = new MFVideoSource();
     bool opened = false;
@@ -1545,6 +1622,7 @@ static bool openVideoSourceForSlot(int uvcId) {
     } else {
         opened = src->openWithTwoStreams(path, uvcId,
                     g_ctx.config.depth_config.width, g_ctx.config.depth_config.height,
+                    g_ctx.config.gray_config.width, g_ctx.config.gray_config.height,
                     g_ctx.config.depth_config.pixel_format, g_ctx.config.depth_config.fps,
                     g_ctx.config.gray_config.pixel_format, g_ctx.config.gray_config.fps);
     }
@@ -1559,8 +1637,11 @@ static bool openVideoSourceForSlot(int uvcId) {
         return false;
     }
 
-    g_ctx.videoPaths[uvcId] = path;
-    g_ctx.videos[uvcId] = src;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        g_ctx.videoPaths[uvcId] = path;
+        g_ctx.videos[uvcId] = src;
+    }
     return true;
 }
 
@@ -1576,7 +1657,7 @@ static bool probeDeviceCapabilities(const std::string& devicePath, int deviceInd
         if (!opened) opened = probeSource->open(devicePath, deviceIndex, 1088, 1920, PixelFormat::NV12, 30);
     } else {
         opened = probeSource->openWithTwoStreams(devicePath, deviceIndex, 
-                                                 544, 640, 
+                                                 544, 640, 544, 640,
                                                  PixelFormat::Z16, 30,
                                                  PixelFormat::Y8I, 30);
     }
@@ -1647,30 +1728,37 @@ static std::vector<std::string> findHidDevices(uint16_t vid, uint16_t pid) {
 class HidDevice {
 public:
     bool open(const std::string& path) {
-        close();
+        std::lock_guard<std::mutex> lock(ioMutex_);
+        if (dev_) {
+            hid_close(dev_);
+            dev_ = nullptr;
+        }
         path_ = path;
         dev_ = hid_open_path(path.c_str());
-        if (dev_) {
-            hid_set_nonblocking(dev_, 1);
-        }
         return dev_ != nullptr;
     }
+
     void close() {
+        std::lock_guard<std::mutex> lock(ioMutex_);
         if (dev_) {
             hid_close(dev_);
             dev_ = nullptr;
         }
     }
-    // Returns true when a report is available.
-    // disconnected is set only when hidapi reports a real read error (ret < 0);
-    // ret == 0 is just the normal non-blocking "no data yet" case.
+
+    // Returns true when a report is available.  Use hid_read_timeout() instead of
+    // hid_read() so a backend/driver that stops completing reads cannot hold the
+    // worker forever during shutdown.  The short timeout also bounds the duration
+    // for which close() can wait on ioMutex_.
     bool read(uint8_t* buf, size_t& len, bool* disconnected = nullptr) {
+        constexpr int READ_TIMEOUT_MS = 50;
+        std::lock_guard<std::mutex> lock(ioMutex_);
         if (disconnected) *disconnected = false;
         if (!dev_) {
             if (disconnected) *disconnected = true;
             return false;
         }
-        int ret = hid_read(dev_, buf, (size_t)len);
+        int ret = hid_read_timeout(dev_, buf, (size_t)len, READ_TIMEOUT_MS);
         if (ret > 0) {
             len = static_cast<size_t>(ret);
             return true;
@@ -1680,8 +1768,14 @@ public:
         }
         return false;
     }
-    const std::string& path() const { return path_; }
+
+    std::string path() const {
+        std::lock_guard<std::mutex> lock(ioMutex_);
+        return path_;
+    }
+
 private:
+    mutable std::mutex ioMutex_;
     hid_device* dev_ = nullptr;
     std::string path_;
 };
@@ -1876,7 +1970,9 @@ static void imuSensorThreadFunc() {
                                        IID_PPV_ARGS(&pManager));
         if (FAILED(hr) || !pManager) {
             SDK_LOG_ERROR("[IMU][WARN] SensorManager unavailable hr=0x%08lx, retrying\n", hr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            // Do not use an uninterruptible sleep here.  Shutdown sets g_ctx.running=false
+            // and must be able to wake this worker promptly.
+            interruptible_sleep_ms(1000);
             continue;
         }
 
@@ -1932,7 +2028,9 @@ static void imuSensorThreadFunc() {
         if (!hasAccel && !hasGyro) {
             SDK_LOG_ERROR("[IMU][WARN] No accelerometer/gyrometer currently available, retrying...\n");
             cleanupBinding(pAccel, pGyro, pAccelEvents, pGyroEvents, pManager);
-            std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            // The old 5-second sleep was the direct reason hid[0] could remain
+            // joinable during SDK shutdown.  Make the retry sleep interruptible.
+            interruptible_sleep_ms(5000);
             continue;
         }
 
@@ -1986,7 +2084,7 @@ static void imuSensorThreadFunc() {
         if (!g_ctx.running) break;
         if (lost) {
             SDK_LOG_ERROR("[IMU][WARN] Sensor binding lost; rebuilding SensorManager/ISensor objects\n");
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            interruptible_sleep_ms(300);
         }
     }
 
@@ -2042,13 +2140,24 @@ static void videoThreadFunc(int uvcId) {
     };
 
     while (stillWanted()) {
-        if (!g_ctx.videos[uvcId]) {
+        MFVideoSource* src = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+            src = g_ctx.videos[uvcId];
+        }
+
+        if (!src) {
             if (!openVideoSourceForSlot(uvcId)) {
                 reconnect_backoff_apply("VIDEO", uvcId, &reconnect_fails, "open failed");
                 continue;
             }
             reconnect_fails = 0;
             SDK_LOG_INFO("[SDK] Video device %d (re)connected\n", uvcId);
+
+            {
+                std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+                src = g_ctx.videos[uvcId];
+            }
 
             // The KS/XU handle belongs to the old USB device instance.
             // Rebind it after RGB UVC is recreated.
@@ -2060,7 +2169,11 @@ static void videoThreadFunc(int uvcId) {
             }
         }
 
-        MFVideoSource* src = g_ctx.videos[uvcId];
+        if (!src) {
+            reconnect_backoff_apply("VIDEO", uvcId, &reconnect_fails, "source pointer unavailable");
+            continue;
+        }
+
         while (stillWanted() && src->isRunning()) {
             uint8_t* data = nullptr;
             size_t size = 0;
@@ -2091,9 +2204,18 @@ static void videoThreadFunc(int uvcId) {
             }
         }
 
-        if (g_ctx.videos[uvcId]) {
-            delete g_ctx.videos[uvcId];
-            g_ctx.videos[uvcId] = nullptr;
+        // The worker owns the source only when the source stopped unexpectedly
+        // while the logical camera is still wanted. During a normal stop/reconfigure
+        // path, the controller clears cam_running[] first, joins this worker, and
+        // then destroys g_ctx.videos[uvcId]. This makes the ownership boundary explicit.
+        if (stillWanted()) {
+            std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+            if (g_ctx.videos[uvcId] == src) {
+                SDK_LOG_WARN("[VIDEO%d][WARN] SourceReader stopped unexpectedly; retiring source and reconnecting", uvcId);
+                g_ctx.videos[uvcId] = nullptr;
+                delete src;
+                src = nullptr;
+            }
         }
     }
 
@@ -2111,6 +2233,9 @@ static bool hidPathStillPresent(const std::string& path) {
 }
 
 static bool reopenHidDeviceForThread(int idx, int& failCount) {
+    if (g_ctx.videoReconfiguring.load(std::memory_order_acquire)) {
+        return false;
+    }
     if (idx < 0 || idx >= HID_NUM) return false;
 
     // Always enumerate again.  This is important because the path can change after
@@ -2175,6 +2300,11 @@ static void hidThreadFunc(int idx) {
     uint8_t buf[64];
 
     while (g_ctx.running) {
+        if (g_ctx.videoReconfiguring.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
         if (!g_ctx.hidDevs[idx] || g_ctx.hidPaths[idx].empty()) {
             if (!reopenHidDeviceForThread(idx, reconnectFails)) continue;
             lastDataTick = GetTickCount64();
@@ -2213,6 +2343,15 @@ static void hidThreadFunc(int idx) {
 
             if (lastDataTick == 0) lastDataTick = now;
             if (now - lastDataTick > HID_NO_DATA_TIMEOUT_MS) {
+                // A Composite UVC reconfigure can reset the USB function and briefly
+                // suppress VIO HID reports. Do not close/reopen HID in the middle of
+                // that operation; let the post-reconfigure timer start fresh.
+                if (g_ctx.videoReconfiguring.load(std::memory_order_acquire)) {
+                    lastDataTick = now;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    continue;
+                }
+
                 SDK_LOG_WARN("[HID%d][WARN] HID has produced no data for %llums, reopening...",
                              idx,
                              static_cast<unsigned long long>(now - lastDataTick));
@@ -2297,12 +2436,14 @@ int insight9_receive_init(const insight9_config_t* config) {
 
     hid_init();
 
+    // Missing slots are no longer fatal: whatever is absent now gets opened by
+    // videoThreadFunc's reconnect loop if and when it shows up.
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    if (uvcPaths.size() < 2) {
-        SDK_LOG_ERROR("[SDK] Need at least 2 UVC devices, found %zu", uvcPaths.size());
-        return -1;
+    g_ctx.singleNodeMode = uvcSlotsAreSingleNode(uvcPaths);
+    if (g_ctx.singleNodeMode) {
+        SDK_LOG_INFO("[SDK] Composite-only device: no standalone RGB function");
     }
-    
+
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         if (hr == RPC_E_CHANGED_MODE) {
@@ -2320,6 +2461,11 @@ int insight9_receive_init(const insight9_config_t* config) {
 
     for (int i = 0; i < UVC_NUM; ++i) {
         g_ctx.videoPaths[i] = uvcPaths[i];
+        if (uvcPaths[i].empty()) {
+            g_ctx.videos[i] = nullptr;
+            SDK_LOG_WARN("[SDK] UVC slot %d not present; will attach on reconnect", i);
+            continue;
+        }
         g_ctx.videos[i] = new MFVideoSource();
         bool opened = false;
         if (i == RGB_UVC_ID) {
@@ -2333,27 +2479,32 @@ int insight9_receive_init(const insight9_config_t* config) {
                 SDK_LOG_WARN("[SDK] Warning: composite streams size mismatch, using Gray size for both.");
                 depthW = grayW; depthH = grayH;
             }
-            opened = g_ctx.videos[i]->openWithTwoStreams(uvcPaths[i], i,
-                        depthW, depthH, config->depth_config.pixel_format, config->depth_config.fps,
+            opened = g_ctx.videos[i]->openWithTwoStreams(uvcPaths[i], i, depthW, depthH, grayW, grayH,
+                        config->depth_config.pixel_format, config->depth_config.fps,
                         config->gray_config.pixel_format, config->gray_config.fps);
         }
         if (!opened) {
-            SDK_LOG_ERROR("[SDK] Failed to open video device %d: %s", i, uvcPaths[i].c_str());
-            return -1;
+            // Also non-fatal - drop the source and let the worker retry.
+            SDK_LOG_WARN("[SDK] Failed to open video device %d: %s; will retry",
+                         i, uvcPaths[i].c_str());
+            delete g_ctx.videos[i];
+            g_ctx.videos[i] = nullptr;
         }
     }
-    
+
     auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
-    if (hidPaths.size() < 1) {
-        SDK_LOG_ERROR("[SDK] VIO device not found (found %zu HID devices)", hidPaths.size());
-        return -1;
-    }
-    g_ctx.hidPaths[0] = hidPaths[0];
-    SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
-    g_ctx.hidDevs[0] = new HidDevice();
-    if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
-        SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
-        return -1;
+    if (hidPaths.empty()) {
+        SDK_LOG_WARN("[SDK] VIO device not found; hidThreadFunc will keep retrying");
+    } else {
+        g_ctx.hidPaths[0] = hidPaths[0];
+        SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
+        g_ctx.hidDevs[0] = new HidDevice();
+        if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
+            SDK_LOG_WARN("[SDK] Failed to open VIO HID; will retry");
+            delete g_ctx.hidDevs[0];
+            g_ctx.hidDevs[0] = nullptr;
+            g_ctx.hidPaths[0].clear();
+        }
     }
 
     {
@@ -2361,7 +2512,7 @@ int insight9_receive_init(const insight9_config_t* config) {
         if (!reopenXUControlLocked("initialization")) {
             SDK_LOG_WARN("[SDK][WARN] XU control unavailable during initialization; video can still run");
         }
-        cacheInitialCameraParams(RGB_CAM_ID);
+        if (!g_ctx.singleNodeMode) cacheInitialCameraParams(RGB_CAM_ID);
         cacheInitialCameraParams(GRAY_CAM_ID);
     }
 
@@ -2439,20 +2590,23 @@ int insight9_receive_init_default() {
 
     hid_init();
 
+    // Missing slots are no longer fatal here either.
     auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-    if (uvcPaths.size() < 2) {
-        SDK_LOG_ERROR("[SDK] Need at least 2 UVC devices, found %zu", uvcPaths.size());
-        return -1;
+    g_ctx.singleNodeMode = uvcSlotsAreSingleNode(uvcPaths);
+    if (g_ctx.singleNodeMode) {
+        SDK_LOG_INFO("[SDK] Composite-only device: no standalone RGB function");
     }
 
     SDK_LOG_INFO("[SDK] Probing device capabilities...");
-    
-    if (uvcPaths.size() > 0) {
-        probeDeviceCapabilities(uvcPaths[0], 0, g_ctx.device_caps);
+
+    // Probe by slot. Probing by list position meant a composite-only device
+    // had its composite probed as if it were the single-stream RGB device.
+    if (!uvcPaths[RGB_UVC_ID].empty()) {
+        probeDeviceCapabilities(uvcPaths[RGB_UVC_ID], RGB_UVC_ID, g_ctx.device_caps);
     }
-    
-    if (uvcPaths.size() > 1) {
-        probeDeviceCapabilities(uvcPaths[1], 1, g_ctx.device_caps);
+
+    if (!uvcPaths[COMPOSITE_UVC_ID].empty()) {
+        probeDeviceCapabilities(uvcPaths[COMPOSITE_UVC_ID], COMPOSITE_UVC_ID, g_ctx.device_caps);
     }
     
     if (g_ctx.device_caps.rgb_default.valid) {
@@ -2525,6 +2679,11 @@ int insight9_receive_init_default() {
     
      for (int i = 0; i < UVC_NUM; ++i) {
         g_ctx.videoPaths[i] = uvcPaths[i];
+        if (uvcPaths[i].empty()) {
+            g_ctx.videos[i] = nullptr;
+            SDK_LOG_WARN("[SDK] UVC slot %d not present; will attach on reconnect", i);
+            continue;
+        }
         g_ctx.videos[i] = new MFVideoSource();
         
         bool opened = false;
@@ -2559,36 +2718,38 @@ int insight9_receive_init_default() {
             );
 
             opened = g_ctx.videos[i]->openWithTwoStreams(uvcPaths[i], i,
-                    depthW, depthH, depthFmt,
-                    depthFps, grayFmt, grayFps
+                    depthW, depthH, grayW, grayH,
+                    depthFmt, depthFps, grayFmt, grayFps
                 );
         }
         if (!opened) {
-            SDK_LOG_ERROR("[SDK] Failed to open physical UVC %d: %s", i, uvcPaths[i].c_str());
+            SDK_LOG_WARN("[SDK] Failed to open physical UVC %d: %s; will retry",
+                         i, uvcPaths[i].c_str());
             delete g_ctx.videos[i];
             g_ctx.videos[i] = nullptr;
-            return -1;
         }
     }
 
     auto hidPaths = findHidDevices(VENDOR_ID, PRODUCT_ID);
-    if (hidPaths.size() < 1) {
-        SDK_LOG_ERROR("[SDK] VIO device not found (found %zu HID devices)", hidPaths.size());
-        return -1;
-    }
-    g_ctx.hidPaths[0] = hidPaths[0];
-    SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
-    g_ctx.hidDevs[0] = new HidDevice();
-    if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
-        SDK_LOG_ERROR("[SDK] Failed to open VIO HID");
-        return -1;
+    if (hidPaths.empty()) {
+        SDK_LOG_WARN("[SDK] VIO device not found; hidThreadFunc will keep retrying");
+    } else {
+        g_ctx.hidPaths[0] = hidPaths[0];
+        SDK_LOG_INFO("[HID] VIO device (interface %d): %s", 0, g_ctx.hidPaths[0].c_str());
+        g_ctx.hidDevs[0] = new HidDevice();
+        if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
+            SDK_LOG_WARN("[SDK] Failed to open VIO HID; will retry");
+            delete g_ctx.hidDevs[0];
+            g_ctx.hidDevs[0] = nullptr;
+            g_ctx.hidPaths[0].clear();
+        }
     }
     {
         std::lock_guard<std::recursive_mutex> lock(g_ctx.xuMutex);
         if (!reopenXUControlLocked("initialization")) {
             SDK_LOG_WARN("[SDK][WARN] XU control unavailable during initialization; video can still run");
         }
-        cacheInitialCameraParams(RGB_CAM_ID);
+        if (!g_ctx.singleNodeMode) cacheInitialCameraParams(RGB_CAM_ID);
         cacheInitialCameraParams(GRAY_CAM_ID);
     }
 
@@ -2604,14 +2765,17 @@ int insight9_receive_start() {
     g_ctx.cam_running[DEPTH_CAM_ID] = true;
     
     for (int uvcId = 0; uvcId < UVC_NUM; ++uvcId) {
-        if (!g_ctx.videos[uvcId]) {
-            continue;
-        }
-
-        if (!g_ctx.videos[uvcId]->start()) {
-            SDK_LOG_ERROR("[SDK] Failed to start UVC %d", uvcId);
-            g_ctx.running = false;
-            return -1;
+        // Start the worker for every slot, including ones with no source yet.
+        // videoThreadFunc() already calls openVideoSourceForSlot() with backoff
+        // when g_ctx.videos[uvcId] is null, so this is what lets the SDK come
+        // up with the device absent and attach it later. Skipping the thread
+        // (the old behaviour) meant a slot missing at init stayed dead for the
+        // life of the process.
+        if (g_ctx.videos[uvcId] && !g_ctx.videos[uvcId]->start()) {
+            SDK_LOG_WARN("[SDK] Failed to start UVC %d; retiring source and retrying", uvcId);
+            std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+            delete g_ctx.videos[uvcId];
+            g_ctx.videos[uvcId] = nullptr;
         }
 
         g_ctx.videoThreads[uvcId] = std::thread(videoThreadFunc, uvcId);
@@ -2626,70 +2790,128 @@ int insight9_receive_start() {
 static int mapCompositeCamId(int cam_id);
 
 int insight9_receive_start_camera(int cam_id) {
-    if (!g_ctx.initialized) return -1;
-    int mapped = mapCompositeCamId(cam_id);
-    if (mapped < 0 || mapped >= UVC_NUM) return -1;
-    if (g_ctx.cam_running[mapped]) return 0;
-    
-    if (!g_ctx.videos[mapped]) {
-        auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
-        if (mapped >= (int)uvcPaths.size()) return -1;
-        
-        g_ctx.videoPaths[mapped] = uvcPaths[mapped];
-        g_ctx.videos[mapped] = new MFVideoSource();
-        
-        if (cam_id == 0) {
-            int w = g_ctx.config.rgb_config.width;
-            int h = g_ctx.config.rgb_config.height;
-            PixelFormat fmt = g_ctx.config.rgb_config.pixel_format;
-            int fps = g_ctx.config.rgb_config.fps;
-            
-            if (!g_ctx.videos[mapped]->open(uvcPaths[mapped], mapped, w, h, fmt, fps)) {
-                delete g_ctx.videos[mapped];
-                g_ctx.videos[mapped] = nullptr;
-                return -1;
-            }
-        } else {
-            int w = g_ctx.config.gray_config.width;
-            int h = g_ctx.config.gray_config.height;
-            PixelFormat depthFmt = g_ctx.config.depth_config.pixel_format;
-            PixelFormat grayFmt = g_ctx.config.gray_config.pixel_format;
-            int fps = g_ctx.config.gray_config.fps;
-            
-            if (!g_ctx.videos[mapped]->openWithTwoStreams(uvcPaths[mapped], mapped, w, h, depthFmt, fps, grayFmt, fps)) {
-                delete g_ctx.videos[mapped];
-                g_ctx.videos[mapped] = nullptr;
-                return -1;
-            }
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+
+    std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
+
+    if (g_ctx.cam_running[cam_id]) return 0;
+
+    const int uvcId = mapCompositeCamId(cam_id);
+    if (uvcId < 0 || uvcId >= UVC_NUM) return -1;
+
+    // If the physical worker is already alive, simply re-enable the logical stream.
+    // Gray and Depth intentionally share one Composite worker.
+    bool haveSource = false;
+    bool sourceRunning = false;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        haveSource = (g_ctx.videos[uvcId] != nullptr);
+        sourceRunning = haveSource && g_ctx.videos[uvcId]->isRunning();
+    }
+
+    if (uvcId == COMPOSITE_UVC_ID && sourceRunning &&
+        g_ctx.videoThreads[uvcId].joinable()) {
+        g_ctx.cam_running[cam_id] = true;
+        SDK_LOG_INFO("[SDK] Logical camera %d enabled on existing Composite worker", cam_id);
+        return 0;
+    }
+
+    // A stale/non-running source cannot be shared. Retire it before creating a new worker.
+    if (g_ctx.videoThreads[uvcId].joinable()) {
+        if (haveSource) g_ctx.videos[uvcId]->stop();
+        g_ctx.videoThreads[uvcId].join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        if (g_ctx.videos[uvcId]) {
+            delete g_ctx.videos[uvcId];
+            g_ctx.videos[uvcId] = nullptr;
         }
     }
-    
-    g_ctx.cam_running[mapped] = true;
-    g_ctx.videos[mapped]->start();
-    
-    joinWithTimeout(g_ctx.videoThreads[mapped], 1000, "video");
-    g_ctx.videoThreads[mapped] = std::thread(videoThreadFunc, mapped);
-    
+
+    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+    // Slot-indexed: an empty entry means this unit does not publish that
+    // function, so there is nothing to reopen.
+    if (uvcId < 0 || uvcId >= UVC_NUM || uvcPaths[uvcId].empty()) return -1;
+    g_ctx.videoPaths[uvcId] = uvcPaths[uvcId];
+
+    MFVideoSource* src = new (std::nothrow) MFVideoSource();
+    if (!src) return -1;
+
+    bool opened = false;
+    if (uvcId == RGB_UVC_ID) {
+        opened = src->open(g_ctx.videoPaths[uvcId], uvcId,
+                           g_ctx.config.rgb_config.width,
+                           g_ctx.config.rgb_config.height,
+                           g_ctx.config.rgb_config.pixel_format,
+                           g_ctx.config.rgb_config.fps);
+    } else {
+        opened = src->openWithTwoStreams(
+            g_ctx.videoPaths[uvcId], uvcId,
+            g_ctx.config.depth_config.width,
+            g_ctx.config.depth_config.height,
+            g_ctx.config.gray_config.width,
+            g_ctx.config.gray_config.height,
+            g_ctx.config.depth_config.pixel_format,
+            g_ctx.config.depth_config.fps,
+            g_ctx.config.gray_config.pixel_format,
+            g_ctx.config.gray_config.fps);
+    }
+
+    if (!opened) {
+        delete src;
+        return -1;
+    }
+
+    if (!src->start()) {
+        delete src;
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        g_ctx.videos[uvcId] = src;
+    }
+
+    if (uvcId == COMPOSITE_UVC_ID) {
+        g_ctx.cam_running[GRAY_CAM_ID] = true;
+        g_ctx.cam_running[DEPTH_CAM_ID] = true;
+    } else {
+        g_ctx.cam_running[RGB_CAM_ID] = true;
+    }
+
+    g_ctx.videoThreads[uvcId] = std::thread(videoThreadFunc, uvcId);
     return 0;
 }
 
 void insight9_receive_stop_camera(int cam_id) {
-    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) {
-        return;
-    }
+    std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
+    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return;
+
     SDK_LOG_INFO("[SDK] Stop logical camera %d", cam_id);
 
     if (cam_id == RGB_CAM_ID) {
         g_ctx.cam_running[RGB_CAM_ID] = false;
+
         if (g_ctx.videos[RGB_UVC_ID]) {
             g_ctx.videos[RGB_UVC_ID]->stop();
         }
         if (g_ctx.videoThreads[RGB_UVC_ID].joinable()) {
             g_ctx.videoThreads[RGB_UVC_ID].join();
         }
+
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        if (g_ctx.videos[RGB_UVC_ID]) {
+            delete g_ctx.videos[RGB_UVC_ID];
+            g_ctx.videos[RGB_UVC_ID] = nullptr;
+        }
         return;
     }
 
+    // Logical Gray and Depth share ONE physical Composite UVC / SourceReader.
+    // A normal stop of only one logical stream can keep the other stream alive,
+    // but any reconfiguration must use the dedicated full-composite path below.
     if (cam_id == GRAY_CAM_ID) {
         g_ctx.cam_running[GRAY_CAM_ID] = false;
     } else if (cam_id == DEPTH_CAM_ID) {
@@ -2697,20 +2919,38 @@ void insight9_receive_stop_camera(int cam_id) {
     }
 
     if (!g_ctx.cam_running[GRAY_CAM_ID] && !g_ctx.cam_running[DEPTH_CAM_ID]) {
-        if (g_ctx.videos[COMPOSITE_UVC_ID]) g_ctx.videos[COMPOSITE_UVC_ID]->stop();
-        g_ctx.videoThreadStuck[COMPOSITE_UVC_ID] =
-            !joinWithTimeout(g_ctx.videoThreads[COMPOSITE_UVC_ID], 1000, "video[Composite]");
-
-        if (g_ctx.videoThreadStuck[COMPOSITE_UVC_ID]) {
-            SDK_LOG_WARN("[SDK][WARN] Composite video source leaked intentionally");
-        } else {
-            delete g_ctx.videos[COMPOSITE_UVC_ID];
+        if (g_ctx.videos[COMPOSITE_UVC_ID]) {
+            g_ctx.videos[COMPOSITE_UVC_ID]->stop();
         }
-        g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
-        g_ctx.videoThreadStuck[COMPOSITE_UVC_ID] = false;
+        if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
+            g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
+        }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        g_ctx.videos[COMPOSITE_UVC_ID] = new MFVideoSource();
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        if (g_ctx.videos[COMPOSITE_UVC_ID]) {
+            delete g_ctx.videos[COMPOSITE_UVC_ID];
+            g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
+        }
+    }
+}
+
+static void stopCompositeForReconfigure() {
+    g_ctx.videoReconfiguring.store(true, std::memory_order_release);
+    g_ctx.cam_running[GRAY_CAM_ID] = false;
+    g_ctx.cam_running[DEPTH_CAM_ID] = false;
+
+    if (g_ctx.videos[COMPOSITE_UVC_ID]) {
+        g_ctx.videos[COMPOSITE_UVC_ID]->stop();
+    }
+
+    if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
+        g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
+    }
+
+    std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+    if (g_ctx.videos[COMPOSITE_UVC_ID]) {
+        delete g_ctx.videos[COMPOSITE_UVC_ID];
+        g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
     }
 }
 
@@ -2729,107 +2969,129 @@ int insight9_receive_get_camera_config(int cam_id, int* width, int* height, Pixe
 }
 
 int insight9_receive_restart_camera(int cam_id) {
-    if (!g_ctx.initialized) {
-        return -1;
-    }
+    std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
 
-    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) {
-        return -1;
-    }
-
-    int uvcId = mapCompositeCamId(cam_id);
-
-    if (uvcId < 0 || uvcId >= UVC_NUM) {
-        return -1;
-    }
+    const int uvcId = mapCompositeCamId(cam_id);
+    if (uvcId < 0 || uvcId >= UVC_NUM) return -1;
 
     SDK_LOG_INFO("[SDK] Restart logical camera %d (physical UVC %d)", cam_id, uvcId);
 
-    if (cam_id == RGB_CAM_ID) {
+    if (uvcId == RGB_UVC_ID) {
+        // Full retirement of the RGB physical UVC.
         insight9_receive_stop_camera(RGB_CAM_ID);
-
-        if (g_ctx.videoThreadStuck[RGB_UVC_ID]) {
-            SDK_LOG_WARN("[SDK][WARN] RGB video source leaked intentionally "
-                         "(stuck thread may still reference it)");
-        } else {
-            delete g_ctx.videos[RGB_UVC_ID];
-        }
-
-        g_ctx.videos[RGB_UVC_ID] = nullptr;
-        g_ctx.videoThreadStuck[RGB_UVC_ID] = false;
-
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-        g_ctx.videos[RGB_UVC_ID] = new MFVideoSource();
+        if (!g_ctx.videos[RGB_UVC_ID]) {
+            auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+            if (uvcPaths[RGB_UVC_ID].empty()) return -1;   // composite-only unit
+            g_ctx.videoPaths[RGB_UVC_ID] = uvcPaths[RGB_UVC_ID];
 
-        if (!g_ctx.videos[RGB_UVC_ID]->open(g_ctx.videoPaths[RGB_UVC_ID],
-                    RGB_UVC_ID,
-                    g_ctx.config.rgb_config.width,
-                    g_ctx.config.rgb_config.height,
-                    g_ctx.config.rgb_config.pixel_format,
-                    g_ctx.config.rgb_config.fps)) {
+            std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+            g_ctx.videos[RGB_UVC_ID] = new (std::nothrow) MFVideoSource();
+            if (!g_ctx.videos[RGB_UVC_ID]) return -1;
+        }
+
+        if (!g_ctx.videos[RGB_UVC_ID]->open(
+                g_ctx.videoPaths[RGB_UVC_ID], RGB_UVC_ID,
+                g_ctx.config.rgb_config.width,
+                g_ctx.config.rgb_config.height,
+                g_ctx.config.rgb_config.pixel_format,
+                g_ctx.config.rgb_config.fps)) {
+            std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
             delete g_ctx.videos[RGB_UVC_ID];
             g_ctx.videos[RGB_UVC_ID] = nullptr;
             return -1;
         }
 
         g_ctx.cam_running[RGB_CAM_ID] = true;
-        g_ctx.videos[RGB_UVC_ID]->start();
+        if (!g_ctx.videos[RGB_UVC_ID]->start()) return -1;
         g_ctx.videoThreads[RGB_UVC_ID] = std::thread(videoThreadFunc, RGB_UVC_ID);
-
         return 0;
     }
 
-    g_ctx.cam_running[GRAY_CAM_ID] = false;
-    g_ctx.cam_running[DEPTH_CAM_ID] = false;
+    // Gray and Depth share MI_00. Restart ALWAYS rebuilds the complete Composite UVC.
+    // This prevents the old reader from surviving while the Gray configuration changes.
+    stopCompositeForReconfigure();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    if (g_ctx.videos[COMPOSITE_UVC_ID]) {
-        g_ctx.videos[COMPOSITE_UVC_ID]->stop();
-    }
-
-    if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
-        g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
-    }
-
-    delete g_ctx.videos[COMPOSITE_UVC_ID];
-    g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-    g_ctx.videos[COMPOSITE_UVC_ID] = new MFVideoSource();
-
-    int w = g_ctx.config.gray_config.width;
-    int h = g_ctx.config.gray_config.height;
-    int fps = g_ctx.config.gray_config.fps;
-
-    PixelFormat depthFmt = g_ctx.config.depth_config.pixel_format;
-    PixelFormat grayFmt = g_ctx.config.gray_config.pixel_format;
-
-    if (!g_ctx.videos[COMPOSITE_UVC_ID]->openWithTwoStreams(g_ctx.videoPaths[COMPOSITE_UVC_ID],
-                COMPOSITE_UVC_ID, w, h, depthFmt, fps, grayFmt, fps)) {
-        delete g_ctx.videos[COMPOSITE_UVC_ID];
-        g_ctx.videos[COMPOSITE_UVC_ID] = nullptr;
-
+    auto uvcPaths = findUvcDevices(VENDOR_ID, PRODUCT_ID);
+    g_ctx.singleNodeMode = uvcSlotsAreSingleNode(uvcPaths);
+    if (uvcPaths[COMPOSITE_UVC_ID].empty()) {
+        SDK_LOG_ERROR("[SDK] Composite UVC not present after re-enumeration");
         return -1;
+    }
+    g_ctx.videoPaths[COMPOSITE_UVC_ID] = uvcPaths[COMPOSITE_UVC_ID];
+
+    MFVideoSource* src = new (std::nothrow) MFVideoSource();
+    if (!src) return -1;
+
+    const int depthW = g_ctx.config.depth_config.width;
+    const int depthH = g_ctx.config.depth_config.height;
+    const int grayW = g_ctx.config.gray_config.width;
+    const int grayH = g_ctx.config.gray_config.height;
+
+    SDK_LOG_INFO("[SDK] Reopening Composite UVC:");
+    SDK_LOG_INFO("       Stream0 Depth: %dx%d@%d fmt=%d",
+                 depthW, depthH,
+                 g_ctx.config.depth_config.fps,
+                 (int)g_ctx.config.depth_config.pixel_format);
+    SDK_LOG_INFO("       Stream1 Gray : %dx%d@%d fmt=%d",
+                 grayW, grayH,
+                 g_ctx.config.gray_config.fps,
+                 (int)g_ctx.config.gray_config.pixel_format);
+
+    if (!src->openWithTwoStreams(
+            g_ctx.videoPaths[COMPOSITE_UVC_ID],
+            COMPOSITE_UVC_ID,
+            depthW, depthH,
+            grayW, grayH,
+            g_ctx.config.depth_config.pixel_format,
+            g_ctx.config.depth_config.fps,
+            g_ctx.config.gray_config.pixel_format,
+            g_ctx.config.gray_config.fps)) {
+        delete src;
+        return -1;
+    }
+
+    if (!src->start()) {
+        delete src;
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        // stopCompositeForReconfigure() has already joined and removed the old source.
+        g_ctx.videos[COMPOSITE_UVC_ID] = src;
     }
 
     g_ctx.cam_running[GRAY_CAM_ID] = true;
     g_ctx.cam_running[DEPTH_CAM_ID] = true;
-    g_ctx.videos[COMPOSITE_UVC_ID]->start();
-
     g_ctx.videoThreads[COMPOSITE_UVC_ID] = std::thread(videoThreadFunc, COMPOSITE_UVC_ID);
+
+    if (g_ctx.hidDevs[0]) {
+        g_ctx.hidDevs[0]->close();
+        if (!g_ctx.hidDevs[0]->open(g_ctx.hidPaths[0])) {
+            SDK_LOG_WARN("[SDK] Failed to reopen HID after composite reconfigure");
+        } else {
+            SDK_LOG_INFO("[SDK] HID reopened after composite reconfigure");
+        }
+    }
 
     return 0;
 }
 
 int insight9_receive_set_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id > 2) return -1;
-    if (cam_id == 0) {
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM || fps <= 0) return -1;
+    if (cam_id == RGB_CAM_ID) {
         g_ctx.config.rgb_config.fps = fps;
         SDK_LOG_INFO("[SDK] Set RGB FPS to %d", fps);
-    } else {
+    } else if (cam_id == GRAY_CAM_ID) {
         g_ctx.config.gray_config.fps = fps;
-        SDK_LOG_INFO("[SDK] Set Gray/Depth composite FPS to %d", fps);
+        SDK_LOG_INFO("[SDK] Set Gray FPS to %d", fps);
+    } else {
+        g_ctx.config.depth_config.fps = fps;
+        SDK_LOG_INFO("[SDK] Set Depth FPS to %d", fps);
     }
     return 0;
 }
@@ -2842,17 +3104,14 @@ int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelF
         g_ctx.config.rgb_config.width = width;
         g_ctx.config.rgb_config.height = height;
         g_ctx.config.rgb_config.pixel_format = format;
-    } else if (cam_id == GRAY_CAM_ID || cam_id == DEPTH_CAM_ID) {
+    } else if (cam_id == GRAY_CAM_ID) {
         g_ctx.config.gray_config.width = width;
         g_ctx.config.gray_config.height = height;
+        g_ctx.config.gray_config.pixel_format = format;
+    } else if (cam_id == DEPTH_CAM_ID) {
         g_ctx.config.depth_config.width = width;
         g_ctx.config.depth_config.height = height;
-
-        if (cam_id == GRAY_CAM_ID) {
-            g_ctx.config.gray_config.pixel_format = format;
-        } else {
-            g_ctx.config.depth_config.pixel_format = format;
-        }
+        g_ctx.config.depth_config.pixel_format = format;
     } else {
         return -1;
     }
@@ -2862,24 +3121,47 @@ int insight9_receive_set_camera_format(int cam_id, int width, int height, PixelF
 }
 
 int insight9_receive_switch_camera_config(int cam_id, int width, int height, PixelFormat format, int fps) {
+    std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
     if (width <= 0 || height <= 0 || fps <= 0) return -1;
 
     SDK_LOG_INFO("[SDK] Switching camera %d to %dx%d@%d...", cam_id, width, height, fps);
+    SDK_LOG_INFO("[Config] Before switch: Gray=%d Depth=%d CompositeSource=%p CompositeThread=%d",
+                 g_ctx.cam_running[GRAY_CAM_ID] ? 1 : 0,
+                 g_ctx.cam_running[DEPTH_CAM_ID] ? 1 : 0,
+                 (void*)g_ctx.videos[COMPOSITE_UVC_ID],
+                 g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable() ? 1 : 0);
 
-    insight9_receive_stop_camera(cam_id);
-    Sleep(3000);
+    const bool composite = (cam_id == GRAY_CAM_ID || cam_id == DEPTH_CAM_ID);
+    g_ctx.videoReconfiguring.store(composite, std::memory_order_release);
+
+    int ret = -1;
+    if (composite) {
+        // Gray/Depth are two logical streams of the same physical MI_00 UVC.
+        // Stop the WHOLE composite before touching either logical configuration.
+        SDK_LOG_INFO("[Config] Stopping entire Composite UVC before reconfigure");
+        stopCompositeForReconfigure();
+        SDK_LOG_INFO("[Config] Composite UVC stopped; waiting for USB/UVC settle");
+        Sleep(3000);
+    } else {
+        insight9_receive_stop_camera(RGB_CAM_ID);
+        Sleep(500);
+    }
 
     if (insight9_receive_set_camera_format(cam_id, width, height, format) != 0) {
         SDK_LOG_ERROR("[SDK] Failed to set camera %d format", cam_id);
+        g_ctx.videoReconfiguring.store(false, std::memory_order_release);
         return -1;
     }
     if (insight9_receive_set_camera_fps(cam_id, fps) != 0) {
         SDK_LOG_ERROR("[SDK] Failed to set camera %d fps", cam_id);
+        g_ctx.videoReconfiguring.store(false, std::memory_order_release);
         return -1;
     }
 
-    int ret = insight9_receive_restart_camera(cam_id);
+    ret = insight9_receive_restart_camera(cam_id);
+    g_ctx.videoReconfiguring.store(false, std::memory_order_release);
+
     if (ret == 0) {
         SDK_LOG_INFO("[SDK] Camera %d switched to %dx%d@%d successfully", cam_id, width, height, fps);
     } else {
@@ -2889,7 +3171,7 @@ int insight9_receive_switch_camera_config(int cam_id, int width, int height, Pix
 }
 
 int insight9_receive_switch_camera_fps(int cam_id, int fps) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id >= UVC_NUM) return -1;
+    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
     video_config_t* cur = (cam_id == RGB_CAM_ID) ? &g_ctx.config.rgb_config
                         : (cam_id == GRAY_CAM_ID) ? &g_ctx.config.gray_config
                                                     : &g_ctx.config.depth_config;
@@ -2905,14 +3187,51 @@ int insight9_receive_switch_camera_format(int cam_id, int width, int height, Pix
 }
 
 int insight9_receive_is_camera_running(int cam_id) {
-    int mapped = mapCompositeCamId(cam_id);
-    if (mapped < 0 || mapped >= UVC_NUM) return 0;
-    return g_ctx.cam_running[mapped] ? 1 : 0;
+    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return 0;
+    return g_ctx.cam_running[cam_id] ? 1 : 0;
+}
+
+int insight9_receive_has_camera(int cam_id) {
+    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return 0;
+    // Gray and depth are two streams of the same composite device, so both
+    // depend on the composite slot; only RGB has a function of its own.
+    const int uvcId = (cam_id == RGB_CAM_ID) ? RGB_UVC_ID : COMPOSITE_UVC_ID;
+    return g_ctx.videoPaths[uvcId].empty() ? 0 : 1;
+}
+
+int insight9_receive_camera_has_color(int cam_id) {
+    if (cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return 0;
+    if (!insight9_receive_has_camera(cam_id)) return 0;
+
+    const std::vector<DeviceCapability>* caps =
+        (cam_id == RGB_CAM_ID)  ? &g_ctx.device_caps.rgb_capabilities :
+        (cam_id == GRAY_CAM_ID) ? &g_ctx.device_caps.gray_capabilities :
+                                  &g_ctx.device_caps.depth_capabilities;
+
+    // insight9_receive_init(config) does not probe capabilities - only
+    // init_default() does - so probe on demand rather than reporting "no
+    // colour" just because nobody has asked the device yet.
+    if (caps->empty()) {
+        const int uvcId = (cam_id == RGB_CAM_ID) ? RGB_UVC_ID : COMPOSITE_UVC_ID;
+        probeDeviceCapabilities(g_ctx.videoPaths[uvcId], uvcId, g_ctx.device_caps);
+    }
+
+    for (const auto& cap : *caps) {
+        if (!cap.valid) continue;
+        if (cap.format == PixelFormat::YUYV || cap.format == PixelFormat::YVYU ||
+            cap.format == PixelFormat::MJPEG || cap.format == PixelFormat::NV12 ||
+            cap.format == PixelFormat::RGB8) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void insight9_receive_stop() {
+    std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
     if (!g_ctx.running) return;
     g_ctx.running = false;
+    g_ctx.videoReconfiguring.store(false, std::memory_order_release);
 
     for (int i = 0; i < LOGICAL_CAM_NUM; ++i) g_ctx.cam_running[i] = false;
     for (int i = 0; i < UVC_NUM; ++i) {
@@ -2931,6 +3250,7 @@ void insight9_receive_stop() {
 }
 
 void insight9_receive_cleanup() {
+    std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
     insight9_receive_stop();
 
     for (int i = 0; i < UVC_NUM; ++i) {
@@ -2938,6 +3258,7 @@ void insight9_receive_cleanup() {
             SDK_LOG_WARN("[SDK][WARN] Video source leaked intentionally "
                          "(stuck thread may still reference it)");
         } else {
+            std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
             delete g_ctx.videos[i];
         }
         g_ctx.videos[i] = nullptr;
@@ -3114,11 +3435,16 @@ int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t* timestamp) {
 
     int uvcId = mapCompositeCamId(cam_id);
     int streamIdx = mapCamIdToStreamIndex(cam_id);
-    if (uvcId < 0 || uvcId >= UVC_NUM || streamIdx < 0 || !g_ctx.videos[uvcId]) {
+    if (uvcId < 0 || uvcId >= UVC_NUM || streamIdx < 0) {
         return -1;
     }
 
-    uint64_t ts = g_ctx.videos[uvcId]->getLastTimestamp(streamIdx);
+    uint64_t ts = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+        if (!g_ctx.videos[uvcId]) return -1;
+        ts = g_ctx.videos[uvcId]->getLastTimestamp(streamIdx);
+    }
     if (ts == 0) {
         return -1;
     }
@@ -3403,8 +3729,8 @@ const char* insight9_receive_get_hardware_type() {
     camera_params params;
     params.hardware_model = 0xFF;
     if (insight9_receive_get_camera_params(&params) == 0) {
-        const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
-        if (params.hardware_model < 4) {
+        const char* models[] = {"Insight 9", "Insight 7", "Insight 3"};
+        if (params.hardware_model < 3) {
             result = models[params.hardware_model];
             return result.c_str();
         }

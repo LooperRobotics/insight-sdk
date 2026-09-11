@@ -59,6 +59,48 @@ sdk_ctx_t g_ctx{};
 enum CameraType { TYPE_UNKNOWN = 0, TYPE_RGB, TYPE_LEFT, TYPE_DEPTH };
 CameraType cam_type[CAM_NUM];
 
+// ==================== Stream presence / late binding ====================
+// Insight 9 publishes three VideoStreaming interfaces (depth / gray / RGB) and
+// therefore six v4l2 nodes. Other units in the family publish fewer - an
+// Insight 3u has no RGB function at all, so Linux shows four nodes and Windows
+// shows a single composite device. The old code hard-coded video indexes 0/2/4
+// with metadata siblings 1/3/5 and refused to start on anything else.
+//
+// cam_bound[i] now says whether logical camera i is currently attached to a
+// real node. It starts false, is filled in by try_bind_cameras() at init, and
+// can flip to true later: the capture threads call try_bind_cameras() on every
+// reconnect attempt, so the SDK can initialise with no device attached at all
+// and pick the streams up when they appear.
+static bool cam_bound[CAM_NUM];
+// Which stream families the node behind each camera advertises. A camera can
+// legitimately offer more than one (Insight 3u's stereo node does Y8I and
+// YUYV); switching between them is a normal set_camera_format + restart.
+static int cam_families[CAM_NUM];
+static pthread_mutex_t g_bind_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Which config slot a logical camera draws from. Spelled out because the
+// cam_id -> config mapping was inverted in several places.
+typedef enum { PLACE_DEPTH, PLACE_GRAY, PLACE_RGB } video_place_t;
+
+// Fixed logical ids used by the image callback: 0 = DEPTH, 1 = GRAY, 2 = RGB.
+static int cam_id_for_type(CameraType t) {
+    switch (t) {
+        case TYPE_DEPTH: return 0;
+        case TYPE_LEFT:  return 1;
+        case TYPE_RGB:   return 2;
+        default:         return -1;
+    }
+}
+
+static CameraType cam_type_for_id(int cam_id) {
+    switch (cam_id) {
+        case 0:  return TYPE_DEPTH;
+        case 1:  return TYPE_LEFT;
+        case 2:  return TYPE_RGB;
+        default: return TYPE_UNKNOWN;
+    }
+}
+
 // Compute the exponential backoff delay (ms) for the Nth consecutive failure
 // (attempt counted from 1), capped at max_ms, starting from base_ms.
 static int reconnect_backoff_ms_ex(int attempt, int base_ms, int max_ms) {
@@ -506,28 +548,103 @@ static int get_all_formats_info(int fd, struct uvc_format_info **formats_out, in
 
 // Probe one V4L2 node's capture formats and classify it as RGB / LEFT / DEPTH.
 // Metadata-only nodes advertise no capture format and fall through to -1.
-static int detect_cam_type(const char *dev, CameraType *out) {
-    if (!dev || !dev[0]) return -1;
+// Node kinds returned by probe_uvc_node().
+#define NODE_VIDEO   0   // VideoStreaming node; *out holds its stream type
+#define NODE_META    1   // its metadata sibling (no VIDEO_CAPTURE formats)
+#define NODE_ERROR (-1)  // could not be opened / queried
+
+// Stream families a node can advertise. A node is not required to carry
+// exactly one: on Insight 3u the stereo node offers Y8I *and* YUYV (left/right
+// stacked top-to-bottom), so the colour stream is an alternate format on the
+// gray camera rather than a separate logical camera.
+#define FAM_DEPTH 0x1   // Z16
+#define FAM_GRAY  0x2   // Y8I / GREY
+#define FAM_COLOR 0x4   // MJPEG / YUYV / NV12
+
+// Probe one v4l2 node. find_uvc_devices_by_vid_pid() returns video *and*
+// metadata nodes mixed together - VIDIOC_QUERYCAP reports the union of the
+// whole device's capabilities, so a metadata node also advertises
+// VIDEO_CAPTURE - and the only reliable way to tell them apart is that a
+// metadata node enumerates zero VIDEO_CAPTURE formats.
+//
+// Classification is by priority, not by exclusive match. The old rule
+// ("exactly one of MJPEG/Y8I/Z16 and nothing else") returned UNKNOWN for any
+// node advertising a second format, which then silently disabled hot-plug
+// re-detection for that camera.
+static int probe_uvc_node(const char *dev, CameraType *out, int *families = NULL) {
+    if (out) *out = TYPE_UNKNOWN;
+    if (families) *families = 0;
+    if (!dev || !dev[0]) return NODE_ERROR;
     int fd = open(dev, O_RDWR);
-    if (fd < 0) return -1;
+    if (fd < 0) return NODE_ERROR;
 
     bool has_mjpeg = false, has_y8i = false, has_z16 = false;
+    bool has_grey = false, has_color = false;
+    int nfmt = 0;
     struct v4l2_fmtdesc fmtdesc;
     memset(&fmtdesc, 0, sizeof(fmtdesc));
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmtdesc.index = 0;
     while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
-        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG) has_mjpeg = true;
-        if (fmtdesc.pixelformat == V4L2_PIX_FMT_Y8I)   has_y8i = true;
-        if (fmtdesc.pixelformat == V4L2_PIX_FMT_Z16)   has_z16 = true;
+        switch (fmtdesc.pixelformat) {
+            case V4L2_PIX_FMT_MJPEG: has_mjpeg = true; break;
+            case V4L2_PIX_FMT_GREY:  has_grey  = true; break;
+            case V4L2_PIX_FMT_YUYV:
+            case V4L2_PIX_FMT_NV12:  has_color = true; break;
+#ifdef V4L2_PIX_FMT_Y8I
+            case V4L2_PIX_FMT_Y8I:   has_y8i   = true; break;
+#endif
+#ifdef V4L2_PIX_FMT_Z16
+            case V4L2_PIX_FMT_Z16:   has_z16   = true; break;
+#endif
+            default: break;
+        }
+        nfmt++;
         fmtdesc.index++;
     }
     close(fd);
 
-    if (has_z16   && !has_mjpeg && !has_y8i) { *out = TYPE_DEPTH; return 0; }
-    if (has_y8i   && !has_mjpeg && !has_z16) { *out = TYPE_LEFT;  return 0; }
-    if (has_mjpeg && !has_y8i   && !has_z16) { *out = TYPE_RGB;   return 0; }
+    if (nfmt == 0) return NODE_META;   // no capture format -> metadata sibling
+
+    int mask = 0;
+    if (has_z16)                mask |= FAM_DEPTH;
+    if (has_y8i || has_grey)    mask |= FAM_GRAY;
+    if (has_mjpeg || has_color) mask |= FAM_COLOR;
+
+    // Preferred identity when nothing else competes for this node.
+    CameraType t = TYPE_UNKNOWN;
+    if (mask & FAM_DEPTH)      t = TYPE_DEPTH;
+    else if (mask & FAM_GRAY)  t = TYPE_LEFT;
+    else if (mask & FAM_COLOR) t = TYPE_RGB;
+
+    if (out) *out = t;
+    if (families) *families = mask;
+    return NODE_VIDEO;
+}
+
+// How many distinct stream families a node advertises.
+static int family_count(int mask) {
+    int n = 0;
+    for (int b = 1; b <= FAM_COLOR; b <<= 1) if (mask & b) n++;
+    return n;
+}
+
+// Which logical camera should claim a node with this family set, given which
+// cameras are already taken. Depth beats gray beats colour, but a family whose
+// camera is already claimed is skipped - that is what lets the stereo node be
+// used as the colour source on a unit where something else is already gray.
+static int cam_id_from_families(int mask, const bool *taken) {
+    if ((mask & FAM_DEPTH) && !taken[0]) return 0;
+    if ((mask & FAM_GRAY)  && !taken[1]) return 1;
+    if ((mask & FAM_COLOR) && !taken[2]) return 2;
     return -1;
+}
+
+static void format_families_str(int mask, char *buf, size_t n) {
+    snprintf(buf, n, "%s%s%s",
+             (mask & FAM_DEPTH) ? "Z16 " : "",
+             (mask & FAM_GRAY)  ? "Y8I/GREY " : "",
+             (mask & FAM_COLOR) ? "MJPEG/YUYV " : "");
 }
 
 static const char *cam_type_name(CameraType t) {
@@ -539,26 +656,151 @@ static const char *cam_type_name(CameraType t) {
     }
 }
 
-// Record what each selected video node actually is. Must run once after the
-// video_devs[]/metadata_devs[] pairs are chosen and before any capture thread
-// starts: refresh_video_device_path() matches on cam_type[], so leaving it at
-// its zero value made every camera look for the MJPEG node.
-static void classify_selected_cameras(void) {
+// Reset every logical camera to "not attached".
+static void unbind_all_cameras(void) {
+    pthread_mutex_lock(&g_bind_lock);
     for (int i = 0; i < CAM_NUM; i++) {
-        CameraType t;
-        if (detect_cam_type(g_ctx.video_devs[i], &t) == 0) {
-            cam_type[i] = t;
-            printf("[CAM%d] type=%s video=%s metadata=%s\n",
-                   i, cam_type_name(t), g_ctx.video_devs[i], g_ctx.metadata_devs[i]);
-        } else {
-            cam_type[i] = TYPE_UNKNOWN;
-            fprintf(stderr, "[CAM%d][WARN] cannot classify %s; hot-plug re-detection disabled\n",
-                    i, g_ctx.video_devs[i]);
+        cam_bound[i] = false;
+        cam_families[i] = 0;
+        cam_type[i] = cam_type_for_id(i);   // what we look for, not what we have
+        g_ctx.video_devs[i][0] = '\0';
+        g_ctx.metadata_devs[i][0] = '\0';
+        g_ctx.video_usb_paths[i][0] = '\0';
+        g_ctx.metadata_usb_paths[i][0] = '\0';
+    }
+    pthread_mutex_unlock(&g_bind_lock);
+}
+
+// Attach any not-yet-attached logical camera to a matching node.
+//
+// Replaces the old fixed index selection (video 0/2/4, metadata 1/3/5), which
+// assumed exactly three VideoStreaming interfaces in a fixed order and is what
+// made a two-stream unit die with "cannot select 2/3 devices by skipping one".
+// Here each video node's own formats decide which logical camera it is, and it
+// is paired with the metadata node immediately after it - but only after
+// confirming that node really is a metadata node, since on a device whose
+// streams carry no metadata, node i+1 is the next camera's video node.
+//
+// Safe to call repeatedly from the capture threads. Returns how many cameras
+// were newly attached by this call.
+static int try_bind_cameras(void) {
+    char uvc_list[10][MAX_PATH] = {{0}};
+    int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
+    if (uvc_count <= 0) return 0;
+
+    int newly = 0;
+    pthread_mutex_lock(&g_bind_lock);
+
+    // Two passes, so a node that advertises one family only is never outbid by
+    // a node that happens to advertise several.
+    //   pass 0: single-family nodes claim their camera
+    //   pass 1: multi-family nodes fill whatever is still open
+    // On Insight 9 every node is single-family, so pass 0 does all the work and
+    // the result is identical to before. On Insight 3u the stereo node offers
+    // Y8I+YUYV: nothing else claims gray, so it lands on cam 1 and the colour
+    // stream stays reachable there as an alternate format.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < uvc_count; i++) {
+            CameraType t = TYPE_UNKNOWN;
+            int fams = 0;
+            if (probe_uvc_node(uvc_list[i], &t, &fams) != NODE_VIDEO) continue;
+            if (fams == 0) {
+                if (pass == 0)
+                    fprintf(stderr, "[SDK][WARN] %s: unrecognised stream type, skipped\n",
+                            uvc_list[i]);
+                continue;
+            }
+
+            const bool multi = family_count(fams) > 1;
+            if ((pass == 0) == multi) continue;
+
+            // Never steal a node another camera already owns.
+            bool owned = false;
+            for (int c = 0; c < CAM_NUM; c++) {
+                if (cam_bound[c] && strcmp(uvc_list[i], g_ctx.video_devs[c]) == 0) {
+                    owned = true;
+                    break;
+                }
+            }
+            if (owned) continue;
+
+            int cid = cam_id_from_families(fams, cam_bound);
+            if (cid < 0) continue;   // every camera this node could serve is taken
+
+            snprintf(g_ctx.video_devs[cid], MAX_PATH, "%s", uvc_list[i]);
+            cam_type[cid] = cam_type_for_id(cid);
+            cam_families[cid] = fams;
+
+            if (i + 1 < uvc_count && probe_uvc_node(uvc_list[i + 1], NULL) == NODE_META) {
+                snprintf(g_ctx.metadata_devs[cid], MAX_PATH, "%s", uvc_list[i + 1]);
+            } else {
+                g_ctx.metadata_devs[cid][0] = '\0';
+                fprintf(stderr, "[CAM%d][WARN] %s has no metadata node; "
+                        "falling back to v4l2 buffer timestamps\n", cid, uvc_list[i]);
+            }
+
+            if (get_video_usb_device_path(g_ctx.video_devs[cid],
+                                          g_ctx.video_usb_paths[cid], MAX_PATH) < 0) {
+                g_ctx.video_usb_paths[cid][0] = '\0';
+            }
+            if (g_ctx.metadata_devs[cid][0] &&
+                get_video_usb_device_path(g_ctx.metadata_devs[cid],
+                                          g_ctx.metadata_usb_paths[cid], MAX_PATH) < 0) {
+                g_ctx.metadata_usb_paths[cid][0] = '\0';
+            }
+
+            cam_bound[cid] = true;
+            newly++;
+
+            char fam_str[64];
+            format_families_str(fams, fam_str, sizeof(fam_str));
+            printf("[CAM%d] attached as %s video=%s metadata=%s offers=[%s]\n",
+                   cid, cam_type_name(cam_type[cid]), g_ctx.video_devs[cid],
+                   g_ctx.metadata_devs[cid][0] ? g_ctx.metadata_devs[cid] : "(none)",
+                   fam_str);
         }
     }
+    pthread_mutex_unlock(&g_bind_lock);
+    return newly;
+}
+
+static int bound_camera_count(void) {
+    int n = 0;
+    for (int i = 0; i < CAM_NUM; i++) if (cam_bound[i]) n++;
+    return n;
+}
+
+static void log_camera_inventory(void) {
+    for (int i = 0; i < CAM_NUM; i++) {
+        if (!cam_bound[i]) {
+            printf("[CAM%d] type=%s not present yet; will attach on reconnect\n",
+                   i, cam_type_name(cam_type_for_id(i)));
+        }
+    }
+    printf("[SDK] %d/%d streams currently available\n", bound_camera_count(), CAM_NUM);
+}
+
+// Order in which to try nodes when binding the XU. The XU lives on the
+// VideoControl interface, so any VideoStreaming node of the same USB function
+// reaches it. Nodes whose capture fd is already open come first: those are
+// known to be alive.
+// Returns how many candidates were written to out[].
+static int xu_candidate_order(int *out) {
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < CAM_NUM; i++) {
+            if (!cam_bound[i] || !g_ctx.video_devs[i][0]) continue;
+            const bool live = (g_ctx.cams[i].fd >= 0);
+            if ((pass == 0) != live) continue;
+            out[n++] = i;
+        }
+    }
+    return n;
 }
 
 static void refresh_video_device_path(int cam_id) {
+    // Not attached yet: nothing to refresh, try_bind_cameras() owns that case.
+    if (!cam_bound[cam_id]) return;
     // Unclassified camera: never guess, just keep the path chosen at init.
     if (cam_type[cam_id] == TYPE_UNKNOWN) return;
 
@@ -569,10 +811,16 @@ static void refresh_video_device_path(int cam_id) {
         return;
     }
 
+    // Match on "this node can serve my role", not "this node's preferred role
+    // is mine": the stereo node's preferred role is gray even when it was
+    // claimed for colour, and requiring exact equality would leave the camera
+    // stuck on a stale path after a re-enumeration.
+    const int want_fam = (cam_id == 0) ? FAM_DEPTH : (cam_id == 1) ? FAM_GRAY : FAM_COLOR;
     for (int i = 0; i < uvc_count; i++) {
-        CameraType t;
-        if (detect_cam_type(uvc_list[i], &t) != 0) continue;   // metadata node or unknown
-        if (t != cam_type[cam_id]) continue;
+        CameraType t = TYPE_UNKNOWN;
+        int fams = 0;
+        if (probe_uvc_node(uvc_list[i], &t, &fams) != NODE_VIDEO) continue;  // metadata node
+        if (!(fams & want_fam)) continue;
 
         // Never steal a node another camera already owns; the enumeration lists
         // every node of the device, so an unguarded match would let two cameras
@@ -589,11 +837,17 @@ static void refresh_video_device_path(int cam_id) {
         if (strcmp(uvc_list[i], g_ctx.video_devs[cam_id]) != 0) {
             printf("[CAM%d] path moved %s -> %s\n",
                    cam_id, g_ctx.video_devs[cam_id], uvc_list[i]);
-            strcpy(g_ctx.video_devs[cam_id], uvc_list[i]);
-            // The metadata node is the sibling right after the video node.
+            snprintf(g_ctx.video_devs[cam_id], MAX_PATH, "%s", uvc_list[i]);
+            // The metadata node is the sibling right after the video node -
+            // but only if it really is a metadata node. On a variant whose
+            // streams expose no metadata interface, node i+1 is the next
+            // camera's video node, and copying it here would make two cameras
+            // read each other's buffers.
             int meta_idx = i + 1;
-            if (meta_idx < uvc_count)
-                strcpy(g_ctx.metadata_devs[cam_id], uvc_list[meta_idx]);
+            if (meta_idx < uvc_count && probe_uvc_node(uvc_list[meta_idx], NULL) == NODE_META)
+                snprintf(g_ctx.metadata_devs[cam_id], MAX_PATH, "%s", uvc_list[meta_idx]);
+            else
+                g_ctx.metadata_devs[cam_id][0] = '\0';
 
             // Re-read the default format from the new node.
             int fd2 = open(uvc_list[i], O_RDWR);
@@ -616,10 +870,26 @@ static void refresh_video_device_path(int cam_id) {
 }
 
 static bool reopenXUControlLocked(const char* reason) {
-    const char* dev_path = g_ctx.video_devs[0];
-    if (dev_path[0] == '\0') {
-        fprintf(stderr, "[XU][ERR] Cannot reopen XU: RGB UVC path unavailable (%s)\n",
+    // Try every attached node rather than only the first.
+    //
+    // The first attached node is camera 0, which on Linux is depth - and on
+    // units where the depth stream can be switched off, that is exactly the
+    // node that disappears. Binding the XU to it alone meant the XU went dead
+    // and stayed dead whenever depth was disabled, even though cameras 1 and 2
+    // were still present and expose the same VideoControl interface.
+    //
+    // A failure here is also not always "this node has no XU": the probe does
+    // GET_INFO/GET_LEN control transfers, and those can time out (errno 110)
+    // when the device's single control endpoint is busy with another node's
+    // format negotiation. Moving on to the next candidate recovers from that
+    // instead of concluding the selector is missing.
+    int order[CAM_NUM];
+    const int n = xu_candidate_order(order);
+    if (n == 0) {
+        fprintf(stderr, "[XU][ERR] Cannot reopen XU: no UVC video node attached (%s)\n",
                 reason ? reason : "unknown");
+        g_ctx.xu_dev_path[0] = '\0';
+        g_ctx.xu_ready = false;
         return false;
     }
 
@@ -629,20 +899,25 @@ static bool reopenXUControlLocked(const char* reason) {
         g_ctx.xu_control = nullptr;
     }
 
-    g_ctx.xu_control = new viewer::UvcExtensionUnit();
-    if (!g_ctx.xu_control->open(dev_path)) {
-        fprintf(stderr, "[XU][WARN] Reopen failed on path: %s (%s)\n", dev_path, reason ? reason : "unknown");
-        delete g_ctx.xu_control;
-        g_ctx.xu_control = nullptr;
-        g_ctx.xu_dev_path[0] = '\0';
-        g_ctx.xu_ready = false;
-        return false;
+    for (int k = 0; k < n; k++) {
+        const char *dev_path = g_ctx.video_devs[order[k]];
+        viewer::UvcExtensionUnit *xu = new viewer::UvcExtensionUnit();
+        if (xu->open(dev_path)) {
+            g_ctx.xu_control = xu;
+            snprintf(g_ctx.xu_dev_path, MAX_PATH, "%s", dev_path);
+            g_ctx.xu_ready = true;
+            printf("[XU] bound to %s (%s)\n", dev_path, reason ? reason : "unknown");
+            return true;
+        }
+        delete xu;
+        fprintf(stderr, "[XU][WARN] cannot open XU on %s (%s)%s\n",
+                dev_path, reason ? reason : "unknown",
+                (k + 1 < n) ? ", trying next node" : "");
     }
 
-    strcpy(g_ctx.xu_dev_path, dev_path);
-    g_ctx.xu_ready = true;
-    printf("[XU] Reopen success on %s (%s)\n", dev_path, reason ? reason : "unknown");
-    return true;
+    g_ctx.xu_dev_path[0] = '\0';
+    g_ctx.xu_ready = false;
+    return false;
 }
 
 // Throttle XU reopens that are triggered opportunistically on a successful
@@ -711,6 +986,14 @@ static void print_camera_info(int fd) {
 }
 
 static int set_framerate(int fd, int framerate) {
+    // A zero denominator is not a valid frame interval. Some nodes accept it
+    // and quietly reset to their default, others reject it with EIO - which is
+    // where the "[CAM][ERR] VIDIOC_S_PARM: Input/output error" at startup came
+    // from. Refuse it here instead of letting it reach the driver.
+    if (framerate <= 0) {
+        fprintf(stderr, "[CAM][WARN] ignoring set_framerate(%d): not a valid rate\n", framerate);
+        return -1;
+    }
     struct v4l2_streamparm parm;
     memset(&parm, 0, sizeof(parm));
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -777,6 +1060,23 @@ static int get_camera_formats_info(struct cam_ctx *ctx) {
     return 0;
 }
 
+// Push the configured geometry for this logical camera into its context.
+// Zero width/height/format is fine and meaningful: init_capture() then adopts
+// whatever the device reports, which is what init_default() wants.
+static void apply_config_to_cam(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return;
+    struct cam_ctx *c = &g_ctx.cams[cam_id];
+    const video_config_t *sc = (cam_id == 0) ? &g_ctx.config.depth_config
+                             : (cam_id == 1) ? &g_ctx.config.gray_config
+                                             : &g_ctx.config.rgb_config;
+    c->width  = sc->width;
+    c->height = sc->height;
+    c->format = pixelFormatToFourcc(sc->pixel_format);
+    // fps too. Nothing ever wrote cam_ctx::fps, so it stayed 0 from the
+    // memset and init_capture() opened every stream with set_framerate(fd, 0).
+    c->fps    = sc->fps;
+}
+
 static int init_capture(struct cam_ctx *ctx) {
     struct v4l2_format fmt;
     int use_default_format = 0;
@@ -830,14 +1130,21 @@ static int init_capture(struct cam_ctx *ctx) {
                ctx->cam_id, ctx->width, ctx->height, ctx->format);
     }
 
-    set_framerate(ctx->fd, ctx->fps);
-    int cam_id = ctx->cam_id;
-    if (cam_id == 0) {
-        set_framerate(ctx->fd, g_ctx.config.rgb_config.fps);
-    } else if (cam_id == 1) {
-        set_framerate(ctx->fd, g_ctx.config.gray_config.fps);
-    } else if (cam_id == 2) {
-        set_framerate(ctx->fd, g_ctx.config.depth_config.fps);
+    // One rate, from this camera's own config. The old code called
+    // set_framerate() twice - once with ctx->fps and again with a config fps
+    // picked by an inverted cam_id mapping (cam 0 is depth, cam 2 is RGB) - so
+    // every stream took two S_PARM round-trips and the first used a stale or
+    // zero value.
+    const video_place_t place = (ctx->cam_id == 0) ? PLACE_DEPTH
+                              : (ctx->cam_id == 1) ? PLACE_GRAY
+                                                   : PLACE_RGB;
+    int want_fps = (place == PLACE_DEPTH) ? g_ctx.config.depth_config.fps
+                 : (place == PLACE_GRAY)  ? g_ctx.config.gray_config.fps
+                                          : g_ctx.config.rgb_config.fps;
+    if (want_fps <= 0) want_fps = ctx->fps;
+    if (want_fps > 0) {
+        set_framerate(ctx->fd, want_fps);
+        ctx->fps = want_fps;
     }
 
     struct v4l2_requestbuffers req;
@@ -1347,7 +1654,15 @@ static void *capture_thread(void *arg) {
     struct timespec connect_ts = {0, 0};
 
     printf("[CAM%d] capture thread started, dev=%s meta=%s\n",
-           ctx->cam_id, g_ctx.video_devs[ctx->cam_id], g_ctx.metadata_devs[ctx->cam_id]);
+           ctx->cam_id,
+           g_ctx.video_devs[ctx->cam_id][0] ? g_ctx.video_devs[ctx->cam_id] : "(pending)",
+           g_ctx.metadata_devs[ctx->cam_id][0] ? g_ctx.metadata_devs[ctx->cam_id] : "(pending)");
+    // Set once we have said this camera is absent, so a stream this hardware
+    // simply does not have cannot spam the log forever.
+    bool absent_logged = false;
+    // The first successful open is startup, not a reconnect; see the XU rebind
+    // check further down.
+    bool first_open = true;
 
     while (g_ctx.running) {
         if (!g_ctx.cam_running[ctx->cam_id]) {
@@ -1386,27 +1701,72 @@ static void *capture_thread(void *arg) {
                 pthread_mutex_unlock(&ctx->fd_lock);
                 continue;
             }
+            // The camera may have no node yet: the SDK is allowed to
+            // initialise with the device absent, so discovery happens here
+            // rather than only at init.
+            if (!cam_bound[ctx->cam_id]) {
+                pthread_mutex_unlock(&ctx->fd_lock);
+                try_bind_cameras();
+                if (!cam_bound[ctx->cam_id]) {
+                    if (!absent_logged) {
+                        printf("[CAM%d] %s stream not present, waiting for it to appear\n",
+                               ctx->cam_id, cam_type_name(cam_type_for_id(ctx->cam_id)));
+                        absent_logged = true;
+                    }
+                    // Reuses the normal backoff, so a stream this unit simply
+                    // does not have settles at the ceiling interval instead of
+                    // rescanning the bus continuously.
+                    reconnect_backoff_apply_for_cam(ctx, &reconnect_fails, "stream not present");
+                    continue;
+                }
+                absent_logged = false;
+                reconnect_fails = 0;
+                // A newly attached camera has no negotiated format yet; let
+                // init_capture() fall back to the device default unless the
+                // caller configured one.
+                apply_config_to_cam(ctx->cam_id);
+                pthread_mutex_lock(&ctx->fd_lock);
+                if (!g_ctx.cam_running[ctx->cam_id] || ctx->fd >= 0) {
+                    pthread_mutex_unlock(&ctx->fd_lock);
+                    continue;
+                }
+            }
+
+            dev_path = g_ctx.video_devs[ctx->cam_id];
             printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
             refresh_video_device_path(ctx->cam_id);
             dev_path = g_ctx.video_devs[ctx->cam_id];
 
-            cache_initial_camera_params(ctx->cam_id);
-            
-            printf("[CAM%d][META] opening %s\n", ctx->cam_id, g_ctx.metadata_devs[ctx->cam_id]);
-            ctx->meta_fd = open(g_ctx.metadata_devs[ctx->cam_id], O_RDWR | O_NONBLOCK);
-            if (ctx->meta_fd < 0) {
-                fprintf(stderr, "[CAM%d][META][ERR] open failed: %s\n", ctx->cam_id, strerror(errno));
-                pthread_mutex_unlock(&ctx->fd_lock);
-                usleep(500000);
-                continue;
+            // Only if init did not already get them. This used to run on
+            // every open, so all three capture threads fired an XU
+            // transaction at startup while the other two nodes were in the
+            // middle of S_FMT/S_PARM - and the device has one control
+            // endpoint, so those transfers timed out.
+            if (!g_ctx.hasCachedInitialParams[ctx->cam_id]) {
+                cache_initial_camera_params(ctx->cam_id);
             }
-            if (init_metadata_capture(ctx) < 0 || start_metadata_capture(ctx->meta_fd) < 0) {
-                fprintf(stderr, "[CAM%d][META][ERR] init/start failed\n", ctx->cam_id);
-                close(ctx->meta_fd);
-                ctx->meta_fd = -1;
-                pthread_mutex_unlock(&ctx->fd_lock);
-                usleep(500000);
-                continue;
+
+            // Metadata is optional: a variant whose VideoStreaming interface
+            // exposes no metadata node still streams video, it just cannot
+            // supply device timestamps.
+            ctx->meta_fd = -1;
+            if (g_ctx.metadata_devs[ctx->cam_id][0]) {
+                printf("[CAM%d][META] opening %s\n", ctx->cam_id, g_ctx.metadata_devs[ctx->cam_id]);
+                ctx->meta_fd = open(g_ctx.metadata_devs[ctx->cam_id], O_RDWR | O_NONBLOCK);
+                if (ctx->meta_fd < 0) {
+                    fprintf(stderr, "[CAM%d][META][ERR] open failed: %s\n", ctx->cam_id, strerror(errno));
+                    pthread_mutex_unlock(&ctx->fd_lock);
+                    usleep(500000);
+                    continue;
+                }
+                if (init_metadata_capture(ctx) < 0 || start_metadata_capture(ctx->meta_fd) < 0) {
+                    fprintf(stderr, "[CAM%d][META][ERR] init/start failed\n", ctx->cam_id);
+                    close(ctx->meta_fd);
+                    ctx->meta_fd = -1;
+                    pthread_mutex_unlock(&ctx->fd_lock);
+                    usleep(500000);
+                    continue;
+                }
             }
 
             printf("[CAM%d] reopening %s\n", ctx->cam_id, dev_path);
@@ -1460,11 +1820,31 @@ static void *capture_thread(void *arg) {
             clock_gettime(CLOCK_MONOTONIC, &connect_ts);
             pthread_mutex_unlock(&ctx->fd_lock);
             printf("[CAM%d] device reinitialized\n", ctx->cam_id);
-            if (ctx->cam_id == 0) {
+
+            // Rebind the XU only when it is actually broken, or when it is
+            // bound to the node that just came back (its handle belongs to the
+            // old USB device instance and is now stale).
+            //
+            // This used to fire unconditionally for cam_id == 0 and was
+            // labelled "RGB video reconnect", from when camera 0 was assumed
+            // to be the RGB/XU-bearing node. On Linux camera 0 is depth, so it
+            // fired on the very first open at startup and tore down a
+            // perfectly good XU handle at the exact moment cameras 1 and 2
+            // were negotiating formats. The reopen's control transfers then
+            // timed out and open() wrongly reported the selector missing.
+            if (!first_open) {
                 pthread_mutex_lock(&g_ctx.xu_mutex);
-                reopenXUControlThrottled("RGB video reconnect");
+                const bool xu_dead = !g_ctx.xu_ready || !g_ctx.xu_control ||
+                                     !g_ctx.xu_control->isOpen();
+                const bool xu_on_this_node =
+                    g_ctx.xu_dev_path[0] && dev_path && dev_path[0] &&
+                    strcmp(g_ctx.xu_dev_path, dev_path) == 0;
+                if (xu_dead || xu_on_this_node) {
+                    reopenXUControlThrottled("video reconnect");
+                }
                 pthread_mutex_unlock(&g_ctx.xu_mutex);
             }
+            first_open = false;
             frame_count = 0;
         }
 
@@ -1536,16 +1916,29 @@ static void *capture_thread(void *arg) {
             continue;
         }
 
-        uint64_t timestamp = read_latest_metadata_timestamp(ctx);
-        if (ctx->meta_fd < 0) {
-            if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
-                fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+        const bool has_meta_node = g_ctx.metadata_devs[ctx->cam_id][0] != '\0';
+        uint64_t timestamp;
+        if (has_meta_node) {
+            timestamp = read_latest_metadata_timestamp(ctx);
+            if (ctx->meta_fd < 0) {
+                // The metadata node this camera should have has gone away -
+                // tear the stream down and let the reconnect path rebuild it.
+                if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+                    fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
+                }
+                close(ctx->fd);
+                ctx->fd = -1;
+                pending_fail_reset = false;  // invalidate any stale probation timer
+                free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+                continue;
             }
-            close(ctx->fd);
-            ctx->fd = -1;
-            pending_fail_reset = false;  // invalidate any stale probation timer
-            free_buffer_array(&ctx->buffers, &ctx->buffer_count);
-            continue;
+        } else {
+            // No metadata interface on this variant: use the driver's own
+            // buffer timestamp so frames still reach the callback. These are
+            // host-clock timestamps, not device timestamps, so anything doing
+            // cross-sensor alignment must account for that.
+            timestamp = (uint64_t)buf.timestamp.tv_sec * 1000000ull +
+                        (uint64_t)buf.timestamp.tv_usec;
         }
 
         // Filter 2: drop buffers until matching UVC metadata provides a usable timestamp.
@@ -1610,6 +2003,10 @@ static void *capture_thread(void *arg) {
 
 int switch_camera_fps(int cam_id, int new_fps) {
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+    if (!cam_bound[cam_id]) {
+        fprintf(stderr, "[CAM%d][ERR] stream not attached\n", cam_id);
+        return -1;
+    }
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
 
     printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, new_fps);
@@ -1667,99 +2064,54 @@ int insight9_receive_init(const insight9_config_t* config) {
     }
     g_ctx.config = *config;
 
-    // Find UVC devices.
-    char uvc_list[10][MAX_PATH] = {{0}};
-    int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
-    if (uvc_count < 6) {
-        fprintf(stderr, "[SDK][ERR] need >= 6 UVC video/metadata nodes with VID=0x%04x PID=0x%04x, found %d\n",
-                VENDOR_ID, PRODUCT_ID, uvc_count);
-        return -1;
-    }
-    // Select video nodes 0/2/4 and their matching metadata nodes 1/3/5.
-    int selected_idx[] = {0, 2, 4};
-    int metadata_idx[] = {1, 3, 5};
-    for (int i = 0; i < CAM_NUM; i++) {
-        if (selected_idx[i] >= uvc_count || metadata_idx[i] >= uvc_count) {
-            fprintf(stderr, "[SDK][ERR] cannot select UVC video/metadata pair indexes %d/%d\n",
-                    selected_idx[i], metadata_idx[i]);
-            return -1;
-        }
-        strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
-        strcpy(g_ctx.metadata_devs[i], uvc_list[metadata_idx[i]]);
-        g_ctx.video_usb_paths[i][0] = '\0';
-        g_ctx.metadata_usb_paths[i][0] = '\0';
-        if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
-            g_ctx.video_usb_paths[i][0] = '\0';
-        }
-        if (get_video_usb_device_path(g_ctx.metadata_devs[i], g_ctx.metadata_usb_paths[i], MAX_PATH) < 0) {
-            g_ctx.metadata_usb_paths[i][0] = '\0';
-        }
-        printf("[SDK] selected UVC[%d]=%s metadata=%s\n",
-               i, g_ctx.video_devs[i], g_ctx.metadata_devs[i]);
-    }
-    classify_selected_cameras();
+    // Attach whatever streams this unit publishes. Nothing here is fatal:
+    // a device with fewer streams starts with fewer, and a device that is not
+    // plugged in yet starts with none and attaches later from the capture
+    // threads' reconnect path.
+    unbind_all_cameras();
+    try_bind_cameras();
+    log_camera_inventory();
 
-    // Find HID devices.
+    // Find HID devices. Also non-fatal.
     char hid_list[10][MAX_PATH] = {{0}};
     int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
+    for (int i = 0; i < HID_NUM; i++) {
+        g_ctx.hid_devs[i][0] = '\0';
+        g_ctx.hid_usb_paths[i][0] = '\0';
+    }
     if (hid_count < 2) {
-        fprintf(stderr, "[SDK][ERR] need >= 2 HID devices with VID=0x%04x PID=0x%04x, found %d\n",
-                VENDOR_ID, PRODUCT_ID, hid_count);
-        return -1;
+        fprintf(stderr, "[SDK][WARN] expected 2 HID devices with VID=0x%04x PID=0x%04x, found %d; "
+                "IMU/VIO will attach when they appear\n", VENDOR_ID, PRODUCT_ID, hid_count);
     }
     // Take the first two devices after sorting: the lower number is IMU and the higher number is VIO.
-    strcpy(g_ctx.hid_devs[0], hid_list[0]);
-    strcpy(g_ctx.hid_devs[1], hid_list[1]);
-    g_ctx.hid_usb_paths[0][0] = '\0';
-    g_ctx.hid_usb_paths[1][0] = '\0';
-    if (get_hid_usb_device_path(g_ctx.hid_devs[0], g_ctx.hid_usb_paths[0], MAX_PATH) < 0) {
-        g_ctx.hid_usb_paths[0][0] = '\0';
+    for (int i = 0; i < HID_NUM && i < hid_count; i++) {
+        snprintf(g_ctx.hid_devs[i], MAX_PATH, "%s", hid_list[i]);
+        if (get_hid_usb_device_path(g_ctx.hid_devs[i], g_ctx.hid_usb_paths[i], MAX_PATH) < 0) {
+            g_ctx.hid_usb_paths[i][0] = '\0';
+        }
     }
-    if (get_hid_usb_device_path(g_ctx.hid_devs[1], g_ctx.hid_usb_paths[1], MAX_PATH) < 0) {
-        g_ctx.hid_usb_paths[1][0] = '\0';
-    }
-    printf("[SDK] selected HID: IMU=%s VIO=%s\n", g_ctx.hid_devs[0], g_ctx.hid_devs[1]);
+    printf("[SDK] selected HID: IMU=%s VIO=%s\n",
+           g_ctx.hid_devs[0][0] ? g_ctx.hid_devs[0] : "(pending)",
+           g_ctx.hid_devs[1][0] ? g_ctx.hid_devs[1] : "(pending)");
 
     // Initialize camera contexts.
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cams[i].cam_id = i;
         g_ctx.cams[i].fd = -1;
         g_ctx.cams[i].meta_fd = -1;
-        if (i == 0) {
-            g_ctx.cams[i].width = config->depth_config.width;
-            g_ctx.cams[i].height = config->depth_config.height;
-            g_ctx.cams[i].format = pixelFormatToFourcc(config->depth_config.pixel_format);
-        } else if (i == 1) {
-            g_ctx.cams[i].width = config->gray_config.width;
-            g_ctx.cams[i].height = config->gray_config.height;
-            g_ctx.cams[i].format = pixelFormatToFourcc(config->gray_config.pixel_format);
-        } else if (i == 2) {
-            g_ctx.cams[i].width = config->rgb_config.width;
-            g_ctx.cams[i].height = config->rgb_config.height;
-            g_ctx.cams[i].format = pixelFormatToFourcc(config->rgb_config.pixel_format);
-        }
+        apply_config_to_cam(i);
     }
 
     pthread_mutex_init(&g_ctx.xu_mutex, NULL);
     g_ctx.xu_dev_path[0] = '\0';
 
-    if (g_ctx.video_devs[0][0] != '\0') {
-        g_ctx.xu_control = new viewer::UvcExtensionUnit();
-        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-            fprintf(stderr, "[XU][WARN] cannot open extension unit, camera params will be unavailable\n");
-            delete g_ctx.xu_control;
-            g_ctx.xu_control = nullptr;
-            g_ctx.xu_ready = false;
-        } else {
-            g_ctx.xu_ready = true;
-            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
-
-            cache_initial_camera_params(0);
-            cache_initial_camera_params(1);
+    if (reopenXUControlLocked("initialization")) {
+        for (int i = 0; i < CAM_NUM; i++) {
+            if (cam_bound[i]) cache_initial_camera_params(i);
         }
     } else {
-        g_ctx.xu_control = nullptr;
-        g_ctx.xu_ready = false;
+        fprintf(stderr, "[XU][WARN] extension unit unavailable for now; "
+                "camera params will be read once a stream attaches\n");
     }
 
     g_ctx.initialized = 1;
@@ -1784,44 +2136,22 @@ int insight9_receive_init_default(void) {
     g_ctx.config.gray_config.fps = 30;
     g_ctx.config.depth_config.fps = 30;
 
-    char uvc_list[10][MAX_PATH] = {{0}};
-    int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
-    if (uvc_count < 6) {
-        fprintf(stderr, "[SDK][ERR] need >= 6 UVC video/metadata nodes with VID=0x%04x PID=0x%04x, found %d\n",
-                VENDOR_ID, PRODUCT_ID, uvc_count);
-        return -1;
-    }
-    // Select video nodes 0/2/4 and their matching metadata nodes 1/3/5.
-    int selected_idx[] = {0, 2, 4};
-    int metadata_idx[] = {1, 3, 5};
-    for (int i = 0; i < CAM_NUM; i++) {
-        if (selected_idx[i] >= uvc_count) {
-            fprintf(stderr, "Error: cannot select 3 devices by skipping one (need at least 6 devices)\n");
-            return -1;
-        }
-        strcpy(g_ctx.video_devs[i], uvc_list[selected_idx[i]]);
-        strcpy(g_ctx.metadata_devs[i], uvc_list[metadata_idx[i]]);
-        g_ctx.video_usb_paths[i][0] = '\0';
-        g_ctx.metadata_usb_paths[i][0] = '\0';
-        if (get_video_usb_device_path(g_ctx.video_devs[i], g_ctx.video_usb_paths[i], MAX_PATH) < 0) {
-            g_ctx.video_usb_paths[i][0] = '\0';
-        }
-        if (get_video_usb_device_path(g_ctx.metadata_devs[i], g_ctx.metadata_usb_paths[i], MAX_PATH) < 0) {
-            g_ctx.metadata_usb_paths[i][0] = '\0';
-        }
-        printf("Selected UVC[%d]: video=%s metadata=%s\n", 
-               i, g_ctx.video_devs[i], g_ctx.metadata_devs[i]);
-    }
-    classify_selected_cameras();
+    // Attach whatever streams this unit publishes; none of this is fatal.
+    unbind_all_cameras();
+    try_bind_cameras();
+    log_camera_inventory();
 
-    // Initialize camera contexts.
+    // Initialize camera contexts. apply_config_to_cam() carries the fps set
+    // just above; width/height/format stay 0 here on purpose so init_capture()
+    // adopts whatever the device reports.
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cams[i].cam_id = i;
         g_ctx.cams[i].fd = -1;
+        apply_config_to_cam(i);
     }
 
     for (int i = 0; i < CAM_NUM; ++i) {
-        if (g_ctx.video_devs[i][0] == '\0') continue;
+        if (!cam_bound[i] || g_ctx.video_devs[i][0] == '\0') continue;
         int fd = open(g_ctx.video_devs[i], O_RDWR);
         if (fd < 0) {
             fprintf(stderr, "[CAM%d][WARN] open for format enum failed: %s\n", i, strerror(errno));
@@ -1839,23 +2169,13 @@ int insight9_receive_init_default(void) {
     pthread_mutex_init(&g_ctx.xu_mutex, NULL);
     g_ctx.xu_dev_path[0] = '\0';
 
-    if (g_ctx.video_devs[0][0] != '\0') {
-        g_ctx.xu_control = new viewer::UvcExtensionUnit();
-        if (!g_ctx.xu_control->open(g_ctx.video_devs[0])) {
-            fprintf(stderr, "[XU][WARN] cannot open extension unit, camera params will be unavailable\n");
-            delete g_ctx.xu_control;
-            g_ctx.xu_control = nullptr;
-            g_ctx.xu_ready = false;
-        } else {
-            g_ctx.xu_ready = true;
-            printf("[XU] initialized, dev=%s\n", g_ctx.video_devs[0]);
-
-            cache_initial_camera_params(0);
-            cache_initial_camera_params(1);
+    if (reopenXUControlLocked("initialization")) {
+        for (int i = 0; i < CAM_NUM; i++) {
+            if (cam_bound[i]) cache_initial_camera_params(i);
         }
     } else {
-        g_ctx.xu_control = nullptr;
-        g_ctx.xu_ready = false;
+        fprintf(stderr, "[XU][WARN] extension unit unavailable for now; "
+                "camera params will be read once a stream attaches\n");
     }
 
     g_ctx.initialized = 1;
@@ -1875,11 +2195,22 @@ int insight9_receive_start(void) {
 
     g_ctx.running = true;
 
+    // Start a thread for every logical camera, attached or not: an unattached
+    // one sits in the reconnect path and picks its stream up if it appears.
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cam_running[i] = true;
         g_ctx.first_frame_received[i] = false;
         clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[i]);
-        pthread_create(&g_ctx.cams[i].tid, NULL, capture_thread, &g_ctx.cams[i]);
+        // The handle goes in video_tids[] because that is what stop() and
+        // stop_camera() join. Writing it to cams[i].tid instead left every
+        // thread started here unjoined at shutdown.
+        if (pthread_create(&g_ctx.video_tids[i], NULL, capture_thread, &g_ctx.cams[i]) != 0) {
+            fprintf(stderr, "[CAM%d][ERR] failed to create capture thread\n", i);
+            g_ctx.cam_running[i] = false;
+            g_ctx.video_tids[i] = 0;
+            continue;
+        }
+        g_ctx.cams[i].tid = g_ctx.video_tids[i];
     }
 
     pthread_mutex_lock(&g_ctx.xu_mutex);
@@ -1896,6 +2227,16 @@ int insight9_receive_start_camera(int cam_id) {
     if (!g_ctx.initialized) return -1;
     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
     if (g_ctx.cam_running[cam_id]) return 0;
+
+    if (!cam_bound[cam_id]) {
+        try_bind_cameras();
+        if (!cam_bound[cam_id]) {
+            fprintf(stderr, "[CAM%d][ERR] %s stream not present on this device\n",
+                    cam_id, cam_type_name(cam_type_for_id(cam_id)));
+            return -1;
+        }
+        apply_config_to_cam(cam_id);
+    }
 
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
     
@@ -1958,6 +2299,7 @@ int insight9_receive_start_camera(int cam_id) {
         pthread_join(g_ctx.video_tids[cam_id], NULL);
     }
     pthread_create(&g_ctx.video_tids[cam_id], NULL, capture_thread, ctx);
+    ctx->tid = g_ctx.video_tids[cam_id];
     
     printf("[CAM%d] started\n", cam_id);
     return 0;
@@ -2145,23 +2487,43 @@ int insight9_receive_switch_camera_config(int cam_id, int width, int height, Pix
 
 int insight9_receive_switch_camera_fps(int cam_id, int fps) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    video_config_t* cur = (cam_id == 0) ? &g_ctx.config.rgb_config
+    // cam 0 is depth and cam 2 is RGB everywhere else in this file; these two
+    // wrappers had the mapping inverted, so they read the current geometry out
+    // of the wrong config and carried it into the switch.
+    video_config_t* cur = (cam_id == 0) ? &g_ctx.config.depth_config
                         : (cam_id == 1) ? &g_ctx.config.gray_config
-                                         : &g_ctx.config.depth_config;
+                                         : &g_ctx.config.rgb_config;
     return insight9_receive_switch_camera_config(cam_id, cur->width, cur->height, cur->pixel_format, fps);
 }
 
 int insight9_receive_switch_camera_format(int cam_id, int width, int height, PixelFormat format) {
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    video_config_t* cur = (cam_id == 0) ? &g_ctx.config.rgb_config
+    video_config_t* cur = (cam_id == 0) ? &g_ctx.config.depth_config
                         : (cam_id == 1) ? &g_ctx.config.gray_config
-                                         : &g_ctx.config.depth_config;
+                                         : &g_ctx.config.rgb_config;
     return insight9_receive_switch_camera_config(cam_id, width, height, format, cur->fps);
 }
 
 int insight9_receive_is_camera_running(int cam_id) {
     if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
     return g_ctx.cam_running[cam_id] ? 1 : 0;
+}
+
+// Is logical camera cam_id currently attached to a real node? Lets the
+// application show "waiting for stream" instead of treating a variant that
+// simply lacks a stream as a failure.
+int insight9_receive_has_camera(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
+    return cam_bound[cam_id] ? 1 : 0;
+}
+
+// Does this camera's node offer a colour format as well? True for the Insight
+// 3u stereo node, which streams Y8I or YUYV out of the same interface - so the
+// caller knows a colour option exists on camera 1 without having to walk the
+// capability list.
+int insight9_receive_camera_has_color(int cam_id) {
+    if (cam_id < 0 || cam_id >= CAM_NUM) return 0;
+    return (cam_families[cam_id] & FAM_COLOR) ? 1 : 0;
 }
 
 void insight9_receive_stop(void) {
@@ -2589,8 +2951,8 @@ const char* insight9_receive_get_hardware_type(void) {
     });
     if (!ok) return "unknown";
     uint8_t model = xu_params.hardware_model;
-    const char* models[] = {"Insight 9", "Insight 7", "Insight 7p", "Insight 3u"};
-    if (model < 4) {
+    const char* models[] = {"Insight 9", "Insight 7", "Insight 3"};
+    if (model < 3) {
         result = models[model];
         return result.c_str();
     }

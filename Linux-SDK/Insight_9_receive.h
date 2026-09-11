@@ -135,6 +135,22 @@ typedef struct {
 } camera_calib;
 #pragma pack(pop)
 
+/*
+ * Logical camera ids used by image_callback and every cam_id argument below.
+ *
+ * NOTE: this numbering is the Linux one and is NOT the same as the Windows
+ * SDK's (Insight9SDK.h), where RGB is 0 and depth is 2. Code built for both
+ * platforms should use these names rather than literals.
+ */
+enum {
+    INSIGHT9_CAM_DEPTH = 0,   /* Z16 depth                                  */
+    INSIGHT9_CAM_GRAY  = 1,   /* Stereo grayscale (Y8I), or YUYV/YVYU colour
+                               * on units whose stereo interface also offers
+                               * a colour format - see
+                               * insight9_receive_camera_has_color()         */
+    INSIGHT9_CAM_RGB   = 2,   /* Dedicated RGB camera, if the unit has one   */
+};
+
 /* Camera index for insight9_receive_get_camera_calib(). */
 enum {
     INSIGHT9_CALIB_CAM_LEFT  = 0,   /* Left grayscale  */
@@ -194,7 +210,9 @@ extern "C" {
 
 /**
  * @brief Image data callback.
- * @param cam_id    Camera ID (0: main RGB, 1: grayscale, 2: depth).
+ * @param cam_id    Camera ID: 0 depth, 1 grayscale/colour, 2 RGB
+ *                  (INSIGHT9_CAM_*). Note the Windows SDK numbers these
+ *                  differently.
  * @param data      Image data pointer (JPEG data for MJPEG, raw data for GREY and Z16).
  * @param size      Data size in bytes.
  * @param width     Image width.
@@ -233,18 +251,32 @@ typedef void (*vio_callback)(float px, float py, float pz,
  * @brief Initialize the SDK with custom configuration.
  * @param config Configuration structure containing resolution, fps, and pixel format for each camera.
  * @return 0 on success, -1 on failure.
+ *
+ * @note Succeeds even when the device is absent or publishes fewer streams
+ *       than CAM_NUM. Streams that are missing are attached later by the
+ *       capture threads' reconnect path, so a missing camera is no longer an
+ *       initialization failure. Use insight9_receive_has_camera() to find out
+ *       what is actually available.
  */
 int insight9_receive_init(const insight9_config_t* config);
 
 /**
  * @brief Initialize the SDK with default configuration.
  * @return 0 on success, -1 on failure.
+ *
+ * @note Same tolerance for missing streams as insight9_receive_init().
+ *       Per-camera geometry is taken from whatever format the device currently
+ *       reports (VIDIOC_G_FMT), so the initial state is device-determined.
  */
 int insight9_receive_init_default(void);
 
 /**
  * @brief Start all capture threads.
  * @return 0 on success, -1 on failure.
+ *
+ * @note A thread is started for every logical camera, including ones with no
+ *       device node yet; those sit in the reconnect backoff and begin
+ *       delivering frames if and when their stream appears.
  */
 int insight9_receive_start(void);
 
@@ -282,8 +314,9 @@ int insight9_receive_read_metadata_timestamp(int cam_id, uint64_t *timestamp);
 
 /**
  * @brief Start a specific camera.
- * @param cam_id Camera ID (0: RGB, 1: Grayscale, 2: Depth).
- * @return 0 on success, -1 on failure.
+ * @param cam_id Camera ID (INSIGHT9_CAM_*).
+ * @return 0 on success, -1 on failure. Fails if the stream is not present on
+ *         this hardware; a re-enumeration is attempted first.
  */
 int insight9_receive_start_camera(int cam_id);
 
@@ -361,6 +394,39 @@ int insight9_receive_switch_camera_format(int cam_id, int width, int height, Pix
  * @return 1 if running, 0 otherwise.
  */
 int insight9_receive_is_camera_running(int cam_id);
+
+/**
+ * @brief Check whether this camera is attached to a real device node.
+ *
+ * Not every unit publishes all CAM_NUM streams: an Insight 3u has no separate
+ * RGB interface, so INSIGHT9_CAM_RGB never attaches on it. This also returns 0
+ * for a stream that exists on the hardware but has not been enumerated yet
+ * (device not plugged in at init, or mid-reconnect), so callers that want to
+ * distinguish "this model has no such camera" from "not connected yet" should
+ * also look at insight9_receive_get_hardware_type().
+ *
+ * @param cam_id Camera ID (INSIGHT9_CAM_*).
+ * @return 1 if attached, 0 otherwise.
+ */
+int insight9_receive_has_camera(int cam_id);
+
+/**
+ * @brief Check whether this camera's interface also offers a colour format.
+ *
+ * On some units the stereo interface advertises YUYV/YVYU in addition to Y8I,
+ * so INSIGHT9_CAM_GRAY can stream either grayscale or colour - one at a time,
+ * since it is one interface. Switching is a normal
+ * insight9_receive_switch_camera_config() call with the colour format.
+ *
+ * Note the frame layout differs per format and the caller must account for it:
+ * Y8I interleaves left/right per byte (mono height == frame height), while
+ * YUYV/YVYU stack them top-to-bottom (mono height == frame height / 2).
+ *
+ * @param cam_id Camera ID (INSIGHT9_CAM_*).
+ * @return 1 if a colour format is available on this camera, 0 otherwise
+ *         (including when the camera is not attached).
+ */
+int insight9_receive_camera_has_color(int cam_id);
 
 /**
  * @brief Stop all capture threads.
@@ -535,8 +601,6 @@ int insight9_receive_get_vio_status(int* status);
  * @return Hardware type/model string, or "unknown" on failure.
  */
 const char* insight9_receive_get_hardware_type(void);
-
-int insight9_receive_switch_camera_fps(int cam_id, int fps);
 
 #ifdef __cplusplus
 int insight9_receive_get_device_capability_count(int cam_id, int* count);

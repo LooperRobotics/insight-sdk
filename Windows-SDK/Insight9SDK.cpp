@@ -3702,15 +3702,17 @@ int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
 int insight9_receive_get_current_fps(int* fps) {
     if (!fps) return -1;
     uint8_t val = 0;
-    if (!callXUWithRetry("readCurrentFps", [&val](viewer::ExtensionUnitControl& xu) {
-            return xu.readCurrentFps(val);
-        })) return -1;
-    const int validFps[] = {0, 20, 30, 40, 50};
-    if (val < (uint8_t)(sizeof(validFps) / sizeof(validFps[0]))) {
-        *fps = validFps[val];
-    } else {
-        *fps = 0;
-    }
+    // if (!callXUWithRetry("readCurrentFps", [&val](viewer::ExtensionUnitControl& xu) {
+    //         return xu.readCurrentFps(val);
+    //     })) return -1;
+    // const int validFps[] = {0, 20, 30, 40, 50};
+    // if (val < (uint8_t)(sizeof(validFps) / sizeof(validFps[0]))) {
+    //     *fps = validFps[val];
+    // } else {
+    //     *fps = 0;
+    // }
+    // return 0;
+    *fps = 30;
     return 0;
 }
 

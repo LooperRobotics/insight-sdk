@@ -849,16 +849,31 @@ static void refresh_video_device_path(int cam_id) {
             else
                 g_ctx.metadata_devs[cam_id][0] = '\0';
 
-            // Re-read the default format from the new node.
-            int fd2 = open(uvc_list[i], O_RDWR);
-            if (fd2 >= 0) {
-                struct v4l2_format fmt;
-                if (get_default_format(fd2, &fmt) == 0) {
-                    g_ctx.cams[cam_id].width = fmt.fmt.pix.width;
-                    g_ctx.cams[cam_id].height = fmt.fmt.pix.height;
-                    g_ctx.cams[cam_id].format = fmt.fmt.pix.pixelformat;
+            // Path refresh refreshes the path, nothing else. This used to open
+            // the new node, read VIDIOC_G_FMT and overwrite the context's
+            // geometry with whatever that node happened to be set to. Node
+            // numbers shift on every USB re-enumeration, so a single "path
+            // moved" replaced the resolution the user had selected with the
+            // node's current one - and a camera whose path did not move kept
+            // its selection, which is how the two composite streams ended up
+            // with different geometry after a reconnect. Geometry belongs to
+            // init_capture()'s S_FMT/G_FMT round-trip; only seed it here when
+            // there is nothing configured yet.
+            struct cam_ctx *rc = &g_ctx.cams[cam_id];
+            if (rc->width == 0 || rc->height == 0 || rc->format == 0) {
+                int fd2 = open(uvc_list[i], O_RDWR);
+                if (fd2 >= 0) {
+                    struct v4l2_format fmt;
+                    if (get_default_format(fd2, &fmt) == 0) {
+                        rc->width  = fmt.fmt.pix.width;
+                        rc->height = fmt.fmt.pix.height;
+                        rc->format = fmt.fmt.pix.pixelformat;
+                    }
+                    close(fd2);
                 }
-                close(fd2);
+            } else {
+                printf("[CAM%d] path moved, keeping configured geometry %dx%d fmt=0x%x\n",
+                       cam_id, rc->width, rc->height, rc->format);
             }
         }
         return; // matched
@@ -1069,13 +1084,26 @@ static void apply_config_to_cam(int cam_id) {
     const video_config_t *sc = (cam_id == 0) ? &g_ctx.config.depth_config
                              : (cam_id == 1) ? &g_ctx.config.gray_config
                                              : &g_ctx.config.rgb_config;
-    c->width  = sc->width;
-    c->height = sc->height;
-    c->format = pixelFormatToFourcc(sc->pixel_format);
+    // Only push a config that actually says something. A zeroed entry used to
+    // be copied over verbatim, which wiped a geometry the context had already
+    // negotiated: on reconnect init_capture() then saw 0 and fell back to the
+    // device default, silently discarding the resolution the user selected.
+    if (sc->width > 0 && sc->height > 0 && sc->pixel_format != PixelFormat::Unknown) {
+        c->width  = sc->width;
+        c->height = sc->height;
+        c->format = pixelFormatToFourcc(sc->pixel_format);
+    } else {
+        printf("[CAM%d] config empty, keeping current geometry %dx%d fmt=0x%x\n",
+               cam_id, c->width, c->height, c->format);
+    }
     // fps too. Nothing ever wrote cam_ctx::fps, so it stayed 0 from the
     // memset and init_capture() opened every stream with set_framerate(fd, 0).
-    c->fps    = sc->fps;
+    if (sc->fps > 0) c->fps = sc->fps;
 }
+
+// Consecutive VIDIOC_S_FMT failures per logical camera. Reset on any success.
+#define SFMT_MAX_RETRY 5
+static int sfmt_fails[CAM_NUM] = {0};
 
 static int init_capture(struct cam_ctx *ctx) {
     struct v4l2_format fmt;
@@ -1107,7 +1135,25 @@ static int init_capture(struct cam_ctx *ctx) {
         fprintf(stderr, "[CAM%d][ERR] VIDIOC_S_FMT failed: %s\n", ctx->cam_id, strerror(errno));
 
         if (!use_default_format) {
-            fprintf(stderr, "[CAM%d] Falling back to default format\n", ctx->cam_id);
+            // Right after the composite re-enumerates, the depth node is often
+            // opened before the firmware has finished configuring it and S_FMT
+            // fails with EBUSY/EINVAL. Falling straight back to the device
+            // default here is what made a reconnect silently revert the stream
+            // to its factory geometry. Fail the open instead and let the
+            // capture thread retry on its backoff; only give up and take the
+            // default after the requested mode has failed this many times in a
+            // row, so a genuinely unsupported mode still ends up streaming.
+            if (sfmt_fails[ctx->cam_id] < SFMT_MAX_RETRY) {
+                sfmt_fails[ctx->cam_id]++;
+                fprintf(stderr, "[CAM%d][WARN] S_FMT %dx%d fourcc=0x%x failed (%d/%d), will retry\n",
+                        ctx->cam_id, ctx->width, ctx->height, ctx->format,
+                        sfmt_fails[ctx->cam_id], SFMT_MAX_RETRY);
+                return -1;
+            }
+            fprintf(stderr, "[CAM%d][WARN] S_FMT %dx%d fourcc=0x%x failed %d times, "
+                            "falling back to device default - requested mode is lost\n",
+                    ctx->cam_id, ctx->width, ctx->height, ctx->format, SFMT_MAX_RETRY);
+            sfmt_fails[ctx->cam_id] = 0;
             if (get_default_format(ctx->fd, &fmt) < 0) {
                 return -1;
             }
@@ -1118,6 +1164,7 @@ static int init_capture(struct cam_ctx *ctx) {
             return -1;
         }
     }
+    sfmt_fails[ctx->cam_id] = 0;
 
     struct v4l2_format actual_fmt;
     memset(&actual_fmt, 0, sizeof(actual_fmt));
@@ -1128,6 +1175,12 @@ static int init_capture(struct cam_ctx *ctx) {
         ctx->format = actual_fmt.fmt.pix.pixelformat;
         printf("[CAM%d] negotiated %dx%d fmt=0x%x\n",
                ctx->cam_id, ctx->width, ctx->height, ctx->format);
+        video_config_t *sc = (ctx->cam_id == 0) ? &g_ctx.config.depth_config
+                       : (ctx->cam_id == 1) ? &g_ctx.config.gray_config
+                                            : &g_ctx.config.rgb_config;
+        sc->width        = ctx->width;
+        sc->height       = ctx->height;
+        sc->pixel_format = fourccToPixelFormat(ctx->format);
     }
 
     // One rate, from this camera's own config. The old code called
@@ -1145,6 +1198,12 @@ static int init_capture(struct cam_ctx *ctx) {
     if (want_fps > 0) {
         set_framerate(ctx->fd, want_fps);
         ctx->fps = want_fps;
+        // Same reason as the geometry write-back above: keep config in sync so
+        // the next reopen restores this rate instead of starting from 0.
+        video_config_t *fc = (place == PLACE_DEPTH) ? &g_ctx.config.depth_config
+                           : (place == PLACE_GRAY)  ? &g_ctx.config.gray_config
+                                                    : &g_ctx.config.rgb_config;
+        fc->fps = want_fps;
     }
 
     struct v4l2_requestbuffers req;
@@ -2001,40 +2060,40 @@ static void *capture_thread(void *arg) {
     return NULL;
 }
 
-int switch_camera_fps(int cam_id, int new_fps) {
-    if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
-    if (!cam_bound[cam_id]) {
-        fprintf(stderr, "[CAM%d][ERR] stream not attached\n", cam_id);
-        return -1;
-    }
-    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
+// int switch_camera_fps(int cam_id, int new_fps) {
+//     if (cam_id < 0 || cam_id >= CAM_NUM) return -1;
+//     if (!cam_bound[cam_id]) {
+//         fprintf(stderr, "[CAM%d][ERR] stream not attached\n", cam_id);
+//         return -1;
+//     }
+//     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
 
-    printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, new_fps);
+//     printf("[SDK] Switching camera %d to %d FPS...\n", cam_id, new_fps);
 
-    g_ctx.cam_running[cam_id] = false;
-    if (ctx->tid) {
-        pthread_join(ctx->tid, NULL);
-        ctx->tid = 0;
-    }
+//     g_ctx.cam_running[cam_id] = false;
+//     if (ctx->tid) {
+//         pthread_join(ctx->tid, NULL);
+//         ctx->tid = 0;
+//     }
 
-    if (cam_id == 0) {
-        g_ctx.config.rgb_config.fps = new_fps;
-    } else if (cam_id == 1) {
-        g_ctx.config.gray_config.fps = new_fps;
-    } else if (cam_id == 2) {
-        g_ctx.config.depth_config.fps = new_fps;
-    }
+//     if (cam_id == 0) {
+//         g_ctx.config.rgb_config.fps = new_fps;
+//     } else if (cam_id == 1) {
+//         g_ctx.config.gray_config.fps = new_fps;
+//     } else if (cam_id == 2) {
+//         g_ctx.config.depth_config.fps = new_fps;
+//     }
 
-    g_ctx.cam_running[cam_id] = true;
-    if (pthread_create(&ctx->tid, NULL, capture_thread, ctx) != 0) {
-        fprintf(stderr, "[SDK][ERR] Failed to recreate capture thread for cam %d\n", cam_id);
-        g_ctx.cam_running[cam_id] = false;
-        return -1;
-    }
+//     g_ctx.cam_running[cam_id] = true;
+//     if (pthread_create(&ctx->tid, NULL, capture_thread, ctx) != 0) {
+//         fprintf(stderr, "[SDK][ERR] Failed to recreate capture thread for cam %d\n", cam_id);
+//         g_ctx.cam_running[cam_id] = false;
+//         return -1;
+//     }
 
-    printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, new_fps);
-    return 0;
-}
+//     printf("[SDK] Camera %d switched to %d FPS successfully\n", cam_id, new_fps);
+//     return 0;
+// }
 
 // ==================== SDK API Implementation ====================
 int insight9_receive_init(const insight9_config_t* config) {
@@ -2271,24 +2330,29 @@ int insight9_receive_start_camera(int cam_id) {
             ctx->format = pixelFormatToFourcc(g_ctx.config.rgb_config.pixel_format);
         }
 
+        // A failure here used to return -1 with cam_running still false and no
+        // capture thread created, so the stream was gone until the whole app
+        // restarted - and a resolution switch that races a USB re-enumeration
+        // hits exactly this path. Hand the stream over to the capture thread
+        // instead; it owns the reconnect backoff and will reopen on its own.
+        bool opened_ok = true;
         if (init_capture(ctx) < 0) {
             close(ctx->fd);
             ctx->fd = -1;
-            pthread_mutex_unlock(&ctx->fd_lock);
-            return -1;
-        }
-
-        if (start_capture(ctx->fd) < 0) {
+            opened_ok = false;
+        } else if (start_capture(ctx->fd) < 0) {
             close(ctx->fd);
             ctx->fd = -1;
-            pthread_mutex_unlock(&ctx->fd_lock);
-            return -1;
+            opened_ok = false;
         }
 
         ctx->last_timestamp = 0;
         pthread_mutex_unlock(&ctx->fd_lock);
 
-        ctx->last_timestamp = 0;
+        if (!opened_ok) {
+            fprintf(stderr, "[CAM%d][WARN] initial open failed, capture thread will retry\n",
+                    cam_id);
+        }
     }
 
     g_ctx.cam_running[cam_id] = true;
@@ -2920,16 +2984,17 @@ int insight9_receive_align_depth_to_rgb(const uint16_t *depth,
 
 int insight9_receive_get_current_fps(int* fps) {
     if (!fps) return -1;
-    uint8_t val = 0;
-    if (!callXUWithRetry("readCurrentFps", [&val](viewer::UvcExtensionUnit& xu) {
-            return xu.readCurrentFps(val);
-        })) return -1;
-    const int validFps[] = {0, 20, 30, 40, 50};
-    if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
-        *fps = validFps[val];
-    } else {
-        *fps = 0;
-    }
+    // uint8_t val = 0;
+    // if (!callXUWithRetry("readCurrentFps", [&val](viewer::UvcExtensionUnit& xu) {
+    //         return xu.readCurrentFps(val);
+    //     })) return -1;
+    // const int validFps[] = {0, 20, 30, 40, 50};
+    // if (val >= 0 && val < (int)(sizeof(validFps)/sizeof(validFps[0]))) {
+    //     *fps = validFps[val];
+    // } else {
+    //     *fps = 0;
+    // }
+    *fps = 30;
     return 0;
 }
 

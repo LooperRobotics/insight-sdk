@@ -2221,6 +2221,42 @@ int insight9_receive_init_default(void) {
             fprintf(stderr, "[CAM%d][WARN] failed to get formats info during init\n", i);
         }
 
+        // Record what the node is actually set to right now, into both the
+        // context and g_ctx.config.
+        //
+        // Without this, init_default() left config width/height at 0 and
+        // insight9_receive_get_camera_config() reported 0x0 until a capture
+        // thread had negotiated - so a caller that wants to show "whatever the
+        // device came up as" had nothing to read at init time, and
+        // restore_target_geometry() had no target to restore on reconnect.
+        struct v4l2_format cur;
+        if (get_default_format(fd, &cur) == 0) {
+            video_config_t *sc = (i == 0) ? &g_ctx.config.depth_config
+                               : (i == 1) ? &g_ctx.config.gray_config
+                                          : &g_ctx.config.rgb_config;
+            sc->width        = cur.fmt.pix.width;
+            sc->height       = cur.fmt.pix.height;
+            sc->pixel_format = fourccToPixelFormat(cur.fmt.pix.pixelformat);
+
+            struct v4l2_streamparm parm;
+            memset(&parm, 0, sizeof(parm));
+            parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            if (ioctl(fd, VIDIOC_G_PARM, &parm) == 0 &&
+                parm.parm.capture.timeperframe.numerator > 0 &&
+                parm.parm.capture.timeperframe.denominator > 0) {
+                sc->fps = (int)(parm.parm.capture.timeperframe.denominator /
+                                parm.parm.capture.timeperframe.numerator);
+            }
+
+            g_ctx.cams[i].width  = sc->width;
+            g_ctx.cams[i].height = sc->height;
+            g_ctx.cams[i].format = cur.fmt.pix.pixelformat;
+            g_ctx.cams[i].fps    = sc->fps;
+
+            printf("[CAM%d] device default %dx%d fmt=0x%x @%dfps\n",
+                   i, sc->width, sc->height, cur.fmt.pix.pixelformat, sc->fps);
+        }
+
         close(fd);
         g_ctx.cams[i].fd = -1;
     }

@@ -39,7 +39,7 @@ It also exposes two HID streams:
 - Factory calibration readout and depth-to-RGB alignment helper.
 - Metadata timestamp readout.
 - VIO status and hardware type query helpers.
-- Visual Studio/CMake build with bundled FFmpeg and HIDAPI.
+- Visual Studio/CMake build with bundled HIDAPI.
 
 ## 4. Dependencies
 
@@ -47,7 +47,6 @@ It also exposes two HID streams:
 - Visual Studio with C++ desktop workload.
 - CMake 3.20 or newer.
 - OpenCV for the included `example.exe`.
-- Bundled FFmpeg libraries in `ffmpeg-z16`.
 - Bundled HIDAPI library in `hidapi-prebuilt`.
 
 The project expects OpenCV under:
@@ -79,7 +78,7 @@ The build produces:
 
 - `build\Release\example.exe`
 - `build\Release\Insight9SDK.lib`
-- Required OpenCV, FFmpeg, and HIDAPI DLLs copied next to `example.exe` when available.
+- Required OpenCV and HIDAPI DLLs copied next to `example.exe` when available.
 
 Run:
 
@@ -411,7 +410,7 @@ Press `q`, `Esc`, or `Ctrl+C` to stop the example.
 
 ## 9. Notes and Troubleshooting
 
-- `example.exe` requires OpenCV, FFmpeg, and HIDAPI DLLs next to the executable. The provided CMake setup copies them to `build\Release` when available.
+- `example.exe` requires OpenCV and HIDAPI DLLs next to the executable. The provided CMake setup copies them to `build\Release` when available.
 - If CMake reports missing OpenCV files, run `download_opencv.bat` and rebuild.
 - If the device cannot be opened, check USB connection, Windows device permissions, driver state, and whether another process is using the camera.
 - Callbacks run on SDK capture threads. Keep callback work short; hand data off to worker threads for decoding, disk I/O, or heavy processing.

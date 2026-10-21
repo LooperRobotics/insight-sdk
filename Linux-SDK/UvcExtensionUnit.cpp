@@ -25,7 +25,8 @@ static int uvc_control_query(int fd, __u8 unit, __u8 selector,
     if (ret < 0) {
         printf("ioctl query failed: %s (errno=%d)\n", strerror(errno), errno);
         printf("unit:%u cs:%d query:%d\n", unit, selector, query);
-        close(fd);
+        // Do not close(fd) here: it is owned by UvcExtensionUnit (fd_), which
+        // would keep the stale number and later close() whatever reused it.
         return 1;
     }
     return ret;

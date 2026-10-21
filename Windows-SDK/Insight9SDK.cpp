@@ -555,7 +555,9 @@ public:
         }
         if (outActualStream) *outActualStream = actualStream;
 
-        if (actualStream < 2 && !streamEnabled_[actualStream]) {
+        // Only video streams 0/1 are tracked; a selected metadata stream can
+        // surface here with a higher index and would overrun the per-stream arrays.
+        if (actualStream >= 2 || !streamEnabled_[actualStream]) {
             if (sample) sample->Release();
             return false;
         }
@@ -1275,8 +1277,8 @@ struct sdk_ctx_t {
     std::thread videoThreads[UVC_NUM];
     bool videoThreadStuck[UVC_NUM] = {false, false};
     bool hidThreadStuck[HID_NUM] = {false, false};
-    camera_params cachedInitialParams[UVC_NUM];
-    bool hasCachedInitialParams[UVC_NUM] = {false, false};
+    camera_params cachedInitialParams[LOGICAL_CAM_NUM];
+    bool hasCachedInitialParams[LOGICAL_CAM_NUM] = {false, false, false};
     // =====================================================
     HidDevice* hidDevs[HID_NUM];
     std::string hidPaths[HID_NUM];
@@ -2790,7 +2792,9 @@ int insight9_receive_start() {
 static int mapCompositeCamId(int cam_id);
 
 int insight9_receive_start_camera(int cam_id) {
-    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+    // Before insight9_receive_start() the worker would exit at once and leave a
+    // joinable std::thread that start() then overwrites (std::terminate).
+    if (!g_ctx.initialized || !g_ctx.running || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
 
     std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
 
@@ -2970,7 +2974,8 @@ int insight9_receive_get_camera_config(int cam_id, int* width, int* height, Pixe
 
 int insight9_receive_restart_camera(int cam_id) {
     std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
-    if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
+    // Same reason as insight9_receive_start_camera(): no workers before start().
+    if (!g_ctx.initialized || !g_ctx.running || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
 
     const int uvcId = mapCompositeCamId(cam_id);
     if (uvcId < 0 || uvcId >= UVC_NUM) return -1;
@@ -3009,6 +3014,12 @@ int insight9_receive_restart_camera(int cam_id) {
         g_ctx.videoThreads[RGB_UVC_ID] = std::thread(videoThreadFunc, RGB_UVC_ID);
         return 0;
     }
+
+    // stopCompositeForReconfigure() pauses the HID thread via videoReconfiguring.
+    // Clear it on every exit so a direct restart cannot leave VIO paused for good.
+    struct ReconfigureGuard {
+        ~ReconfigureGuard() { g_ctx.videoReconfiguring.store(false, std::memory_order_release); }
+    } reconfigureGuard;
 
     // Gray and Depth share MI_00. Restart ALWAYS rebuilds the complete Composite UVC.
     // This prevents the old reader from surviving while the Gray configuration changes.
@@ -3124,6 +3135,12 @@ int insight9_receive_switch_camera_config(int cam_id, int width, int height, Pix
     std::lock_guard<std::recursive_mutex> controlLock(g_ctx.cameraControlMutex);
     if (!g_ctx.initialized || cam_id < 0 || cam_id >= LOGICAL_CAM_NUM) return -1;
     if (width <= 0 || height <= 0 || fps <= 0) return -1;
+
+    // Nothing is streaming yet: store the config, insight9_receive_start() applies it.
+    if (!g_ctx.running) {
+        if (insight9_receive_set_camera_format(cam_id, width, height, format) != 0) return -1;
+        return insight9_receive_set_camera_fps(cam_id, fps);
+    }
 
     SDK_LOG_INFO("[SDK] Switching camera %d to %dx%d@%d...", cam_id, width, height, fps);
     SDK_LOG_INFO("[Config] Before switch: Gray=%d Depth=%d CompositeSource=%p CompositeThread=%d",

@@ -1582,13 +1582,13 @@ static uint64_t read_latest_metadata_timestamp(struct cam_ctx *ctx) {
 static void safe_cleanup_camera(struct cam_ctx *ctx) {
     if (!ctx) return;
     pthread_mutex_lock(&ctx->fd_lock);
-    if (ctx->fd < 0) {
-        pthread_mutex_unlock(&ctx->fd_lock);
-        return;
-    }
 
+    // Buffers and the metadata node are released even when the video fd is
+    // already closed; mappings outlive the fd that created them.
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
+    if (ctx->fd >= 0) {
+        ioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
+    }
 
     if (ctx->buffers) {
         for (int i = 0; i < ctx->buffer_count; i++) {
@@ -1601,18 +1601,21 @@ static void safe_cleanup_camera(struct cam_ctx *ctx) {
     }
     ctx->buffer_count = 0;
 
-    struct v4l2_requestbuffers req;
-    memset(&req, 0, sizeof(req));
-    req.count = 0;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    ioctl(ctx->fd, VIDIOC_REQBUFS, &req);
+    if (ctx->fd >= 0) {
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count = 0;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        ioctl(ctx->fd, VIDIOC_REQBUFS, &req);
 
-    close(ctx->fd);
-    ctx->fd = -1;
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
     ctx->last_timestamp = 0;
 
     if (ctx->meta_fd >= 0) {
+        stop_metadata_capture(ctx->meta_fd);
         close(ctx->meta_fd);
         ctx->meta_fd = -1;
     }
@@ -1915,15 +1918,7 @@ static void *capture_thread(void *arg) {
                 continue;
             }
             fprintf(stderr, "[CAM%d][ERR] poll: %s\n", ctx->cam_id, strerror(errno));
-            close(ctx->fd);
-            ctx->fd = -1;
             pending_fail_reset = false;  // invalidate any stale probation timer
-            free_buffer_array(&ctx->buffers, &ctx->buffer_count);
-            if (ctx->meta_fd >= 0) {
-                close(ctx->meta_fd);
-                ctx->meta_fd = -1;
-            }
-            free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
             safe_cleanup_camera(ctx);
             continue;
         } else if (ret == 0) {
@@ -1946,14 +1941,6 @@ static void *capture_thread(void *arg) {
             }
             if (errno == EBUSY || errno == ENODEV || errno == EBADF) {
                 fprintf(stderr, "[CAM%d][WARN] device removed, waiting for reconnect\n", ctx->cam_id);
-                close(ctx->fd);
-                ctx->fd = -1;
-                free_buffer_array(&ctx->buffers, &ctx->buffer_count);
-                if (ctx->meta_fd >= 0) {
-                    close(ctx->meta_fd);
-                    ctx->meta_fd = -1;
-                }
-                free_buffer_array(&ctx->meta_buffers, &ctx->meta_buffer_count);
                 safe_cleanup_camera(ctx);
                 pending_fail_reset = false;  // invalidate any stale probation timer
                 reconnect_backoff_apply_for_cam(ctx, &reconnect_fails, "DQBUF reset");
@@ -1967,8 +1954,6 @@ static void *capture_thread(void *arg) {
         if (buf.flags & V4L2_BUF_FLAG_ERROR) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-                close(ctx->fd);
-                ctx->fd = -1;
                 pending_fail_reset = false;  // invalidate any stale probation timer
                 safe_cleanup_camera(ctx);
             }
@@ -1985,10 +1970,8 @@ static void *capture_thread(void *arg) {
                 if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                     fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
                 }
-                close(ctx->fd);
-                ctx->fd = -1;
                 pending_fail_reset = false;  // invalidate any stale probation timer
-                free_buffer_array(&ctx->buffers, &ctx->buffer_count);
+                safe_cleanup_camera(ctx);
                 continue;
             }
         } else {
@@ -2004,8 +1987,6 @@ static void *capture_thread(void *arg) {
         if (timestamp == 0) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-                close(ctx->fd);
-                ctx->fd = -1;
                 pending_fail_reset = false;  // invalidate any stale probation timer
                 safe_cleanup_camera(ctx);
             }
@@ -2017,8 +1998,6 @@ static void *capture_thread(void *arg) {
         if (timestamp == ctx->last_timestamp) {
             if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
                 fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-                close(ctx->fd);
-                ctx->fd = -1;
                 pending_fail_reset = false;  // invalidate any stale probation timer
                 safe_cleanup_camera(ctx);
             }
@@ -2040,8 +2019,6 @@ static void *capture_thread(void *arg) {
 
         if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
             fprintf(stderr, "[CAM%d][ERR] VIDIOC_QBUF: %s\n", ctx->cam_id, strerror(errno));
-            close(ctx->fd);
-            ctx->fd = -1;
             pending_fail_reset = false;  // invalidate any stale probation timer
             safe_cleanup_camera(ctx);
         }
@@ -2206,6 +2183,7 @@ int insight9_receive_init_default(void) {
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cams[i].cam_id = i;
         g_ctx.cams[i].fd = -1;
+        g_ctx.cams[i].meta_fd = -1;
         apply_config_to_cam(i);
     }
 
@@ -2468,29 +2446,15 @@ void insight9_receive_stop_camera(int cam_id) {
     
     g_ctx.cam_running[cam_id] = false;
 
-    usleep(200000);  // 200ms
-    struct cam_ctx *ctx = &g_ctx.cams[cam_id];
-    if (ctx->fd >= 0) {
-        stop_capture(ctx->fd);
-        if (ctx->buffers) {
-            for (int j = 0; j < ctx->buffer_count; j++) {
-                if (ctx->buffers[j].start)
-                    munmap(ctx->buffers[j].start, ctx->buffers[j].length);
-            }
-            free(ctx->buffers);
-            ctx->buffers = NULL;
-        }
-        close(ctx->fd);
-        ctx->fd = -1;
-        ctx->buffer_count = 0;
-    }
-    safe_cleanup_camera(ctx);
-    
+    // Join before releasing buffers: the capture thread may still be inside
+    // DQBUF or the user's callback, reading the mmap'd frame. It sees
+    // cam_running == false within one poll timeout and exits.
     if (g_ctx.video_tids[cam_id]) {
         pthread_join(g_ctx.video_tids[cam_id], NULL);
         g_ctx.video_tids[cam_id] = 0;
     }
-    
+    safe_cleanup_camera(&g_ctx.cams[cam_id]);
+
     printf("[CAM%d] stopped\n", cam_id);
 }
 
@@ -2634,17 +2598,7 @@ void insight9_receive_stop(void) {
 
     for (int i = 0; i < CAM_NUM; i++) {
         g_ctx.cam_running[i] = false;
-        struct cam_ctx *ctx = &g_ctx.cams[i];
-        if (ctx->fd >= 0) {
-            stop_capture(ctx->fd);
-            close(ctx->fd);
-            ctx->fd = -1;
-        }
-        if (ctx->meta_fd >= 0) {
-            stop_metadata_capture(ctx->meta_fd);
-            close(ctx->meta_fd);
-            ctx->meta_fd = -1;
-        }
+        // Join first, then release; see insight9_receive_stop_camera().
         if (g_ctx.video_tids[i]) {
             pthread_join(g_ctx.video_tids[i], NULL);
             g_ctx.video_tids[i] = 0;

@@ -25,7 +25,7 @@ cd build
 
 echo.
 echo Configuring CMake...
-cmake .. -G "Visual Studio 18 2026" -A x64 -DUSE_SYSTEM_FFMPEG=OFF -DUSE_SYSTEM_HIDAPI=OFF
+cmake .. -G "Visual Studio 18 2026" -A x64 -DUSE_SYSTEM_HIDAPI=OFF
 
 if errorlevel 1 (
     echo.

@@ -2286,8 +2286,13 @@ int insight9_receive_start(void) {
         g_ctx.cams[i].tid = g_ctx.video_tids[i];
     }
 
+    // init() already bound the XU. Reopening a healthy handle here would fire
+    // control transfers while the capture threads above are in S_FMT, which
+    // times out on the single control endpoint - so only repair a dead one.
     pthread_mutex_lock(&g_ctx.xu_mutex);
-    reopenXUControlLocked("camera start");
+    if (!g_ctx.xu_ready || !g_ctx.xu_control || !g_ctx.xu_control->isOpen()) {
+        reopenXUControlLocked("camera start");
+    }
     pthread_mutex_unlock(&g_ctx.xu_mutex);
 
     hid_init();
@@ -2308,75 +2313,30 @@ int insight9_receive_start_camera(int cam_id) {
                     cam_id, cam_type_name(cam_type_for_id(cam_id)));
             return -1;
         }
-        apply_config_to_cam(cam_id);
     }
 
     struct cam_ctx *ctx = &g_ctx.cams[cam_id];
-    
-    if (ctx->fd < 0) {
-        pthread_mutex_lock(&ctx->fd_lock);
-        if (ctx->fd >= 0) {
-            // Someone else (e.g. capture_thread's own reopen path) already
-            // got there first; nothing left for us to do here.
-            pthread_mutex_unlock(&ctx->fd_lock);
-        } else {
-            refresh_video_device_path(cam_id);
-            const char *dev_path = g_ctx.video_devs[cam_id];
-            ctx->fd = open(dev_path, O_RDWR);
-            if (ctx->fd < 0) {
-                fprintf(stderr, "[CAM%d][ERR] open failed: %s\n", cam_id, strerror(errno));
-                pthread_mutex_unlock(&ctx->fd_lock);
-                return -1;
-            }
-        }
 
-        if (cam_id == 0) {
-            ctx->width = g_ctx.config.depth_config.width;
-            ctx->height = g_ctx.config.depth_config.height;
-            ctx->format = pixelFormatToFourcc(g_ctx.config.depth_config.pixel_format);
-        } else if (cam_id == 1) {
-            ctx->width = g_ctx.config.gray_config.width;
-            ctx->height = g_ctx.config.gray_config.height;
-            ctx->format = pixelFormatToFourcc(g_ctx.config.gray_config.pixel_format);
-        } else {
-            ctx->width = g_ctx.config.rgb_config.width;
-            ctx->height = g_ctx.config.rgb_config.height;
-            ctx->format = pixelFormatToFourcc(g_ctx.config.rgb_config.pixel_format);
-        }
-
-        // A failure here used to return -1 with cam_running still false and no
-        // capture thread created, so the stream was gone until the whole app
-        // restarted - and a resolution switch that races a USB re-enumeration
-        // hits exactly this path. Hand the stream over to the capture thread
-        // instead; it owns the reconnect backoff and will reopen on its own.
-        bool opened_ok = true;
-        if (init_capture(ctx) < 0) {
-            close(ctx->fd);
-            ctx->fd = -1;
-            opened_ok = false;
-        } else if (start_capture(ctx->fd) < 0) {
-            close(ctx->fd);
-            ctx->fd = -1;
-            opened_ok = false;
-        }
-
-        ctx->last_timestamp = 0;
-        pthread_mutex_unlock(&ctx->fd_lock);
-
-        if (!opened_ok) {
-            fprintf(stderr, "[CAM%d][WARN] initial open failed, capture thread will retry\n",
-                    cam_id);
-        }
-    }
+    // Only set the target geometry/fps here. The capture thread owns opening
+    // the video and metadata nodes (with reconnect backoff); opening the video
+    // node here as well left metadata closed, so the thread tore the fresh
+    // stream down and negotiated S_FMT/REQBUFS a second time on every restart.
+    apply_config_to_cam(cam_id);
 
     g_ctx.cam_running[cam_id] = true;
     g_ctx.first_frame_received[cam_id] = false;
     clock_gettime(CLOCK_MONOTONIC, &g_ctx.last_frame_time[cam_id]);
-    
+
     if (g_ctx.video_tids[cam_id]) {
         pthread_join(g_ctx.video_tids[cam_id], NULL);
+        g_ctx.video_tids[cam_id] = 0;
     }
-    pthread_create(&g_ctx.video_tids[cam_id], NULL, capture_thread, ctx);
+    if (pthread_create(&g_ctx.video_tids[cam_id], NULL, capture_thread, ctx) != 0) {
+        fprintf(stderr, "[CAM%d][ERR] failed to create capture thread\n", cam_id);
+        g_ctx.cam_running[cam_id] = false;
+        g_ctx.video_tids[cam_id] = 0;
+        return -1;
+    }
     ctx->tid = g_ctx.video_tids[cam_id];
     
     printf("[CAM%d] started\n", cam_id);

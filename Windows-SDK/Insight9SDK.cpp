@@ -1809,6 +1809,10 @@ public:
         return r;
     }
 
+    // Stop forwarding reports. Used instead of ISensor::SetEventSink(nullptr),
+    // which blocks ~10 s per sensor once the STA stops pumping messages.
+    void detach() { detached_ = true; }
+
     // ISensorEvents
     HRESULT STDMETHODCALLTYPE OnEvent(ISensor*, REFGUID, IPortableDeviceValues*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE OnLeave(REFSENSOR_ID sensorID) override { return S_OK; }
@@ -1818,7 +1822,7 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE OnDataUpdated(ISensor* pSensor, ISensorDataReport* pReport) override {
-        if (!pReport) return S_OK;
+        if (!pReport || detached_) return S_OK;
 
         PROPVARIANT var;
         PropVariantInit(&var);
@@ -1882,11 +1886,18 @@ public:
         }
 
         if (g_accelDirty && g_gyroDirty) {
-            if (g_ctx.imuCb) {
-                g_ctx.imuCb(g_lastAx, g_lastAy, g_lastAz,
-                            g_lastGx, g_lastGy, g_lastGz,
-                            (g_lastAccelTs > g_lastGyroTs) ? g_lastAccelTs : g_lastGyroTs,
-                            g_ctx.imuUser);
+            imu_callback cb;
+            void* user;
+            {
+                std::lock_guard<std::mutex> lock(g_ctx.imuMutex);
+                cb = g_ctx.imuCb;
+                user = g_ctx.imuUser;
+            }
+            if (cb) {
+                cb(g_lastAx, g_lastAy, g_lastAz,
+                   g_lastGx, g_lastGy, g_lastGz,
+                   (g_lastAccelTs > g_lastGyroTs) ? g_lastAccelTs : g_lastGyroTs,
+                   user);
             }
             g_accelDirty = false;
             g_gyroDirty = false;
@@ -1896,6 +1907,7 @@ public:
 
 private:
     bool isAccel_;
+    std::atomic<bool> detached_{false};
     LONG ref_ = 1;
     IPortableDeviceKeyCollection* pAllKeys_ = nullptr;
 
@@ -1937,13 +1949,17 @@ static void imuSensorThreadFunc() {
                              ImuSensorEvents*& pAccelEvents,
                              ImuSensorEvents*& pGyroEvents,
                              ISensorManager*& pManager) {
+        // No SetEventSink(nullptr): measured at ~10 s per sensor on shutdown
+        // (an internal timeout, since this STA has stopped pumping). Detaching
+        // the sinks first makes any late report a no-op; releasing the sensor
+        // drops its reference to the sink.
+        if (pAccelEvents) pAccelEvents->detach();
+        if (pGyroEvents) pGyroEvents->detach();
         if (pAccel) {
-            pAccel->SetEventSink(nullptr);
             pAccel->Release();
             pAccel = nullptr;
         }
         if (pGyro) {
-            pGyro->SetEventSink(nullptr);
             pGyro->Release();
             pGyro = nullptr;
         }
@@ -2108,7 +2124,16 @@ static int streamToLogicalCamId(int uvcId, DWORD streamIndex) {
 }
 
 static void deliverFrame(int uvcId, uint8_t* data, size_t size, const FrameInfo& info) {
-    if (!g_ctx.imgCb) return;
+    // Snapshot cb/user together so a concurrent register cannot pair them
+    // wrongly or null the pointer between the check and the call.
+    image_callback cb;
+    void* user;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx.imgMutex);
+        cb = g_ctx.imgCb;
+        user = g_ctx.imgUser;
+    }
+    if (!cb) return;
     
     int callbackCamId = streamToLogicalCamId(uvcId, info.streamIndex);
     if (callbackCamId < 0 || callbackCamId >= LOGICAL_CAM_NUM) {
@@ -2125,8 +2150,8 @@ static void deliverFrame(int uvcId, uint8_t* data, size_t size, const FrameInfo&
     else if (info.format == PixelFormat::RGB8) v4l2Fmt = 0x42475200;    // 'RGB8'
     else if (info.format == PixelFormat::NV12) v4l2Fmt = 0x3231564E;    // 'NV12'
 
-    g_ctx.imgCb(callbackCamId, data, size, info.width, info.height, 
-                v4l2Fmt, info.timestamp, g_ctx.imgUser);
+    cb(callbackCamId, data, size, info.width, info.height,
+       v4l2Fmt, info.timestamp, user);
 }
 
 static void videoThreadFunc(int uvcId) {
@@ -2372,15 +2397,42 @@ static void hidThreadFunc(int idx) {
             auto* p = reinterpret_cast<vio_hid_payload*>(buf);
             if (p->timestamp != 0 && p->timestamp == last_vio_ts) continue;
             last_vio_ts = p->timestamp;
-            if (g_ctx.vioCb) {
-                g_ctx.vioCb(p->px, p->py, p->pz, p->qx, p->qy, p->qz, p->qw,
-                            p->timestamp, g_ctx.vioUser);
+            vio_callback cb;
+            void* user;
+            {
+                std::lock_guard<std::mutex> lock(g_ctx.vioMutex);
+                cb = g_ctx.vioCb;
+                user = g_ctx.vioUser;
+            }
+            if (cb) {
+                cb(p->px, p->py, p->pz, p->qx, p->qy, p->qz, p->qw,
+                   p->timestamp, user);
             }
         }
     }
 }
 
 // ==================== SDK API ====================
+// True only when the SDK's own CoInitializeEx succeeded, so cleanup balances
+// exactly that call and never the host application's.
+static bool g_comInitializedBySdk = false;
+
+static bool initComForSdk() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) {  // S_OK or S_FALSE: both need a matching CoUninitialize
+        g_comInitializedBySdk = true;
+        return true;
+    }
+    if (hr == RPC_E_CHANGED_MODE) {
+        // The host thread is already STA (Qt, WinForms, ...). COM is usable;
+        // uninitializing here would tear down the host's apartment.
+        SDK_LOG_INFO("[SDK] Calling thread is already STA; reusing host COM apartment");
+        return true;
+    }
+    SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
+    return false;
+}
+
 int insight9_receive_init(const insight9_config_t* config) {
     if (g_ctx.initialized) {
         SDK_LOG_ERROR("[SDK] Already initialized");
@@ -2436,6 +2488,9 @@ int insight9_receive_init(const insight9_config_t* config) {
     }
     g_ctx.config = *config;
 
+    // COM must be up before findUvcDevices(), which enumerates through COM.
+    if (!initComForSdk()) return -1;
+
     hid_init();
 
     // Missing slots are no longer fatal: whatever is absent now gets opened by
@@ -2444,21 +2499,6 @@ int insight9_receive_init(const insight9_config_t* config) {
     g_ctx.singleNodeMode = uvcSlotsAreSingleNode(uvcPaths);
     if (g_ctx.singleNodeMode) {
         SDK_LOG_INFO("[SDK] Composite-only device: no standalone RGB function");
-    }
-
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) {
-        if (hr == RPC_E_CHANGED_MODE) {
-            CoUninitialize();
-            hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (FAILED(hr)) {
-                SDK_LOG_ERROR("[SDK] CoInitializeEx retry failed, hr=0x%08lx", hr);
-                return -1;
-            }
-        } else {
-            SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
-            return -1;
-        }
     }
 
     for (int i = 0; i < UVC_NUM; ++i) {
@@ -2539,20 +2579,7 @@ int insight9_receive_init_default() {
         return -1;
     }
 
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) {
-        if (hr == RPC_E_CHANGED_MODE) {
-            CoUninitialize();
-            hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (FAILED(hr)) {
-                SDK_LOG_ERROR("[SDK] CoInitializeEx retry failed, hr=0x%08lx", hr);
-                return -1;
-            }
-        } else {
-            SDK_LOG_ERROR("[SDK] CoInitializeEx failed, hr=0x%08lx", hr);
-            return -1;
-        }
-    }
+    if (!initComForSdk()) return -1;
 
     g_ctx.config = {};
     g_ctx.running = false;
@@ -2791,6 +2818,14 @@ int insight9_receive_start() {
 
 static int mapCompositeCamId(int cam_id);
 
+// The worker may retire (delete) g_ctx.videos[uvcId] at any time when the
+// device drops out, so the pointer is only dereferenced under the lifecycle
+// lock. stop() just flushes the reader and never joins, so this cannot deadlock.
+static void stopVideoSource(int uvcId) {
+    std::lock_guard<std::mutex> lock(g_ctx.videoLifecycleMutex);
+    if (g_ctx.videos[uvcId]) g_ctx.videos[uvcId]->stop();
+}
+
 int insight9_receive_start_camera(int cam_id) {
     // Before insight9_receive_start() the worker would exit at once and leave a
     // joinable std::thread that start() then overwrites (std::terminate).
@@ -2822,7 +2857,7 @@ int insight9_receive_start_camera(int cam_id) {
 
     // A stale/non-running source cannot be shared. Retire it before creating a new worker.
     if (g_ctx.videoThreads[uvcId].joinable()) {
-        if (haveSource) g_ctx.videos[uvcId]->stop();
+        stopVideoSource(uvcId);
         g_ctx.videoThreads[uvcId].join();
     }
 
@@ -2898,9 +2933,7 @@ void insight9_receive_stop_camera(int cam_id) {
     if (cam_id == RGB_CAM_ID) {
         g_ctx.cam_running[RGB_CAM_ID] = false;
 
-        if (g_ctx.videos[RGB_UVC_ID]) {
-            g_ctx.videos[RGB_UVC_ID]->stop();
-        }
+        stopVideoSource(RGB_UVC_ID);
         if (g_ctx.videoThreads[RGB_UVC_ID].joinable()) {
             g_ctx.videoThreads[RGB_UVC_ID].join();
         }
@@ -2923,9 +2956,7 @@ void insight9_receive_stop_camera(int cam_id) {
     }
 
     if (!g_ctx.cam_running[GRAY_CAM_ID] && !g_ctx.cam_running[DEPTH_CAM_ID]) {
-        if (g_ctx.videos[COMPOSITE_UVC_ID]) {
-            g_ctx.videos[COMPOSITE_UVC_ID]->stop();
-        }
+        stopVideoSource(COMPOSITE_UVC_ID);
         if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
             g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
         }
@@ -2943,9 +2974,7 @@ static void stopCompositeForReconfigure() {
     g_ctx.cam_running[GRAY_CAM_ID] = false;
     g_ctx.cam_running[DEPTH_CAM_ID] = false;
 
-    if (g_ctx.videos[COMPOSITE_UVC_ID]) {
-        g_ctx.videos[COMPOSITE_UVC_ID]->stop();
-    }
+    stopVideoSource(COMPOSITE_UVC_ID);
 
     if (g_ctx.videoThreads[COMPOSITE_UVC_ID].joinable()) {
         g_ctx.videoThreads[COMPOSITE_UVC_ID].join();
@@ -3251,9 +3280,7 @@ void insight9_receive_stop() {
     g_ctx.videoReconfiguring.store(false, std::memory_order_release);
 
     for (int i = 0; i < LOGICAL_CAM_NUM; ++i) g_ctx.cam_running[i] = false;
-    for (int i = 0; i < UVC_NUM; ++i) {
-        if (g_ctx.videos[i]) g_ctx.videos[i]->stop();
-    }
+    for (int i = 0; i < UVC_NUM; ++i) stopVideoSource(i);
     for (int i = 0; i < UVC_NUM; ++i) {
         char label[32];
         snprintf(label, sizeof(label), "video[%d]", i);
@@ -3308,7 +3335,10 @@ void insight9_receive_cleanup() {
 
     hid_exit();
 
-    CoUninitialize();
+    if (g_comInitializedBySdk) {
+        CoUninitialize();
+        g_comInitializedBySdk = false;
+    }
 }
 
 // ==================== The remaining API implementations ====================
@@ -3334,19 +3364,22 @@ const char* insight9_receive_get_video_dev(int cam_id) {
     return (mapped >= 0 && mapped < UVC_NUM) ? g_ctx.videoPaths[mapped].c_str() : nullptr;
 }
 
-void insight9_receive_register_image_callback(image_callback cb, void *user) { 
-    g_ctx.imgCb = cb; 
-    g_ctx.imgUser = user; 
+void insight9_receive_register_image_callback(image_callback cb, void *user) {
+    std::lock_guard<std::mutex> lock(g_ctx.imgMutex);
+    g_ctx.imgCb = cb;
+    g_ctx.imgUser = user;
 }
 
-void insight9_receive_register_imu_callback(imu_callback cb, void *user) { 
-    g_ctx.imuCb = cb; 
-    g_ctx.imuUser = user; 
+void insight9_receive_register_imu_callback(imu_callback cb, void *user) {
+    std::lock_guard<std::mutex> lock(g_ctx.imuMutex);
+    g_ctx.imuCb = cb;
+    g_ctx.imuUser = user;
 }
 
-void insight9_receive_register_vio_callback(vio_callback cb, void *user) { 
-    g_ctx.vioCb = cb; 
-    g_ctx.vioUser = user; 
+void insight9_receive_register_vio_callback(vio_callback cb, void *user) {
+    std::lock_guard<std::mutex> lock(g_ctx.vioMutex);
+    g_ctx.vioCb = cb;
+    g_ctx.vioUser = user;
 }
 
 const DeviceCapabilities_t* insight9_receive_get_device_capabilities_ptr(void) {

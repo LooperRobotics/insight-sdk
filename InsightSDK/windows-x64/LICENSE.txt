@@ -1,0 +1,65 @@
+## License for the source files of this SDK
+
+The header files, examples and documentation of this SDK are licensed under
+the MIT license.
+
+```
+Copyright (c) 2026 Looper Robotics
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## License for the binary files of this SDK
+
+The libraries and programs of this SDK are provided in binary form only:
+liblooper, looper.dll, libinsight9, looper-cli and InsightViewer, together
+with their import libraries. The license for these binary files is
+provided below:
+
+```
+Copyright (c) 2026 Looper Robotics
+
+Scope of License: This license grants, free of charge, to any person obtaining
+a copy of these binary files, the right to use and redistribute them, unmodified,
+for utilizing products from Looper Robotics. You may use them for personal,
+academic, and commercial purposes. The above copyright notice and this
+permission notice shall be included in all copies or substantial portions of
+these binary files.
+
+Prohibited Actions: You are prohibited from modifying, decompiling,
+disassembling, or reverse engineering any part of these binary files. You may
+not use these binary files with products other than those of Looper Robotics.
+
+Reservation of Rights: Looper Robotics reserves all rights to these binary
+files not expressly granted above, and reserves the right to modify this
+license at any time without prior notice.
+
+Disclaimer: These binary files are provided "as is", without warranty of any
+kind. Looper Robotics assumes no responsibility for any direct, indirect,
+incidental, special, or consequential damages resulting from their use.
+
+License Updates: If Looper Robotics releases a new version of this license,
+you agree to comply with the new version after receiving notice.
+```
+
+## License for the third party dependencies
+
+The binary files of this SDK include third party software that has its own
+license. See [licenses/THIRD_PARTY_LICENSES.md](licenses/THIRD_PARTY_LICENSES.md)
+and the license texts in the `licenses` directory.

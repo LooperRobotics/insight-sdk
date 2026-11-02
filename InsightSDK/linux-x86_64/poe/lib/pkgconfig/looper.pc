@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/../..
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: looper
+Description: LooperSDK: discovery, network configuration and streaming for Looper PoE cameras
+Version: 1.0.0
+Cflags: -I${includedir}
+Libs: -L${libdir} -llooper
+Libs.private: -lpthread

@@ -25,6 +25,7 @@ add_library(Insight9SDK
     Insight9SDK.cpp
     UvcDevice.cpp
     ExtensionUnitControl.cpp
+    Insight9PointCloud.cpp
 )
 target_include_directories(Insight9SDK PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(Insight9SDK PRIVATE PkgConfig::LIBUSB Threads::Threads)

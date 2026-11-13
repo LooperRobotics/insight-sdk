@@ -197,6 +197,7 @@ The API is the same as the Windows SDK. See `Insight9SDK.h` for full documentati
 | FPS / format | `..._set_camera_fps`, `..._switch_camera_fps`, `..._set_camera_format`, `..._switch_camera_format`, `..._switch_camera_config`, `..._get_current_fps` |
 | Camera params (XU) | `..._set_active_camera`, `..._get_active_camera`, `..._set_camera_params[_for]`, `..._get_camera_params[_for]`, `..._get_cached_initial_params`, `insight9_check_camera_params`, `..._print_camera_params` |
 | Calibration | `..._get_camera_calib`, `..._print_camera_calib`, `..._align_depth_to_rgb` |
+| Point cloud | `..._depth_to_pointcloud`, `insight9_pointcloud_default_params`, `insight9_pointcloud_max_points`, `insight9_pointcloud_pose_to_transform`, `insight9_pointcloud_map_create/insert/get/clear/destroy` (see `Windows-SDK/README` section 6.11) |
 | Device info | `..._get_video_dev`, `..._get_metadata_dev`, `..._read_metadata_timestamp`, `..._get_vio_status`, `..._get_hardware_type` |
 
 ### Differences from Windows
@@ -242,6 +243,7 @@ Set `-DINSIGHT9_DEBUG_LOG=ON` to see probe/commit results, the selected alternat
 | `Insight9SDK.cpp` | SDK core: device slots, workers, reconnect, HID, API |
 | `UvcDevice.hpp/.cpp` | libusb runtime, descriptor parsing, UVC streaming |
 | `ExtensionUnitControl.hpp/.cpp` | UVC extension unit (camera params, calibration, VIO status) |
+| `Insight9PointCloud.cpp` | Depth-to-point-cloud conversion and global map (same file on every platform) |
 | `example.cpp` | OpenCV demo, ported from the Windows example |
 | `install_deps.sh` | One-step installation of Xcode CLT, Homebrew and the build dependencies |
 | `CMakeLists.txt`, `build.sh` | Build |

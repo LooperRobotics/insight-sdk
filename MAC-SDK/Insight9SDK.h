@@ -548,6 +548,179 @@ int insight9_receive_get_device_capability_count(int cam_id, int* count);
 int insight9_receive_get_device_capability_by_index(int cam_id, int index, DeviceCapability* cap);
 #endif
 
+/* ==================== Point cloud ==================== */
+
+/**
+ * One point of a point cloud.
+ *
+ * 16 bytes, laid out like pcl::PointXYZRGB and like a ROS PointCloud2 with
+ * fields x/y/z/rgb (FLOAT32) at offsets 0/4/8/12 and point_step 16, so an
+ * array of these can be memcpy'd into either directly.
+ */
+typedef struct {
+    float    x, y, z;   /* metres                                           */
+    uint32_t rgb;       /* 0x00RRGGBB; 0 when the point has no colour       */
+} insight9_point;
+
+/* Colour source for insight9_receive_depth_to_pointcloud(). */
+enum {
+    INSIGHT9_PC_COLOR_NONE  = 0,  /* geometry only, rgb = 0                   */
+    INSIGHT9_PC_COLOR_GRAY8 = 1,  /* 8-bit image pixel-aligned with the depth
+                                   * map, i.e. the LEFT grayscale eye         */
+    INSIGHT9_PC_COLOR_RGB8  = 2,  /* decoded RGB-camera image, bytes R,G,B    */
+    INSIGHT9_PC_COLOR_BGR8  = 3,  /* decoded RGB-camera image, bytes B,G,R
+                                   * (what cv::imdecode returns)              */
+};
+
+typedef struct {
+    int   pixel_step;          /* Use every Nth depth pixel in u and v (>= 1)  */
+    float min_depth;           /* Keep z >  min_depth (metres)                 */
+    float max_depth;           /* Keep z <= max_depth (metres); <= 0: no limit */
+
+    /* Optional colour source. */
+    int            color_format;       /* INSIGHT9_PC_COLOR_*                     */
+    const uint8_t *color;              /* First pixel of the image                 */
+    int            color_width;        /* Image width  in pixels                   */
+    int            color_height;       /* Image height in pixels                   */
+    int            color_row_stride;   /* Bytes per row;   0 = width*pixel_stride  */
+    int            color_pixel_stride; /* Bytes per pixel; 0 = 1 (GRAY8) / 3 (RGB) */
+    const camera_calib *rgb_calib;     /* Required for RGB8/BGR8: intrinsics plus
+                                        * the rgb->left extrinsic. The image size
+                                        * must match rgb_calib->intrinsics.        */
+    int keep_uncolored;                /* With RGB8/BGR8, points that fall outside
+                                        * the RGB image are dropped (0, default) or
+                                        * kept with rgb = 0 (1).                   */
+
+    /* Optional 4x4 row-major transform applied to every output point. It maps
+     * points from the LEFT camera optical frame into the frame you want (for
+     * example T_world_left from insight9_pointcloud_pose_to_transform()).
+     * NULL: points stay in the LEFT camera optical frame (x right, y down,
+     * z forward). */
+    const float *transform;
+} insight9_pointcloud_params;
+
+/**
+ * @brief Fill params with defaults: pixel_step 2, min_depth 0, max_depth 2.0 m,
+ *        no colour, no transform.
+ */
+void insight9_pointcloud_default_params(insight9_pointcloud_params *params);
+
+/**
+ * @brief Upper bound on the number of points one call can produce, i.e. the
+ *        capacity to allocate for insight9_receive_depth_to_pointcloud().
+ * @return 0 if any argument is <= 0.
+ */
+size_t insight9_pointcloud_max_points(int depth_w, int depth_h, int pixel_step);
+
+/**
+ * @brief Back-project a depth image into a point cloud.
+ *
+ * The depth stream is registered to the LEFT grayscale camera, so each sampled
+ * depth pixel is deprojected with the LEFT intrinsics. Streams are rectified
+ * (p == k), so no lens distortion is applied. With RGB8/BGR8 colour, each
+ * point is transformed into the RGB frame (inverse of the rgb->left extrinsic)
+ * and projected with the RGB intrinsics to pick its colour.
+ *
+ * @param depth        Depth buffer (uint16, row-major), 1 unit = 1 mm.
+ * @param depth_w      Depth width.
+ * @param depth_h      Depth height. Valid rows only: exclude the 2 metadata
+ *                     rows at the bottom of the Z16 frame.
+ * @param left_calib   LEFT camera calibration.
+ * @param params       Options; NULL uses insight9_pointcloud_default_params().
+ * @param out          Output points. Caller allocates at least
+ *                     insight9_pointcloud_max_points(depth_w, depth_h,
+ *                     params->pixel_step) entries.
+ * @param out_capacity Number of entries in out.
+ * @param out_count    Receives the number of points written.
+ * @return 0 on success, -1 on invalid arguments or too small a buffer.
+ */
+int insight9_receive_depth_to_pointcloud(const uint16_t *depth,
+                                         int depth_w, int depth_h,
+                                         const camera_calib *left_calib,
+                                         const insight9_pointcloud_params *params,
+                                         insight9_point *out,
+                                         size_t out_capacity,
+                                         size_t *out_count);
+
+/**
+ * @brief Build the 4x4 row-major transform T_world_left from a VIO pose.
+ *
+ * T_world_left = T_world_body * T_body_left, where T_world_body is the pose
+ * delivered by vio_callback and T_body_left is the fixed transform from the
+ * LEFT camera to the VIO body frame. Pass the result as
+ * insight9_pointcloud_params::transform to get world-frame points.
+ *
+ * @param px,py,pz,qx,qy,qz,qw VIO pose (as from vio_callback).
+ * @param body_to_left  ROS-convention transform with parent = VIO body frame
+ *                      and child = LEFT camera (p_body = R * p_left + t).
+ *                      NULL treats the pose as the LEFT camera pose itself.
+ * @param T_out         Receives 16 floats, row-major.
+ * @return 0 on success, -1 on invalid arguments.
+ */
+int insight9_pointcloud_pose_to_transform(float px, float py, float pz,
+                                          float qx, float qy, float qz, float qw,
+                                          const camera_extrinsics *body_to_left,
+                                          float T_out[16]);
+
+/*
+ * Global point cloud map: accumulates world-frame frames into one cloud.
+ *
+ * A frame is kept only as a keyframe, when the camera has moved at least
+ * keyframe_translation or turned at least keyframe_rotation_deg since the last
+ * keyframe. Each keyframe is voxel-downsampled on its own. Keyframes taken
+ * farther than keep_radius from the current camera position are dropped, and
+ * insight9_pointcloud_map_get() returns only points within keep_radius of it.
+ * All map functions are thread-safe for the same map.
+ */
+typedef struct insight9_pointcloud_map insight9_pointcloud_map;
+
+typedef struct {
+    float keyframe_translation;   /* metres;  default 0.03                   */
+    float keyframe_rotation_deg;  /* degrees; default 1.0                    */
+    float voxel_size;             /* metres;  default 0.05; <= 0 disables it */
+    float keep_radius;            /* metres;  default 100;  <= 0: no limit   */
+} insight9_pointcloud_map_params;
+
+void insight9_pointcloud_map_default_params(insight9_pointcloud_map_params *params);
+
+/**
+ * @brief Create a map. params NULL uses the defaults.
+ * @return Map handle, or NULL on failure. Free with insight9_pointcloud_map_destroy().
+ */
+insight9_pointcloud_map *insight9_pointcloud_map_create(const insight9_pointcloud_map_params *params);
+
+void insight9_pointcloud_map_destroy(insight9_pointcloud_map *map);
+
+/** @brief Drop every point and keyframe. */
+void insight9_pointcloud_map_clear(insight9_pointcloud_map *map);
+
+/**
+ * @brief Offer one frame to the map.
+ * @param points       World-frame points, i.e. produced with
+ *                     params.transform = T_world_left.
+ * @param count        Number of points.
+ * @param T_world_left The same 4x4 row-major camera pose.
+ * @return 1 if the frame was added as a keyframe, 0 if it was skipped,
+ *         -1 on invalid arguments.
+ */
+int insight9_pointcloud_map_insert(insight9_pointcloud_map *map,
+                                   const insight9_point *points, size_t count,
+                                   const float T_world_left[16]);
+
+/**
+ * @brief Copy the current global cloud.
+ * @param out          Destination, or NULL to only query the point count.
+ * @param out_capacity Number of entries in out.
+ * @param out_count    Receives the number of points written, or with out ==
+ *                     NULL the number available.
+ * @return 0 on success, 1 if out was too small and the cloud was truncated,
+ *         -1 on invalid arguments.
+ */
+int insight9_pointcloud_map_get(insight9_pointcloud_map *map,
+                                insight9_point *out, size_t out_capacity,
+                                size_t *out_count);
+
+
 #ifdef __cplusplus
 }
 #endif

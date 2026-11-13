@@ -37,6 +37,7 @@ It also exposes two HID streams:
 - Device capability enumeration, including default capabilities.
 - UVC extension unit camera parameter control.
 - Factory calibration readout and depth-to-RGB alignment helper.
+- Depth-to-point-cloud conversion (camera or world frame, optional RGB/gray colour) and a global point cloud map.
 - Metadata timestamp readout.
 - VIO status and hardware type query helpers.
 - Visual Studio/CMake build with bundled HIDAPI.
@@ -331,6 +332,56 @@ VIO status values:
 | 4 | `TRACKING_STATIC` |
 | 5 | `TRACKINGLOST` |
 | 6 | `DATA_LOST` |
+
+### 6.11 Point Cloud
+
+`Insight9PointCloud.cpp` turns Z16 depth frames into point clouds, either per frame or accumulated into a global map. Points are `insight9_point { float x, y, z; uint32_t rgb; }` (metres, `0x00RRGGBB`). The layout matches `pcl::PointXYZRGB` and a ROS `PointCloud2` with fields `x,y,z,rgb` at offsets 0/4/8/12, so an array can be copied straight into either.
+
+```cpp
+void   insight9_pointcloud_default_params(insight9_pointcloud_params *params);
+size_t insight9_pointcloud_max_points(int depth_w, int depth_h, int pixel_step);
+int    insight9_receive_depth_to_pointcloud(const uint16_t *depth, int depth_w, int depth_h,
+                                            const camera_calib *left_calib,
+                                            const insight9_pointcloud_params *params,
+                                            insight9_point *out, size_t out_capacity,
+                                            size_t *out_count);
+int    insight9_pointcloud_pose_to_transform(float px, float py, float pz,
+                                             float qx, float qy, float qz, float qw,
+                                             const camera_extrinsics *body_to_left,
+                                             float T_out[16]);
+
+insight9_pointcloud_map *insight9_pointcloud_map_create(const insight9_pointcloud_map_params *params);
+int  insight9_pointcloud_map_insert(insight9_pointcloud_map *map, const insight9_point *points,
+                                    size_t count, const float T_world_left[16]);
+int  insight9_pointcloud_map_get(insight9_pointcloud_map *map, insight9_point *out,
+                                 size_t out_capacity, size_t *out_count);
+void insight9_pointcloud_map_clear(insight9_pointcloud_map *map);
+void insight9_pointcloud_map_destroy(insight9_pointcloud_map *map);
+```
+
+- **Single frame.** Depth is deprojected with the LEFT intrinsics. Defaults: every 2nd pixel, depth up to 2.0 m. Pass the valid depth rows only (`height - 2` for Z16).
+- **Colour (optional).** `INSIGHT9_PC_COLOR_RGB8` / `BGR8` takes a decoded RGB-camera image plus `rgb_calib`; points that fall outside the image are dropped unless `keep_uncolored` is set. `INSIGHT9_PC_COLOR_GRAY8` takes the LEFT grayscale eye, which must be the depth size. Use `color_pixel_stride = 2` for Y8I, where the left eye is every other byte.
+- **World frame.** Set `params.transform` to `T_world_left` from `insight9_pointcloud_pose_to_transform()`, built from the VIO pose and the fixed LEFT-camera-to-VIO-body extrinsic. With no transform, points stay in the LEFT camera optical frame.
+- **Global map.** Keeps a frame only when the camera moved >= 3 cm or turned >= 1 degree. Each keyframe is downsampled to 5 cm voxels, and keyframes and points farther than 100 m from the current position are dropped. Map functions are thread-safe. Call `map_get` with `out = NULL` to query the size first.
+
+```cpp
+insight9_pointcloud_params pc;
+insight9_pointcloud_default_params(&pc);
+pc.color_format = INSIGHT9_PC_COLOR_BGR8;          // cv::imdecode output
+pc.color = bgr.data; pc.color_width = bgr.cols; pc.color_height = bgr.rows;
+pc.rgb_calib = &rgb_calib;
+
+float T_world_left[16];
+insight9_pointcloud_pose_to_transform(px, py, pz, qx, qy, qz, qw, &body_to_left, T_world_left);
+pc.transform = T_world_left;
+
+std::vector<insight9_point> pts(insight9_pointcloud_max_points(w, h - 2, pc.pixel_step));
+size_t n = 0;
+if (insight9_receive_depth_to_pointcloud(depth, w, h - 2, &left_calib, &pc,
+                                         pts.data(), pts.size(), &n) == 0) {
+    insight9_pointcloud_map_insert(map, pts.data(), n, T_world_left);
+}
+```
 
 ## 7. Minimal Example
 

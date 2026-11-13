@@ -64,7 +64,7 @@ else()
     set(HIDAPI_TARGET hidapi_prebuilt)
 endif()
 
-add_library(Insight9SDK STATIC Insight9SDK.cpp ExtensionUnitControl.cpp)
+add_library(Insight9SDK STATIC Insight9SDK.cpp ExtensionUnitControl.cpp Insight9PointCloud.cpp)
 target_link_libraries(Insight9SDK PRIVATE
     ${HIDAPI_TARGET}
     strmiids

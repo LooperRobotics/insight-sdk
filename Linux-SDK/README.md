@@ -49,7 +49,7 @@ Image callback timestamps are provided in microseconds. Metadata device timestam
 - CMake 3.10 or newer.
 - GCC/G++ with C++17 support.
 - pthreads.
-- OpenCV development package, required by the included `example`.
+- OpenCV development package, required only by the included `example` (optional; the `insight9` library does not depend on OpenCV).
 - Runtime access to `/sys/class/video4linux`, `/sys/class/hidraw`, `/dev/video*`, and `/dev/hidraw*`.
 
 Install common dependencies on Ubuntu/Debian:
@@ -88,6 +88,22 @@ The build produces:
 
 - `build/libinsight9.so`
 - `build/example`
+
+OpenCV is optional. If it is found, `example` shows a live image window; if not
+(e.g. on embedded boards such as RK3588), `example` is built in headless mode:
+it still runs all SDK calls and prints image/IMU/VIO statistics, but shows no images.
+
+Force headless mode even when OpenCV is installed:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DINSIGHT9_EXAMPLE_USE_OPENCV=OFF
+```
+
+Build only the library, without the example:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DINSIGHT9_BUILD_EXAMPLE=OFF
+```
 
 ## 6. API Reference
 

@@ -10,8 +10,22 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
+option(INSIGHT9_BUILD_EXAMPLE "Build the example program" ON)
+option(INSIGHT9_EXAMPLE_USE_OPENCV "Use OpenCV in the example for image display (falls back to headless if not found)" ON)
+
 find_package(Threads REQUIRED)
-find_package(OpenCV REQUIRED)
+
+# The insight9 library itself has no OpenCV dependency; only the example's
+# image display uses it. Without OpenCV the example is built in headless mode.
+set(INSIGHT9_EXAMPLE_OPENCV OFF)
+if(INSIGHT9_BUILD_EXAMPLE AND INSIGHT9_EXAMPLE_USE_OPENCV)
+    find_package(OpenCV QUIET)
+    if(OpenCV_FOUND)
+        set(INSIGHT9_EXAMPLE_OPENCV ON)
+    else()
+        message(STATUS "OpenCV not found: building 'example' in headless mode (no image window).")
+    endif()
+endif()
 
 add_compile_options(-Wall -Wextra -fPIC)
 
@@ -63,31 +77,37 @@ set_target_properties(insight9 PROPERTIES
     OUTPUT_NAME "insight9"
 )
 
-add_executable(example example.cpp)
+if(INSIGHT9_BUILD_EXAMPLE)
+    add_executable(example example.cpp)
 
-target_link_libraries(example PRIVATE
-    insight9
-    Threads::Threads
-    ${OpenCV_LIBS}
-)
+    target_link_libraries(example PRIVATE
+        insight9
+        Threads::Threads
+    )
 
-target_include_directories(example PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-)
+    if(INSIGHT9_EXAMPLE_OPENCV)
+        target_compile_definitions(example PRIVATE INSIGHT9_EXAMPLE_WITH_OPENCV)
+        target_include_directories(example PRIVATE ${OpenCV_INCLUDE_DIRS})
+        target_link_libraries(example PRIVATE ${OpenCV_LIBS})
+    endif()
 
-set_target_properties(example PROPERTIES
-    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
-    INSTALL_RPATH "\$ORIGIN"
-)
+    set_target_properties(example PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        INSTALL_RPATH "\$ORIGIN"
+    )
+endif()
 
 install(TARGETS insight9
     LIBRARY DESTINATION lib
 )
 
 install(FILES ${LIB_HEADERS} DESTINATION include)
-install(TARGETS example DESTINATION bin)
+if(INSIGHT9_BUILD_EXAMPLE)
+    install(TARGETS example DESTINATION bin)
+endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "Fortify Source: disabled")
+message(STATUS "Build example: ${INSIGHT9_BUILD_EXAMPLE} (OpenCV display: ${INSIGHT9_EXAMPLE_OPENCV})")

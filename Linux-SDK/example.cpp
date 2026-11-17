@@ -10,7 +10,13 @@
 #include <unistd.h>
 #include <signal.h>
 #include <linux/videodev2.h>
+// INSIGHT9_EXAMPLE_WITH_OPENCV is defined by CMake when OpenCV is available.
+// Without it the example runs headless: it still exercises the whole SDK API
+// (streams, camera params, calibration, IMU/VIO, FPS switching) and prints
+// statistics, but does not decode or display images.
+#ifdef INSIGHT9_EXAMPLE_WITH_OPENCV
 #include <opencv2/opencv.hpp>
+#endif
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -77,6 +83,7 @@ static const int GRAY_FPS_VALUES[] = {20, 30, 40, 50, 60};
 
 static volatile uint64_t last_image_time_per_cam[3] = {0, 0, 0};
 
+#ifdef INSIGHT9_EXAMPLE_WITH_OPENCV
 // ==================== Display / depth-to-RGB alignment ====================
 // Grid layout (single fixed window):
 //   top-left = left eye, bottom-left = right eye,
@@ -113,6 +120,7 @@ static std::mutex g_panel_lock;
 static cv::Mat g_panel[PANEL_COUNT];
 static cv::Mat g_aligned_color;   // aligned depth, colorized (RGB-sized, BGR)
 static cv::Mat g_aligned_mask;    // valid-pixel mask for the overlay (RGB-sized, 8U)
+#endif // INSIGHT9_EXAMPLE_WITH_OPENCV
 
 // Calibration for depth->RGB alignment, read once at startup.
 static bool g_calib_ready = false;
@@ -289,6 +297,7 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
     // and blocking it on terminal I/O costs V4L2 frames.
     if (want_print) print_img_stats(snapshot, elapsed);
 
+#ifdef INSIGHT9_EXAMPLE_WITH_OPENCV
     // Cheap hand-off to this camera's worker: just copy the raw bytes.
     {
         std::lock_guard<std::mutex> lk(g_raw_lock[cam_id]);
@@ -300,6 +309,7 @@ void my_image_cb(int cam_id, uint8_t *data, size_t size, int w, int h,
         rf.has_new = true;
     }
     g_raw_cv[cam_id].notify_one();
+#endif
 }
 
 void my_imu_cb(float ax, float ay, float az,
@@ -339,6 +349,7 @@ void my_vio_cb(float px, float py, float pz,
     if (want_print) print_hid_stats(&snap);
 }
 
+#ifdef INSIGHT9_EXAMPLE_WITH_OPENCV
 // Decode one raw frame into BGR panel(s); for depth, also align it to RGB and
 // build the colorized overlay. Runs on a per-camera worker thread.
 static void process_raw_frame(int cam_id, const raw_frame &rf) {
@@ -483,6 +494,7 @@ static void camera_worker(int cam_id) {
         g_panel_seq.fetch_add(1, std::memory_order_release);
     }
 }
+#endif // INSIGHT9_EXAMPLE_WITH_OPENCV
 
 void toggle_gray_camera_fps() {
     uint64_t now = get_tick_ms();
@@ -641,6 +653,7 @@ int main() {
 
     printf("\n=================================================\n\n");
     printf("SDK running with all 3 cameras\n");
+#ifdef INSIGHT9_EXAMPLE_WITH_OPENCV
     printf("A fixed grid window will appear: L / R / raw-depth / RGB+aligned-depth.\n");
     printf("Press 'q' or ESC in the window, or Ctrl+C, to stop...\n");
 
@@ -740,6 +753,29 @@ int main() {
         if (workers[cam].joinable()) workers[cam].join();
     }
     cv::destroyAllWindows();
+
+#else
+    printf("Built without OpenCV: running headless (statistics only, no image window).\n");
+    printf("Press Ctrl+C to stop...\n");
+
+    uint64_t last_vio_poll = 0;
+    while (keep_running) {
+        // Poll VIO status from the main thread (a USB control transfer; keep it
+        // off the callback threads).
+        uint64_t now_ms = get_tick_ms();
+        if (now_ms - last_vio_poll >= 500) {
+            last_vio_poll = now_ms;
+            if (insight9_receive_get_vio_status(&vio_status_raw) == 0) {
+                printf("Current VIO status: %s (%d)\n",
+                       vio_status_to_string(static_cast<VioStatus>(vio_status_raw)),
+                       vio_status_raw);
+                fflush(stdout);
+            }
+        }
+        usleep(50 * 1000);
+    }
+
+#endif
 
     pthread_join(fps_switch_thread, NULL);
 

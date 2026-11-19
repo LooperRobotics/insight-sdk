@@ -35,6 +35,7 @@ endif()
 
 set(LIB_SOURCES
     Insight_9_receive.cpp
+    Insight9PointCloud.cpp
     hid.c
     UvcExtensionUnit.cpp
 )

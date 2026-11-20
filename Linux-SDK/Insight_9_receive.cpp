@@ -2108,27 +2108,8 @@ int insight9_receive_init(const insight9_config_t* config) {
     try_bind_cameras();
     log_camera_inventory();
 
-    // Find HID devices. Also non-fatal.
-    char hid_list[10][MAX_PATH] = {{0}};
-    int hid_count = find_hid_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, hid_list, 10);
-    for (int i = 0; i < HID_NUM; i++) {
-        g_ctx.hid_devs[i][0] = '\0';
-        g_ctx.hid_usb_paths[i][0] = '\0';
-    }
-    if (hid_count < 2) {
-        fprintf(stderr, "[SDK][WARN] expected 2 HID devices with VID=0x%04x PID=0x%04x, found %d; "
-                "IMU/VIO will attach when they appear\n", VENDOR_ID, PRODUCT_ID, hid_count);
-    }
-    // Take the first two devices after sorting: the lower number is IMU and the higher number is VIO.
-    for (int i = 0; i < HID_NUM && i < hid_count; i++) {
-        snprintf(g_ctx.hid_devs[i], MAX_PATH, "%s", hid_list[i]);
-        if (get_hid_usb_device_path(g_ctx.hid_devs[i], g_ctx.hid_usb_paths[i], MAX_PATH) < 0) {
-            g_ctx.hid_usb_paths[i][0] = '\0';
-        }
-    }
-    printf("[SDK] selected HID: IMU=%s VIO=%s\n",
-           g_ctx.hid_devs[0][0] ? g_ctx.hid_devs[0] : "(pending)",
-           g_ctx.hid_devs[1][0] ? g_ctx.hid_devs[1] : "(pending)");
+    // Find HID devices by role (IMU / VIO). Also non-fatal.
+    hid_discover(1);
 
     // Initialize camera contexts.
     for (int i = 0; i < CAM_NUM; i++) {

@@ -578,6 +578,25 @@ static int probe_uvc_node(const char *dev, CameraType *out, int *families = NULL
     int fd = open(dev, O_RDWR);
     if (fd < 0) return NODE_ERROR;
 
+    // device_caps describes this node alone (capabilities is the union over
+    // the whole device). When available it decides video vs metadata, so a
+    // video node whose ENUM_FMT fails while the device is still settling after
+    // a re-enumeration is reported as an error, not mistaken for metadata.
+    bool caps_known = false;
+    struct v4l2_capability cap;
+    memset(&cap, 0, sizeof(cap));
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 && (cap.capabilities & V4L2_CAP_DEVICE_CAPS)) {
+        caps_known = true;
+        if (cap.device_caps & V4L2_CAP_META_CAPTURE) {
+            close(fd);
+            return NODE_META;
+        }
+        if (!(cap.device_caps & V4L2_CAP_VIDEO_CAPTURE)) {
+            close(fd);
+            return NODE_ERROR;
+        }
+    }
+
     bool has_mjpeg = false, has_y8i = false, has_z16 = false;
     bool has_grey = false, has_color = false;
     int nfmt = 0;
@@ -604,7 +623,11 @@ static int probe_uvc_node(const char *dev, CameraType *out, int *families = NULL
     }
     close(fd);
 
-    if (nfmt == 0) return NODE_META;   // no capture format -> metadata sibling
+    if (nfmt == 0) {
+        // A confirmed video node with no formats is not ready yet. Only fall
+        // back to "no formats means metadata" on drivers without device_caps.
+        return caps_known ? NODE_ERROR : NODE_META;
+    }
 
     int mask = 0;
     if (has_z16)                mask |= FAM_DEPTH;
@@ -620,6 +643,73 @@ static int probe_uvc_node(const char *dev, CameraType *out, int *families = NULL
     if (out) *out = t;
     if (families) *families = mask;
     return NODE_VIDEO;
+}
+
+// Result of find_meta_sibling().
+#define META_FOUND     1   // out holds the metadata node
+#define META_NONE      0   // this stream has no metadata node
+#define META_PENDING (-1)  // the node exists in sysfs but cannot be used yet
+
+static int read_sysfs_int(const char *path, int *out) {
+    char buf[32];
+    if (read_sysfs_file(path, buf, sizeof(buf)) != 0) return -1;
+    *out = atoi(buf);
+    return 0;
+}
+
+// Finds the metadata node that belongs to `video_dev`.
+//
+// uvcvideo registers each streaming interface as a video node immediately
+// followed by its metadata node, under the same parent device (the
+// VideoControl interface). The v4l2 core numbers nodes per parent in /index,
+// so the sibling is the node with the same parent and index + 1. This does not
+// depend on global videoN numbers, which are only consecutive when nothing
+// else grabs a minor in between and every node is already openable - neither
+// holds while the device is re-enumerating. Pairing by "next node in the
+// sorted list" is what once paired the stereo stream with the RGB video node.
+//
+// Several nodes share one parent (depth and stereo both live on the
+// composite's VideoControl interface), so the parent alone cannot pair them.
+static int find_meta_sibling(const char *video_dev, char out[MAX_PATH]) {
+    out[0] = '\0';
+    const char *base = strrchr(video_dev, '/');
+    base = base ? base + 1 : video_dev;
+
+    char path[MAX_PATH], parent[MAX_PATH];
+    snprintf(path, sizeof(path), "/sys/class/video4linux/%s/device", base);
+    if (realpath(path, parent) == NULL) return META_PENDING;
+    int vidx = -1;
+    snprintf(path, sizeof(path), "/sys/class/video4linux/%s/index", base);
+    if (read_sysfs_int(path, &vidx) != 0) return META_PENDING;
+
+    DIR *dir = opendir("/sys/class/video4linux");
+    if (!dir) return META_PENDING;
+    struct dirent *entry;
+    int result = META_NONE;
+    char candidate_parent[MAX_PATH];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.' || strcmp(entry->d_name, base) == 0) continue;
+        snprintf(path, sizeof(path), "/sys/class/video4linux/%s/device", entry->d_name);
+        if (realpath(path, candidate_parent) == NULL) continue;
+        if (strcmp(candidate_parent, parent) != 0) continue;
+        int idx = -1;
+        snprintf(path, sizeof(path), "/sys/class/video4linux/%s/index", entry->d_name);
+        if (read_sysfs_int(path, &idx) != 0 || idx != vidx + 1) continue;
+
+        char dev[MAX_PATH];
+        snprintf(dev, sizeof(dev), "/dev/%s", entry->d_name);
+        int kind = probe_uvc_node(dev, NULL);
+        if (kind == NODE_META) {
+            snprintf(out, MAX_PATH, "%s", dev);
+            result = META_FOUND;
+        } else if (kind == NODE_ERROR) {
+            result = META_PENDING;   // not openable yet; ask again later
+        }
+        // NODE_VIDEO: index + 1 is the next stream, so this one has no metadata.
+        break;
+    }
+    closedir(dir);
+    return result;
 }
 
 // How many distinct stream families a node advertises.
@@ -727,12 +817,22 @@ static int try_bind_cameras(void) {
             int cid = cam_id_from_families(fams, cam_bound);
             if (cid < 0) continue;   // every camera this node could serve is taken
 
+            // Do not bind while the metadata node is still settling: binding
+            // now would either pin "no metadata" or race the node into place.
+            char meta[MAX_PATH];
+            int meta_state = find_meta_sibling(uvc_list[i], meta);
+            if (meta_state == META_PENDING) {
+                fprintf(stderr, "[CAM%d] %s: metadata node not ready yet, retrying later\n",
+                        cid, uvc_list[i]);
+                continue;
+            }
+
             snprintf(g_ctx.video_devs[cid], MAX_PATH, "%s", uvc_list[i]);
             cam_type[cid] = cam_type_for_id(cid);
             cam_families[cid] = fams;
 
-            if (i + 1 < uvc_count && probe_uvc_node(uvc_list[i + 1], NULL) == NODE_META) {
-                snprintf(g_ctx.metadata_devs[cid], MAX_PATH, "%s", uvc_list[i + 1]);
+            if (meta_state == META_FOUND) {
+                snprintf(g_ctx.metadata_devs[cid], MAX_PATH, "%s", meta);
             } else {
                 g_ctx.metadata_devs[cid][0] = '\0';
                 fprintf(stderr, "[CAM%d][WARN] %s has no metadata node; "
@@ -798,17 +898,21 @@ static int xu_candidate_order(int *out) {
     return n;
 }
 
-static void refresh_video_device_path(int cam_id) {
+// Re-resolves this camera's video node and its metadata sibling.
+// Returns -1 when the metadata node exists but is not usable yet (the device is
+// still re-enumerating); the caller should back off and retry instead of
+// opening a half-formed pair. Returns 0 otherwise.
+static int refresh_video_device_path(int cam_id) {
     // Not attached yet: nothing to refresh, try_bind_cameras() owns that case.
-    if (!cam_bound[cam_id]) return;
+    if (!cam_bound[cam_id]) return 0;
     // Unclassified camera: never guess, just keep the path chosen at init.
-    if (cam_type[cam_id] == TYPE_UNKNOWN) return;
+    if (cam_type[cam_id] == TYPE_UNKNOWN) return 0;
 
     char uvc_list[10][MAX_PATH];
     int uvc_count = find_uvc_devices_by_vid_pid(VENDOR_ID, PRODUCT_ID, uvc_list, 10);
     if (uvc_count <= 0) {
         fprintf(stderr, "[CAM%d] No UVC devices found\n", cam_id);
-        return;
+        return 0;
     }
 
     // Match on "this node can serve my role", not "this node's preferred role
@@ -834,20 +938,28 @@ static void refresh_video_device_path(int cam_id) {
         }
         if (owned_by_other) continue;
 
+        // Re-derive the metadata sibling on every refresh, not only when the
+        // video path moves: after a re-enumeration the video node can land on
+        // the same number while its metadata node does not, and a metadata
+        // path that was wrong once would otherwise stay wrong forever.
+        char meta[MAX_PATH];
+        int meta_state = find_meta_sibling(uvc_list[i], meta);
+        if (meta_state == META_PENDING) {
+            fprintf(stderr, "[CAM%d] %s: metadata node not ready yet\n", cam_id, uvc_list[i]);
+            return -1;
+        }
+        if (meta_state == META_NONE) meta[0] = '\0';
+        if (strcmp(meta, g_ctx.metadata_devs[cam_id]) != 0) {
+            printf("[CAM%d] metadata path %s -> %s\n", cam_id,
+                   g_ctx.metadata_devs[cam_id][0] ? g_ctx.metadata_devs[cam_id] : "(none)",
+                   meta[0] ? meta : "(none)");
+            snprintf(g_ctx.metadata_devs[cam_id], MAX_PATH, "%s", meta);
+        }
+
         if (strcmp(uvc_list[i], g_ctx.video_devs[cam_id]) != 0) {
             printf("[CAM%d] path moved %s -> %s\n",
                    cam_id, g_ctx.video_devs[cam_id], uvc_list[i]);
             snprintf(g_ctx.video_devs[cam_id], MAX_PATH, "%s", uvc_list[i]);
-            // The metadata node is the sibling right after the video node -
-            // but only if it really is a metadata node. On a variant whose
-            // streams expose no metadata interface, node i+1 is the next
-            // camera's video node, and copying it here would make two cameras
-            // read each other's buffers.
-            int meta_idx = i + 1;
-            if (meta_idx < uvc_count && probe_uvc_node(uvc_list[meta_idx], NULL) == NODE_META)
-                snprintf(g_ctx.metadata_devs[cam_id], MAX_PATH, "%s", uvc_list[meta_idx]);
-            else
-                g_ctx.metadata_devs[cam_id][0] = '\0';
 
             // Path refresh refreshes the path, nothing else. This used to open
             // the new node, read VIDIOC_G_FMT and overwrite the context's
@@ -876,12 +988,13 @@ static void refresh_video_device_path(int cam_id) {
                        cam_id, rc->width, rc->height, rc->format);
             }
         }
-        return; // matched
+        return 0; // matched
     }
 
     // No match: keep the existing path rather than falling back to a fixed index.
     fprintf(stderr, "[CAM%d] Cannot find device for type %s, keeping old path: %s\n",
             cam_id, cam_type_name(cam_type[cam_id]), g_ctx.video_devs[cam_id]);
+    return 0;
 }
 
 static bool reopenXUControlLocked(const char* reason) {
@@ -1794,10 +1907,16 @@ static void *capture_thread(void *arg) {
                 }
             }
 
+            // Resolve paths first so the log shows what is actually opened,
+            // not the pre-refresh (possibly stale) path.
+            if (refresh_video_device_path(ctx->cam_id) < 0) {
+                pthread_mutex_unlock(&ctx->fd_lock);
+                reconnect_backoff_apply_for_cam(ctx, &reconnect_fails, "metadata node not ready");
+                continue;
+            }
             dev_path = g_ctx.video_devs[ctx->cam_id];
-            printf("[CAM%d] device not open, opening %s\n", ctx->cam_id, dev_path);
-            refresh_video_device_path(ctx->cam_id);
-            dev_path = g_ctx.video_devs[ctx->cam_id];
+            printf("[CAM%d] device not open, opening %s (meta %s)\n", ctx->cam_id, dev_path,
+                   g_ctx.metadata_devs[ctx->cam_id][0] ? g_ctx.metadata_devs[ctx->cam_id] : "none");
 
             // Only if init did not already get them. This used to run on
             // every open, so all three capture threads fired an XU

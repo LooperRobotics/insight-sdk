@@ -12,10 +12,17 @@
 #define HID_NUM 2
 #define MAX_PATH 1024
 
+// HID thread index == role.
+#define HID_ROLE_UNKNOWN (-1)
+#define HID_ROLE_IMU     0
+#define HID_ROLE_VIO     1
+
 int get_hid_usb_device_path(const char *hid_dev, char *usb_path, size_t usb_path_size);
-int find_hid_devices_by_vid_pid(unsigned int target_vid, unsigned int target_pid,
-                               char dev_paths[][MAX_PATH], int max_devs);
-void refresh_hid_device_path(int idx);
+// Resolves g_ctx.hid_devs[role] by report descriptor (interface number as
+// cross-check); clears it when that role is not present.
+void refresh_hid_device_path(int idx, int verbose);
+// Resolves both roles from scratch.
+void hid_discover(int verbose);
 void *hid_thread(void *arg);
 int hid_init(void);
 

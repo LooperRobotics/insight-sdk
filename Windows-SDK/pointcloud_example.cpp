@@ -13,7 +13,7 @@
 // Usage: pointcloud_example [--no-gui] [--color gray|rgb|none] [--step N]
 //                           [--max-depth M] [--no-filter] [--voxel V]
 //                           [--no-map] [--body-to-left flu|calib|none]
-//                           [--out PREFIX]
+//                           [--out PREFIX]  (default prefix: device model)
 //
 // Preview window: drag with the left mouse button to orbit, wheel or +/- to
 // zoom, r = reset view, , and . = max depth -/+ 0.5 m, 1-4 = pixel step,
@@ -33,6 +33,7 @@
 #include <signal.h>
 #endif
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -121,7 +122,7 @@ struct Options {
     int pose_delay_ms = 0;
     bool use_map = true;
     BodyToLeft body_to_left = BTL_CALIB;
-    std::string out_prefix = "insight9";
+    std::string out_prefix;  // empty: named after the device model
 };
 
 static void usage(const char *prog) {
@@ -142,7 +143,20 @@ static void usage(const char *prog) {
     printf("  --body-to-left flu|calib|none\n");
     printf("                      LEFT camera -> VIO body extrinsic (default calib,\n");
     printf("                      see the top of pointcloud_example.cpp)\n");
-    printf("  --out PREFIX        PLY file prefix (default insight9)\n");
+    printf("  --out PREFIX        PLY file prefix (default: the device model,\n");
+    printf("                      e.g. insight9 / insight7 / insight3)\n");
+}
+
+// Default output prefix from the device model: "Insight 3" -> "insight3".
+// Returns "" when the model cannot be read yet.
+static std::string model_prefix() {
+    const char *hw = insight9_receive_get_hardware_type();
+    if (!hw || strcmp(hw, "unknown") == 0) return std::string();
+    std::string out;
+    for (const char *c = hw; *c; c++) {
+        if (isalnum((unsigned char)*c)) out += (char)tolower((unsigned char)*c);
+    }
+    return out;
 }
 
 static bool parse_args(int argc, char **argv, Options *o) {
@@ -720,6 +734,12 @@ int main(int argc, char **argv) {
             printf("Cannot read the LEFT calibration yet; retrying in 3 s\n");
             return false;
         }
+        if (opt.out_prefix.empty()) {
+            opt.out_prefix = model_prefix();
+            if (!opt.out_prefix.empty())
+                printf("Device model: %s (PLY prefix '%s')\n",
+                       insight9_receive_get_hardware_type(), opt.out_prefix.c_str());
+        }
         const camera_extrinsics &e = left_calib.extrinsics;
         printf("LEFT calib: %ux%u fx=%.2f fy=%.2f cx=%.2f cy=%.2f\n",
                left_calib.intrinsics.width, left_calib.intrinsics.height,
@@ -754,6 +774,13 @@ int main(int argc, char **argv) {
         printf("LEFT -> VIO body extrinsic: %s (--body-to-left flu|calib|none)\n",
                names[opt.body_to_left]);
     }
+
+    // Output file prefix: --out, else the device model (read with the
+    // calibration, once depth runs), else a generic fallback.
+    auto out_prefix = [&]() -> std::string {
+        if (opt.out_prefix.empty()) opt.out_prefix = model_prefix();
+        return opt.out_prefix.empty() ? std::string("insight") : opt.out_prefix;
+    };
 
     // ---- Point cloud parameters ----
     insight9_pointcloud_params pc_defaults;
@@ -1109,14 +1136,14 @@ int main(int argc, char **argv) {
             } else if (key == 'd' && !depth.data.empty()) {
                 // Raw depth as a 16-bit PNG (mm), for checking what the device sends.
                 cv::Mat raw(depth.height, depth.width, CV_16UC1, depth.data.data());
-                std::string path = opt.out_prefix + "_depth_raw.png";
+                std::string path = out_prefix() + "_depth_raw.png";
                 cv::imwrite(path, raw);
                 printf("Saved raw depth %dx%d to %s\n", depth.width, depth.height, path.c_str());
             } else if (key == 's') {
-                save_ply(opt.out_prefix + "_frame.ply", frame_pts.data(), frame_n);
+                save_ply(out_prefix() + "_frame.ply", frame_pts.data(), frame_n);
                 if (map && fetch_map(map, map_raw)) {
                     voxel_merge(map_raw, opt.voxel, map_pts);
-                    save_ply(opt.out_prefix + "_map.ply", map_pts.data(), map_pts.size());
+                    save_ply(out_prefix() + "_map.ply", map_pts.data(), map_pts.size());
                 }
             }
         }
@@ -1127,10 +1154,10 @@ int main(int argc, char **argv) {
 
     // Save what we have: the last frame (camera or world frame, see above)
     // and the global map (world frame).
-    if (frame_n > 0) save_ply(opt.out_prefix + "_frame.ply", frame_pts.data(), frame_n);
+    if (frame_n > 0) save_ply(out_prefix() + "_frame.ply", frame_pts.data(), frame_n);
     if (map && fetch_map(map, map_raw) && !map_raw.empty()) {
         voxel_merge(map_raw, opt.voxel, map_pts);
-        save_ply(opt.out_prefix + "_map.ply", map_pts.data(), map_pts.size());
+        save_ply(out_prefix() + "_map.ply", map_pts.data(), map_pts.size());
     }
 
     insight9_pointcloud_map_destroy(map);

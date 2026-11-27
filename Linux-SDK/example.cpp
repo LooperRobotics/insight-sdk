@@ -1,4 +1,5 @@
 #include "Insight_9_receive.h"
+#include "example_log.hpp"
 #include "hid.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -519,7 +520,22 @@ void* fps_switch_worker(void* arg) {
     return NULL;
 }
 
-int main() {
+static void print_usage(const char *prog) {
+    printf("Usage: %s [-l]\n", prog);
+    printf("  -l    also save the run log to example_YYYYMMDD_HHMMSS.log in the current directory\n");
+}
+
+int main(int argc, char **argv) {
+    ExampleLog run_log;   // first, so it is the last thing torn down
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-l") == 0) {
+            run_log.start("example");
+        } else {
+            print_usage(argv[0]);
+            return (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) ? 0 : 1;
+        }
+    }
+
     signal(SIGINT, sigint_handler);
 
     int active_cam = -1;

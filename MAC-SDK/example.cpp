@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include "Insight9SDK.h"
+#include "example_log.hpp"
 #include <opencv2/opencv.hpp>
 
 using Clock = std::chrono::steady_clock;
@@ -668,7 +669,8 @@ static void print_metadata_timestamps(void) {
 }
 
 static void usage(const char* prog) {
-    printf("Usage: sudo %s [--no-gui] [--set-params] [--rgb WxH@FPS:FMT]\n", prog);
+    printf("Usage: sudo %s [-l] [--no-gui] [--set-params] [--rgb WxH@FPS:FMT]\n", prog);
+    printf("  -l             also save the run log to example_YYYYMMDD_HHMMSS.log in the current directory\n");
     printf("  --no-gui       print statistics only, do not open the OpenCV window\n");
     printf("  --set-params   also write demo camera parameters to the RGB camera\n");
     printf("  --no-xu-demo   skip the parameter/calibration reads before start (no depth overlay)\n");
@@ -688,12 +690,15 @@ static bool parse_rgb_mode(const char* s, int* w, int* h, int* fps, PixelFormat*
 }
 
 int main(int argc, char** argv) {
+    ExampleLog run_log;   // first, so it is the last thing torn down
     bool gui = true;
     bool write_params = false;
     bool xu_demo = true;
     const char* rgb_mode = NULL;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--no-gui") == 0) {
+        if (strcmp(argv[i], "-l") == 0) {
+            run_log.start("example");
+        } else if (strcmp(argv[i], "--no-gui") == 0) {
             gui = false;
         } else if (strcmp(argv[i], "--set-params") == 0) {
             write_params = true;

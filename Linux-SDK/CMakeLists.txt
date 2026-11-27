@@ -80,12 +80,30 @@ set_target_properties(example PROPERTIES
     INSTALL_RPATH "\$ORIGIN"
 )
 
+# Point cloud API example: depth -> point cloud -> world frame -> global map.
+add_executable(pointcloud_example pointcloud_example.cpp)
+
+target_link_libraries(pointcloud_example PRIVATE
+    insight9
+    Threads::Threads
+    ${OpenCV_LIBS}
+)
+
+target_include_directories(pointcloud_example PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+set_target_properties(pointcloud_example PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+    INSTALL_RPATH "\$ORIGIN"
+)
+
 install(TARGETS insight9
     LIBRARY DESTINATION lib
 )
 
 install(FILES ${LIB_HEADERS} DESTINATION include)
-install(TARGETS example DESTINATION bin)
+install(TARGETS example pointcloud_example DESTINATION bin)
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")

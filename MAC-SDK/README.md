@@ -78,6 +78,7 @@ Outputs:
 
 - `build/libinsight9.a`: the SDK static library
 - `build/example`: OpenCV demo (built only when OpenCV is found)
+- `build/pointcloud_example`: point cloud API demo (built only when OpenCV is found)
 
 Options (passed through to CMake):
 
@@ -105,11 +106,46 @@ sudo ./build/example --no-gui   # console statistics only (e.g. over SSH)
 sudo ./build/example --set-params  # also write demo camera parameters to the RGB camera
 sudo ./build/example --rgb 1920x1080@30:mjpeg  # RGB mode instead of the device default
 sudo ./build/example --no-xu-demo  # skip the parameter/calibration reads (no depth overlay)
+sudo ./build/example -l         # also save the run log to example_YYYYMMDD_HHMMSS.log in the current directory
 ```
 
 By default the example only reads camera parameters. `--set-params` writes manual exposure/gain and other demo values to the RGB sensor, which persist on the device and can lower the RGB frame rate. The depth overlay on the RGB panel needs RGB at the calibrated resolution (1920x1080), e.g. `--rgb 1920x1080@30:mjpeg`.
 
 Press `q`/`Esc` in the window or `Ctrl+C` to stop. On exit the camera is returned to macOS.
+
+### Point cloud example
+
+`pointcloud_example.cpp` shows the point cloud API (section 6.11) end to end:
+
+1. Each depth frame becomes a point cloud in the LEFT camera frame with `insight9_receive_depth_to_pointcloud()`. The LEFT intrinsics are scaled to the depth resolution first, because the calibration covers a single resolution and depth follows the stereo stream's resolution. Flying pixels at object edges are filtered out. While the device's depth pipeline is not running (right after it connects, or stuck until it is replugged), the depth stream delivers a placeholder frame that shows the text "Depth not enabled or not ready". The example detects such frames and skips them until real depth arrives. It also sends no control transfers until then: calibration is read on the first real depth frame and VIO status is polled every 2 s, as in Looper Viewer, because control transfers sent while the streams start up can keep depth from starting. Points are coloured from the LEFT eye (`INSIGHT9_PC_COLOR_GRAY8`, pixel-aligned with depth; GREY, Y8I and YUYV are handled) or from the RGB camera (`INSIGHT9_PC_COLOR_BGR8`).
+2. While VIO is tracking, the latest VIO pose becomes `T_world_left` through `insight9_pointcloud_pose_to_transform()`, and passing it as `params.transform` puts the cloud in the world frame.
+3. World-frame clouds go into a global map with `insight9_pointcloud_map_insert()`. The map is read back with `insight9_pointcloud_map_get()`, querying the size first.
+4. A preview window draws the current frame (default) or the map, with a mouse-orbit view. The last frame and the map are saved as PLY files (`insight9_frame.ply`, `insight9_map.ply`), which open in MeshLab, CloudCompare or Open3D.
+
+```
+sudo ./build/pointcloud_example
+sudo ./build/pointcloud_example --no-gui --out scan
+```
+
+| Option | Meaning |
+|---|---|
+| `--no-gui` | Console output only. PLY files are written on exit. |
+| `--color gray\|rgb\|none` | Point colour: LEFT eye (default), RGB camera, or none (shaded by depth). |
+| `--step N` | Use every Nth depth pixel (default 1; keys `1`-`4` change it while running). |
+| `--max-depth M` | Drop points farther than M metres (default 8.0; `,` and `.` change it while running). |
+| `--no-filter` | Keep flying pixels at depth edges. |
+| `--voxel V` | Map voxel size in metres (default 0.05). |
+| `--map-max-depth M` | Only points within M metres of the camera go into the map (default 5.0). |
+| `--pose-delay MS` | Look up the VIO pose MS milliseconds before the depth frame's timestamp (default 0). |
+| `--no-map` | Camera-frame clouds only; VIO and the map are not used. |
+| `--body-to-left calib\|flu\|none` | Source of the LEFT camera to VIO body extrinsic (default `calib`, see below). |
+| `--out PREFIX` | PLY file name prefix (default `insight9`). |
+
+In the preview window, drag with the left mouse button to orbit and use the wheel or `+`/`-` to zoom. Keys: `[`/`]` change the point size, `r` resets the view, `m` switches between frame and map view, `s` saves PLY files, `d` saves the raw depth frame as a 16-bit PNG, `c` clears the map, `q`/`Esc` quits.
+
+The map needs the fixed LEFT-camera-to-VIO-body extrinsic. The VIO body is the IMU, and the LEFT calibration's extrinsic is exactly IMU -> LEFT (`camera_camera_imu` -> `camera_camera_left`), so the default `--body-to-left calib` uses it. `flu` (x forward, y left, z up) and `none` (VIO pose = LEFT pose) are for other devices.
+
+How the map stays sharp: each depth frame is paired with the VIO pose interpolated at the depth frame's capture time. Image timestamps are microseconds and VIO timestamps nanoseconds of the same device clock; depth reaches the host about 100 ms after the matching pose, so the newest pose would be off while the camera moves. `--pose-delay` shifts the lookup further if needed. Frames are added as keyframes every 5 cm or 2 degrees, and only points within `--map-max-depth` go in. For display and PLY export the map is merged into one averaged point per voxel, and voxels seen only once are dropped as noise. The preview redraws at most 15 times per second so that drawing never holds up mapping; the console prints the processing time per depth frame and per redraw.
 
 The SDK only prints errors and warnings. Build with `-DINSIGHT9_DEBUG_LOG=ON` to also see what it found on the device and how each stream was negotiated, for example (interface numbers, transfer type and formats depend on the unit and firmware):
 
@@ -245,6 +281,8 @@ Set `-DINSIGHT9_DEBUG_LOG=ON` to see probe/commit results, the selected alternat
 | `ExtensionUnitControl.hpp/.cpp` | UVC extension unit (camera params, calibration, VIO status) |
 | `Insight9PointCloud.cpp` | Depth-to-point-cloud conversion and global map (same file on every platform) |
 | `example.cpp` | OpenCV demo, ported from the Windows example |
+| `example_log.hpp` | `-l` run log for the example (same file on every platform) |
+| `pointcloud_example.cpp` | Point cloud API demo: per-frame cloud, world frame, global map, PLY export (same file on every platform) |
 | `install_deps.sh` | One-step installation of Xcode CLT, Homebrew and the build dependencies |
 | `CMakeLists.txt`, `build.sh` | Build |
 

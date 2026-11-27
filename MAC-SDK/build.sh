@@ -96,3 +96,6 @@ if [ -x build/example ]; then
     echo "  sudo ./build/example            # OpenCV window"
     echo "  sudo ./build/example --no-gui   # console statistics only"
 fi
+if [ -x build/pointcloud_example ]; then
+    echo "Point cloud : sudo ./build/pointcloud_example   (see README, \"Point cloud example\")"
+fi

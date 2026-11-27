@@ -81,16 +81,22 @@ target_link_libraries(Insight9SDK PRIVATE
 add_executable(example example.cpp)
 target_link_libraries(example Insight9SDK opencv)
 
+# Point cloud API example: depth -> point cloud -> world frame -> global map.
+add_executable(pointcloud_example pointcloud_example.cpp)
+target_link_libraries(pointcloud_example Insight9SDK opencv)
+
 # 复制 OpenCV DLL（在 example 创建之后）
 if(OPENCV_FOUND AND EXISTS "${OPENCV_BIN_DIR}")
     file(GLOB OPENCV_DLLS "${OPENCV_BIN_DIR}/opencv_world*.dll")
     if(OPENCV_DLLS)
-        add_custom_command(TARGET example POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${OPENCV_DLLS}
-                $<TARGET_FILE_DIR:example>
-            COMMENT "Copying OpenCV DLLs"
-        )
+        foreach(tgt example pointcloud_example)
+            add_custom_command(TARGET ${tgt} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${OPENCV_DLLS}
+                    $<TARGET_FILE_DIR:${tgt}>
+                COMMENT "Copying OpenCV DLLs"
+            )
+        endforeach()
         message(STATUS "OpenCV DLLs will be copied: ${OPENCV_DLLS}")
     else()
         message(WARNING "OpenCV DLLs not found in ${OPENCV_BIN_DIR}")
@@ -98,9 +104,11 @@ if(OPENCV_FOUND AND EXISTS "${OPENCV_BIN_DIR}")
 endif()
 
 if(NOT USE_SYSTEM_HIDAPI AND EXISTS "${HIDAPI_DIR}/bin/hidapi.dll")
-    add_custom_command(TARGET example POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${HIDAPI_DIR}/bin/hidapi.dll"
-            $<TARGET_FILE_DIR:example>
-    )
+    foreach(tgt example pointcloud_example)
+        add_custom_command(TARGET ${tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${HIDAPI_DIR}/bin/hidapi.dll"
+                $<TARGET_FILE_DIR:${tgt}>
+        )
+    endforeach()
 endif()

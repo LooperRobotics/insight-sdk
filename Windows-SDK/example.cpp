@@ -12,6 +12,7 @@
 #include <algorithm>
 
 #include "Insight9SDK.h"
+#include "example_log.hpp"
 #include <opencv2/opencv.hpp>
 
 static volatile BOOL keep_running = TRUE;
@@ -594,7 +595,22 @@ void toggle_gray_camera_fps() {
     LeaveCriticalSection(&g_sdk_op_lock);
 }
 
-int main() {
+static void print_usage(const char *prog) {
+    printf("Usage: %s [-l]\n", prog);
+    printf("  -l    also save the run log to example_YYYYMMDD_HHMMSS.log in the current directory\n");
+}
+
+int main(int argc, char **argv) {
+    ExampleLog run_log;   // first, so it is the last thing torn down
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-l") == 0) {
+            run_log.start("example");
+        } else {
+            print_usage(argv[0]);
+            return (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) ? 0 : 1;
+        }
+    }
+
     SetConsoleCtrlHandler(console_handler, TRUE);
     InitializeCriticalSection(&g_stats_lock);
     InitializeCriticalSection(&g_sdk_op_lock);

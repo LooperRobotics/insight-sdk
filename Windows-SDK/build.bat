@@ -53,6 +53,7 @@ echo ========================================
 echo Build completed successfully!
 echo ========================================
 echo Example executable: build\Release\example.exe
+echo Point cloud example: build\Release\pointcloud_example.exe
 echo.
 echo To run the example:
 echo   cd build\Release

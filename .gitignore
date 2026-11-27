@@ -1,2 +1,5 @@
 Linux-SDK/build
 MAC-SDK/build
+
+# Point clouds saved by pointcloud_example
+*.ply
